@@ -686,7 +686,8 @@ bool MakeFine(SparseRange& range, std::size_t slot, const bool (&zero)[FinePages
 #ifdef PS5_NATIVE
     std::int64_t compact = -1;
     if (eden_direct_low(kept * FinePage, FinePage, 12, &compact) != 0) return false;
-    const std::uintptr_t view = MapCpuView(compact, kept * FinePage, PROT_READ | PROT_WRITE);
+    const std::uintptr_t view =
+        MapCpuView(compact, kept * FinePage, PROT_READ | PROT_WRITE, FinePage);
     if (view == 0) {
         (void)sceKernelReleaseDirectMemory(compact, kept * FinePage);
         return false;
@@ -694,7 +695,7 @@ bool MakeFine(SparseRange& range, std::size_t slot, const bool (&zero)[FinePages
     std::size_t next = 0;
     for (std::size_t page = 0; page < FinePages; ++page)
         if (!zero[page]) {
-            std::memcpy(static_cast<std::uint8_t*>(view) + next * FinePage,
+            std::memcpy(reinterpret_cast<std::uint8_t*>(view) + next * FinePage,
                         reinterpret_cast<const void*>(at + page * FinePage), FinePage);
             ++next;
         }

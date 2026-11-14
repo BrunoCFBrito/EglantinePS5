@@ -328,7 +328,6 @@ std::int64_t zero_block = -1;
 // 0x104e005114, inside a heap piece). The views reserve address space of their own instead, and
 // every concurrent view gets its own 2 MiB slot in it.
 constexpr std::size_t CpuViewSlots = 64;
-constexpr std::size_t CpuViewAlignment = 0x4000;
 std::atomic<std::uint64_t> cpu_views_used[(CpuViewSlots + 63) / 64] = {};
 std::atomic<int> cpu_views_state{0}; // 0 unmade, 1 made, 2 unavailable
 void* cpu_views_base = nullptr;
@@ -356,12 +355,13 @@ void* MakeCpuViewRange() {
 
 // Maps `physical` at a view of its own. 0 when no view is free or the mapping was refused; nothing
 // is written in that case.
-std::uintptr_t MapCpuView(std::int64_t physical, std::size_t size, int protection) {
+std::uintptr_t MapCpuView(std::int64_t physical, std::size_t size, int protection,
+                          std::size_t alignment = SparseSlot) {
     void* const base = MakeCpuViewRange();
     if (base == nullptr) {
         // The reservation was refused: a mapping the kernel places anywhere, as before.
         void* view = reinterpret_cast<void*>(cpu_mapping_hint);
-        if (sceKernelMapDirectMemory(&view, size, protection, 0, physical, CpuViewAlignment) != 0)
+        if (sceKernelMapDirectMemory(&view, size, protection, 0, physical, alignment) != 0)
             return 0;
         return reinterpret_cast<std::uintptr_t>(view);
     }
@@ -377,7 +377,7 @@ std::uintptr_t MapCpuView(std::int64_t physical, std::size_t size, int protectio
     atomic_flag_clear_explicit(&cpu_views_lock, std::memory_order_release);
     if (slot == CpuViewSlots) return 0;
     void* at = static_cast<std::uint8_t*>(base) + slot * SparseSlot;
-    if (sceKernelMapDirectMemory(&at, size, protection, MAP_FIXED, physical, CpuViewAlignment) != 0 ||
+    if (sceKernelMapDirectMemory(&at, size, protection, MAP_FIXED, physical, alignment) != 0 ||
         at != static_cast<std::uint8_t*>(base) + slot * SparseSlot) {
         cpu_views_used[slot >> 6].fetch_and(~(std::uint64_t{1} << (slot & 63)),
                                             std::memory_order_relaxed);
