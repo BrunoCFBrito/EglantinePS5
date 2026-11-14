@@ -1383,27 +1383,31 @@ void PackPass(SparseRange& range, std::size_t slots, std::vector<std::size_t>& c
 
 // Diagnostic: the zero block (every untouched slot shows it, and the sparse tables' unused parts) must
 // stay zero. Written through a mapping that should not allow it, every untouched slot of the game
-// would read that garbage. Checked each pass through a read-only view of its own.
+// would read that garbage. Checked each pass through a read-only view of its own, mapped from
+// the view range and given back at once: a mapping the kernel places (flags 0, a hint) can sit
+// inside a range the app reserved at the same hint, and a MAP_FIXED commit or an unmap of that
+// range takes the view away under the check (2026-11-14: the check read 0x1180000000, a CRAM
+// view slot, and died when no unpack had it mapped). A slot of the view range is ours alone.
 std::atomic<std::uint64_t> zero_block_dirty{0};
 void CheckZeroBlock() noexcept {
 #ifdef PS5_NATIVE
-    static const volatile std::uint64_t* view = []() -> const volatile std::uint64_t* {
-        void* at = reinterpret_cast<void*>(cpu_mapping_hint);
-        if (zero_block < 0 || sceKernelMapDirectMemory(&at, SparseSlot, PROT_READ, 0, zero_block, SparseSlot) != 0)
-            return nullptr;
-        return static_cast<const volatile std::uint64_t*>(at);
-    }();
-    if (view == nullptr) return;
+    if (zero_block < 0) return;
+    // A view of its own out of the range reserved for views: released only when the check has
+    // finished, and no other unpack or copy can be given this address (MapCpuView's bitmap).
+    const std::uintptr_t view = MapCpuView(zero_block, SparseSlot, PROT_READ);
+    if (view == 0) return; // all views busy: skip the check, never touch an address we do not own
+    const auto* const words = reinterpret_cast<const volatile std::uint64_t*>(view);
     for (std::size_t i = 0; i < SparseSlot / 8; i += 8)
-        if (view[i] != 0) {
+        if (words[i] != 0) {
             if (zero_block_dirty.fetch_add(1, std::memory_order_relaxed) < 4) {
                 char line[160];
                 const int n = std::snprintf(line, sizeof(line), "EDEN_CRAM_ZERO_BLOCK written: word %zu is %#llx\n", i,
-                                            (unsigned long long)view[i]);
+                                            (unsigned long long)words[i]);
                 if (n > 0) Report(line);
             }
-            return;
+            break;
         }
+    UnmapCpuView(view, SparseSlot);
 #endif
 }
 

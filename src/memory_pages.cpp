@@ -345,6 +345,12 @@ void* MakeCpuViewRange() {
         if (cpu_mapping_range(address, CpuViewSlots * SparseSlot)) {
             cpu_views_base = address;
             cpu_views_state.store(1, std::memory_order_release);
+            {
+                char line[96];
+                const int length = std::snprintf(line, sizeof(line), "EDEN_CRAM_VIEW_RANGE base=%p bytes=%zu\n",
+                                                 address, CpuViewSlots * SparseSlot);
+                if (length > 0) Note(line);
+            }
             return cpu_views_base;
         }
         (void)munmap(address, CpuViewSlots * SparseSlot);
