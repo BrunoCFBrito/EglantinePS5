@@ -2000,9 +2000,11 @@ static void DecompressBlock(std::span<const u8, 16> inBuf, const u32 blockWidth,
 }
 
 void Decompress(std::span<const uint8_t> data, uint32_t width, uint32_t height, uint32_t depth,
-                uint32_t block_width, uint32_t block_height, std::span<uint8_t> output) {
+                uint32_t block_width, uint32_t block_height, std::span<uint8_t> output,
+                uint32_t buffer_row_blocks) {
     const u32 rows = Common::DivideUp(height, block_height);
     const u32 cols = Common::DivideUp(width, block_width);
+    const u32 pitch = buffer_row_blocks != 0 ? buffer_row_blocks : cols;
 
     Common::ThreadWorker& workers{GetThreadWorkers()};
 
@@ -2010,10 +2012,10 @@ void Decompress(std::span<const uint8_t> data, uint32_t width, uint32_t height, 
         const u32 depth_offset = z * height * width * 4;
         for (u32 y_index = 0; y_index < rows; ++y_index) {
             auto decompress_stride = [data, width, height, block_width, block_height, output, rows,
-                                      cols, z, depth_offset, y_index] {
+                                      cols, pitch, z, depth_offset, y_index] {
                 const u32 y = y_index * block_height;
                 for (u32 x_index = 0; x_index < cols; ++x_index) {
-                    const u32 block_index = (z * rows * cols) + (y_index * cols) + x_index;
+                    const u32 block_index = (z * rows * pitch) + (y_index * pitch) + x_index;
                     const u32 x = x_index * block_width;
 
                     const std::span<const u8, 16> blockPtr{data.subspan(block_index * 16, 16)};

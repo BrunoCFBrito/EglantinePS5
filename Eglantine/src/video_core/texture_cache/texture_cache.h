@@ -2533,9 +2533,9 @@ bool TextureCache<P>::UploadConvertedInChunks(Image& image) {
         return false;
     }
     for (const BufferImageCopy& copy : probe.copies) {
-        // The conversion reads a run's rows at the run's own pitch. A run clamped at the right
-        // edge (a width not a multiple of the block row) would read the wrong blocks.
-        if (copy.buffer_row_length != copy.image_extent.width) {
+        // ConvertImage reads a run's rows at the run's own block pitch, so padding blocks at the
+        // right edge are fine. The plan always cuts rows on block boundaries.
+        if (copy.buffer_row_length < copy.image_extent.width) {
             return false;
         }
     }

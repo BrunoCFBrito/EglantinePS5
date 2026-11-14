@@ -1379,10 +1379,11 @@ void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8
 
     const Extent2D tile_size = DefaultBlockSize(info.format);
     for (BufferImageCopy& copy : copies) {
-        // Row bands of a large image arrive with their own extent and tight rows; a whole-mip copy
-        // has the mip's own. The conversion reads the extent's rows at its own pitch either way.
-        ASSERT(copy.buffer_row_length == copy.image_extent.width);
-        ASSERT(copy.buffer_image_height == copy.image_extent.height);
+        // A whole-mip copy's rows are the mip's block rows, padded to the block width; a row band
+        // from UploadConvertedInChunks has the run's own block rows. Either way the copy covers at
+        // least the extent.
+        ASSERT(copy.buffer_row_length >= copy.image_extent.width);
+        ASSERT(copy.buffer_image_height >= copy.image_extent.height);
 
         const auto input_offset = input.subspan(copy.buffer_offset);
         copy.buffer_offset = output_offset;
@@ -1394,7 +1395,8 @@ void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8
             Tegra::Texture::ASTC::Decompress(
                 input_offset, copy.image_extent.width, copy.image_extent.height,
                 copy.image_subresource.num_layers * copy.image_extent.depth, tile_size.width,
-                tile_size.height, output.subspan(output_offset));
+                tile_size.height, output.subspan(output_offset),
+                copy.buffer_row_length / tile_size.width);
 
             copy.buffer_size =
                 ConvertedCopyBytes(info, copy.image_extent,
@@ -1417,7 +1419,8 @@ void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8
             // A layer at a time (headless/CMakeLists.txt): ASTC blocks are 16 bytes, BC blocks
             // cover 4x4 pixels.
             const u32 layers = copy.image_subresource.num_layers * copy.image_extent.depth;
-            const u32 layer_input = Common::DivideUp(copy.image_extent.width, tile_size.width) *
+            const u32 buffer_row_blocks = copy.buffer_row_length / tile_size.width;
+            const u32 layer_input = buffer_row_blocks *
                                     Common::DivideUp(copy.image_extent.height, tile_size.height) * 16;
             const u32 layer_output = Common::AlignUp(copy.image_extent.width, 4) *
                                      Common::AlignUp(copy.image_extent.height, 4) / bpp_div;
@@ -1425,7 +1428,8 @@ void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8
             for (u32 layer = 0; layer < layers; ++layer) {
                 Tegra::Texture::ASTC::Decompress(
                     input_offset.subspan(layer * layer_input), copy.image_extent.width,
-                    copy.image_extent.height, 1, tile_size.width, tile_size.height, decode_scratch);
+                    copy.image_extent.height, 1, tile_size.width, tile_size.height, decode_scratch,
+                    buffer_row_blocks);
                 compress(decode_scratch, copy.image_extent.width, copy.image_extent.height, 1,
                          output.subspan(output_offset + layer * layer_output));
             }
