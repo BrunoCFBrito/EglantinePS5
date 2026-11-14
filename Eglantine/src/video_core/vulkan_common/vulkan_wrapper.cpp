@@ -536,7 +536,9 @@ void Image::Release() const noexcept {
 }
 
 Image::MemoryBlock Image::GetMemoryBlock() const noexcept {
-    if (allocation == nullptr) {
+    // A moved-from or reset image owns no allocation; the allocation its handle named may
+    // already be freed.
+    if (handle == VK_NULL_HANDLE || allocation == nullptr) {
         return {};
     }
     VmaAllocationInfo2 info{};

@@ -11,6 +11,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <utility>
 
 #include "video_core/texture_cache/texture_cache_base.h"
 
@@ -497,7 +498,12 @@ public:
 
     /// No memory was left to make it: the texture cache drops it instead of using it.
     [[nodiscard]] bool OutOfMemory() const noexcept {
-        return !original_image && info.type != VideoCommon::ImageType::Buffer;
+        return allocation_failed;
+    }
+
+    /// True while the full-size original is freed (it is made again on ScaleDown or a download).
+    [[nodiscard]] bool IsOriginalImageReleased() const noexcept {
+        return original_image_released;
     }
 
     void UploadMemory(VkBuffer buffer, VkDeviceSize offset,
@@ -529,8 +535,15 @@ public:
         return (this->*current_image).UsageFlags();
     }
 
-    /// Where the image's memory lies, for the collector (TextureCache::RunGarbageCollector).
+    /// Where the original image's memory lies, for the collector
+    /// (TextureCache::RunGarbageCollector). Size 0 once the original is released;
+    /// ScaledMemoryBlock has the scaled copy's.
     [[nodiscard]] vk::Image::MemoryBlock MemoryBlock() const noexcept {
+        // ReleaseOriginalImage moves the original on and leaves its allocation handle behind;
+        // that allocation is freed with pending_original_image.
+        if (original_image_released) {
+            return {};
+        }
         return original_image.GetMemoryBlock();
     }
 
@@ -588,6 +601,15 @@ public:
 
     bool ScaleDown(bool ignore = false);
 
+    /// TextureCache accounting for the released original: bytes given back (+), or taken again
+    /// by EnsureOriginalImage (-), since the last call.
+    [[nodiscard]] s64 TakeOriginalImageAccountingDelta() noexcept {
+        return std::exchange(original_image_accounting_delta, s64{0});
+    }
+
+    /// Destroys a released original (and its views) once the GPU is past their last use.
+    void TickReleasedOriginalImage();
+
     u64 allocation_tick;
 
     friend class BlockLinearUnswizzle3DPass;
@@ -596,6 +618,20 @@ private:
     bool BlitScaleHelper(bool scale_up);
 
     bool NeedsScaleHelper() const;
+
+    /// Whether the original may be freed now: depth or stencil, the scaled copy in use, and no
+    /// path that reads the original outside ScaleDown (sparse, trimmed or GPU-decoded images).
+    bool CanReleaseOriginalImage() const noexcept;
+
+    /// Moves the original and the views made from it to the pending release, and counts the
+    /// memory it gives back.
+    void ReleaseOriginalImage();
+
+    /// Makes the original again after a release. False when the driver had no memory for it.
+    bool EnsureOriginalImage();
+
+    /// The bytes ImageMemoryBytes counts for the original, for the accounting above.
+    u64 OriginalImageBytes() const noexcept;
 
     Scheduler* scheduler{};
     TextureCacheRuntime* runtime{};
@@ -710,6 +746,22 @@ private:
     std::optional<Framebuffer> normal_framebuffer;
     std::unique_ptr<ImageView> scale_view;
     std::unique_ptr<ImageView> normal_view;
+
+    /// Set when the original could not be made at construction; stays set (unlike a released
+    /// original, which is made again on demand).
+    bool allocation_failed = false;
+    /// True between ReleaseOriginalImage and the next EnsureOriginalImage.
+    bool original_image_released = false;
+    /// Bytes of original memory freed (+) or taken again (-) since TextureCache applied them.
+    s64 original_image_accounting_delta = 0;
+    /// The released original and the views made from it, held until no submitted command refers
+    /// to them (Vulkan requires that before destroying them). Declared last, so their destructors
+    /// run before the images above.
+    vk::Image pending_original_image;
+    u64 pending_original_tick = 0;
+    std::unique_ptr<ImageView> pending_normal_view;
+    std::optional<Framebuffer> pending_normal_framebuffer;
+    std::vector<vk::ImageView> pending_storage_views;
 };
 
 class ImageView : public VideoCommon::ImageViewBase {

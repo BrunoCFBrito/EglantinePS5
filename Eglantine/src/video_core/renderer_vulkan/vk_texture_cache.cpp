@@ -3038,6 +3038,7 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
                                    SparseTilesModeOf(runtime_.device) == SparseTilesMode::Aliased,
                                true)),
       aspect_mask(ImageAspectMask(info.format)) {
+    allocation_failed = !original_image && info.type != VideoCommon::ImageType::Buffer;
     if (OutOfMemory()) {
         return;
     }
@@ -3186,6 +3187,13 @@ void Image::UploadMemory(VkBuffer buffer, VkDeviceSize offset,
     const bool is_rescaled = True(flags & ImageFlagBits::Rescaled);
     if (is_rescaled) {
         ScaleDown(true);
+        if (!original_image) {
+            LOG_CRITICAL(Render_Vulkan,
+                         "Missing image at upload: gpu={:#x}, cpu={:#x}, format={}, flags={:#x}",
+                         gpu_addr, cpu_addr, static_cast<u32>(info.format),
+                         static_cast<u32>(flags));
+            return;
+        }
     }
 
     const bool msaa_upload_is_depth = (aspect_mask & VK_IMAGE_ASPECT_DEPTH_BIT) != 0;
@@ -3303,14 +3311,18 @@ void Image::DownloadMemory(std::span<VkBuffer> buffers_span, std::span<size_t> o
             return;
     }
 
+    const bool is_rescaled = True(flags & ImageFlagBits::Rescaled);
+    if (is_rescaled) {
+        ScaleDown();
+    }
+
     if (!original_image) {
         LOG_CRITICAL(Render_Vulkan, "Missing image at download: gpu={:#x}, cpu={:#x}, type={}, format={}, flags={:#x}, size={}, dimensions={}x{}",
                      gpu_addr, cpu_addr, static_cast<u32>(info.type), static_cast<u32>(info.format),
                      static_cast<u32>(flags), unswizzled_size_bytes, info.size.width, info.size.height);
-    }
-    const bool is_rescaled = True(flags & ImageFlagBits::Rescaled);
-    if (is_rescaled) {
-        ScaleDown();
+        // ScaleDown has to make the original again (the scaled copy is bigger than the guest
+        // size); without it there is nothing to copy at the guest's size.
+        return;
     }
 
     if (info.num_samples > 1) {
@@ -4218,12 +4230,14 @@ bool Image::ScaleUp(bool ignore) {
                                  runtime->ViewFormats(info.format));
         ignore = false;
     }
-    current_image = &Image::scaled_image;
-    if (ignore) {
-        return true;
-    }
     if (aspect_mask == 0) {
         aspect_mask = ImageAspectMask(info.format);
+    }
+    current_image = &Image::scaled_image;
+    if (ignore) {
+        // A download has finished with the original: free it as a blit would.
+        ReleaseOriginalImage();
+        return true;
     }
     if (NeedsScaleHelper()) {
         if (!BlitScaleHelper(true)) {
@@ -4233,6 +4247,8 @@ bool Image::ScaleUp(bool ignore) {
     } else {
         BlitScale(*scheduler, *original_image, *scaled_image, info, aspect_mask, resolution);
     }
+    // The scaled copy is current and holds everything: the full-size original is now optional.
+    ReleaseOriginalImage();
     return true;
 }
 
@@ -4245,11 +4261,19 @@ bool Image::ScaleDown(bool ignore) {
         return false;
     }
     ASSERT(info.type != ImageType::Linear);
+    const bool made_original = !original_image;
+    if (made_original && !EnsureOriginalImage()) {
+        // Without memory for the original the scaled copy stays current; the upload and download
+        // paths check for that before using Handle()/original_image.
+        return false;
+    }
     flags &= ~ImageFlagBits::Rescaled;
     current_image = &Image::original_image;
-    if (ignore) {
+    if (ignore && !made_original) {
         return true;
     }
+    // An original made again here holds nothing: always downscale into it, even for an upload
+    // that asked to skip the blit, so the parts it does not upload keep the scaled contents.
     if (aspect_mask == 0) {
         aspect_mask = ImageAspectMask(info.format);
     }
@@ -4262,7 +4286,141 @@ bool Image::ScaleDown(bool ignore) {
     } else {
         BlitScale(*scheduler, *scaled_image, *original_image, info, aspect_mask, resolution, false);
     }
+    // The original now holds the scaled contents, so later partial uploads must not discard it.
+    initialized = true;
     return true;
+}
+
+u64 Image::OriginalImageBytes() const noexcept {
+    const u64 size = (std::max)(static_cast<u64>(guest_size_bytes),
+                                static_cast<u64>(unswizzled_size_bytes));
+    return Common::AlignUp(size, u64{1024});
+}
+
+bool Image::CanReleaseOriginalImage() const noexcept {
+    // Depth and stencil only: colour images keep decode/storage views on the original, and their
+    // GPU decode paths (AcceleratedUpload, Converted, IsDecoding) write it directly.
+    static const bool release_originals = [] {
+        // EDEN_NX2_DEPTH_ORIGINAL=0 keeps the full-size original, as before this change.
+        const char* value = std::getenv("EDEN_NX2_DEPTH_ORIGINAL");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (!release_originals || !original_image || original_image_released ||
+        pending_original_image) {
+        return false;
+    }
+    if (info.type == ImageType::Linear || info.type == ImageType::Buffer || info.is_sparse) {
+        return false;
+    }
+    if (False(flags & ImageFlagBits::Rescaled) || current_image != &Image::scaled_image) {
+        return false;
+    }
+    if (True(flags & (ImageFlagBits::Unbacked | ImageFlagBits::SparseLayers |
+                      ImageFlagBits::SparseTiles | ImageFlagBits::TrimmedLevels |
+                      ImageFlagBits::AcceleratedUpload | ImageFlagBits::Converted |
+                      ImageFlagBits::AsynchronousDecode | ImageFlagBits::IsDecoding))) {
+        return false;
+    }
+    if ((aspect_mask & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) == 0) {
+        return false;
+    }
+    // A storage view would still name the freed image.
+    return std::ranges::none_of(
+               storage_image_views,
+               [](const vk::ImageView& view) { return static_cast<bool>(view); }) &&
+           std::ranges::none_of(
+               storage_layer_views,
+               [](const vk::ImageView& view) { return static_cast<bool>(view); });
+}
+
+void Image::ReleaseOriginalImage() {
+    if (!CanReleaseOriginalImage()) {
+        return;
+    }
+    if (ENABLE_MSAA_RESOLVE_CONSUME && runtime != nullptr) {
+        runtime->EraseResolveShadow(*original_image);
+    }
+    // The image views made from the original can only be destroyed once the GPU is done with
+    // them: keep them next to the image.
+    if (normal_framebuffer) {
+        pending_normal_framebuffer = std::move(normal_framebuffer);
+        normal_framebuffer.reset();
+    }
+    if (normal_view) {
+        pending_normal_view = std::move(normal_view);
+    }
+    for (vk::ImageView& view : storage_image_views) {
+        if (view) {
+            pending_storage_views.push_back(std::move(view));
+        }
+    }
+    for (vk::ImageView& view : storage_layer_views) {
+        if (view) {
+            pending_storage_views.push_back(std::move(view));
+        }
+    }
+    pending_original_image = std::move(original_image);
+    pending_original_tick = scheduler->CurrentTick();
+    original_image_released = true;
+    original_image_accounting_delta += static_cast<s64>(OriginalImageBytes());
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        LOG_INFO(Render_Vulkan,
+                 "Depth original released after scaling: gpu={:#x}, {}x{}, format {}",
+                 gpu_addr, info.size.width, info.size.height, static_cast<u32>(info.format));
+    }
+}
+
+bool Image::EnsureOriginalImage() {
+    if (original_image) {
+        return true;
+    }
+    const bool reallocating = original_image_released;
+    original_image = MakeImage(
+        runtime->device, runtime->memory_allocator,
+        TrimmedHostInfo(runtime->device, info, host_level_offset),
+        IsHugeAstcArray(runtime->device, info) || IsUnevenMipRgba8Astc(runtime->device, info)
+            ? std::span<const VkFormat>{HugeAstcViewFormats}
+        : IsOpaqueBc1Astc(runtime->device, info)
+            ? std::span<const VkFormat>{OpaqueAstcViewFormats}
+            : runtime->ViewFormats(info.format),
+        AstcHostFormat(runtime->device, info), false, false, true);
+    if (!original_image || original_image.IsUnbacked()) {
+        original_image.reset();
+        LOG_CRITICAL(Render_Vulkan,
+                     "Could not make the original image again: gpu={:#x}, {}x{} format {}",
+                     gpu_addr, info.size.width, info.size.height, static_cast<u32>(info.format));
+        return false;
+    }
+    if (runtime->device.HasDebuggingToolAttached()) {
+        original_image.SetObjectNameEXT(VideoCommon::Name(*this).c_str());
+    }
+    original_image_released = false;
+    if (reallocating) {
+        original_image_accounting_delta -= static_cast<s64>(OriginalImageBytes());
+    }
+    return true;
+}
+
+void Image::TickReleasedOriginalImage() {
+    if (scheduler == nullptr) {
+        return;
+    }
+    if (pending_original_image && scheduler->IsFree(pending_original_tick)) {
+        // Framebuffers, then views, then the image: no submitted command may refer to them when
+        // they are destroyed.
+        pending_normal_framebuffer.reset();
+        pending_normal_view.reset();
+        pending_storage_views.clear();
+        pending_original_image.reset();
+    }
+    // An original left behind (a ScaleUp that could not release one already pending, or an
+    // upload that made it again) goes now that the scaled copy is the one in use.
+    if (True(flags & ImageFlagBits::Rescaled) && !original_image_released &&
+        !pending_original_image) {
+        ReleaseOriginalImage();
+    }
 }
 
 bool Image::BlitScaleHelper(bool scale_up) {

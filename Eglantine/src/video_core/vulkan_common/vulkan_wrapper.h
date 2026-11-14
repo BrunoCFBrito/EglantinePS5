@@ -715,7 +715,8 @@ public:
 
     Image(Image&& rhs) noexcept
         : handle{std::exchange(rhs.handle, VkImage{})}, usage{rhs.usage}, owner{rhs.owner},
-          allocator{rhs.allocator}, allocation{rhs.allocation}, dld{rhs.dld} {}
+          allocator{rhs.allocator}, allocation{std::exchange(rhs.allocation, VmaAllocation{})},
+          dld{rhs.dld} {}
 
     Image& operator=(Image&& rhs) noexcept {
         Release();
@@ -723,7 +724,7 @@ public:
         usage = rhs.usage;
         owner = rhs.owner;
         allocator = rhs.allocator;
-        allocation = rhs.allocation;
+        allocation = std::exchange(rhs.allocation, VmaAllocation{});
         dld = rhs.dld;
         return *this;
     }
@@ -739,6 +740,7 @@ public:
     void reset() noexcept {
         Release();
         handle = VkImage{};
+        allocation = VmaAllocation{};
     }
 
     explicit operator bool() const noexcept {

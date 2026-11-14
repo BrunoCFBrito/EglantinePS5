@@ -620,6 +620,10 @@ private:
     /// bound to its layers for a SparseLayers one.
     u64 ImageMemoryBytes(const Image& image) const;
 
+    /// Applies the device memory an image gave back (+) or took again (-) when its full-size
+    /// original was released or made again (Image::TakeOriginalImageAccountingDelta).
+    void ApplyImageMemoryDelta(s64 delta);
+
     void QueueAsyncDecode(Image& image, ImageId image_id);
     void TickAsyncDecode();
 

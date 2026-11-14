@@ -547,6 +547,18 @@ void TextureCache<P>::TickFrame() {
             gpu_sentenced_images.pop_front();
         }
     }
+    if constexpr (requires(Image& image) {
+                      image.TickReleasedOriginalImage();
+                      image.TakeOriginalImageAccountingDelta();
+                  }) {
+        // Destroy originals freed after scaling (EDEN_NX2_DEPTH_ORIGINAL) once the GPU is past
+        // them, and apply what their release or re-making changed in the estimate. A driver
+        // reading below replaces the estimate anyway.
+        for (const auto [image_id, image] : slot_images) {
+            image->TickReleasedOriginalImage();
+            ApplyImageMemoryDelta(image->TakeOriginalImageAccountingDelta());
+        }
+    }
     // If we can obtain the memory info, use it instead of the estimate.
     if (runtime.CanReportMemoryUsage()) {
         total_used_memory = runtime.GetDeviceMemoryUsage();
@@ -617,7 +629,7 @@ void TextureCache<P>::TickFrame() {
                     ++scaled;
                     scaled_bytes += copy;
                 }
-                if (bytes == 0) {
+                if (bytes == 0 && copy == 0) {
                     ++unbacked;
                 } else if (image->info.format >= PixelFormat::MaxColorFormat) {
                     ++depths;
@@ -2930,6 +2942,13 @@ u64 TextureCache<P>::GetScaledImageSizeBytes(const ImageBase& image) {
 
 template <class P>
 u64 TextureCache<P>::ImageMemoryBytes(const Image& image) const {
+    if constexpr (requires(const Image& probe) { probe.IsOriginalImageReleased(); }) {
+        if (image.IsOriginalImageReleased()) {
+            // The original has been freed; the scaled copy is counted separately by
+            // GetScaledImageSizeBytes and is the only copy holding device memory now.
+            return 0;
+        }
+    }
     if (True(image.flags & ImageFlagBits::Unbacked)) {
         // No device memory but what BindLayers gave a SparseLayers image: at its full size (GBs
         // for title 1's sparse terrain images), deleting it would look to the collector like
@@ -2946,6 +2965,15 @@ u64 TextureCache<P>::ImageMemoryBytes(const Image& image) const {
         tentative_size = TranscodedAstcSize(tentative_size, image.info.format);
     }
     return Common::AlignUp(tentative_size, 1024);
+}
+
+template <class P>
+void TextureCache<P>::ApplyImageMemoryDelta(s64 delta) {
+    if (delta > 0) {
+        total_used_memory -= (std::min)(total_used_memory, static_cast<u64>(delta));
+    } else if (delta < 0) {
+        total_used_memory += static_cast<u64>(-delta);
+    }
 }
 
 template <class P>
@@ -3189,6 +3217,9 @@ bool TextureCache<P>::ScaleUp(Image& image) {
     if (!has_copy && image.HasScaled()) {
         total_used_memory += GetScaledImageSizeBytes(image);
     }
+    if constexpr (requires { image.TakeOriginalImageAccountingDelta(); }) {
+        ApplyImageMemoryDelta(image.TakeOriginalImageAccountingDelta());
+    }
     if (!rescaled) {
         return false;
     }
@@ -3199,6 +3230,9 @@ bool TextureCache<P>::ScaleUp(Image& image) {
 template <class P>
 bool TextureCache<P>::ScaleDown(Image& image) {
     const bool rescaled = image.ScaleDown();
+    if constexpr (requires { image.TakeOriginalImageAccountingDelta(); }) {
+        ApplyImageMemoryDelta(image.TakeOriginalImageAccountingDelta());
+    }
     if (!rescaled) {
         return false;
     }
@@ -4329,6 +4363,11 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
         if (async_decode->image_id == image_id) {
             async_decode->cancelled = true;
         }
+    }
+    if constexpr (requires { slot_images[image_id].TakeOriginalImageAccountingDelta(); }) {
+        // Memory given back or taken again for a released original, before what is left of the
+        // image is subtracted below (ImageMemoryBytes returns 0 while it is released).
+        ApplyImageMemoryDelta(slot_images[image_id].TakeOriginalImageAccountingDelta());
     }
     if (image.HasScaled()) {
         total_used_memory -= GetScaledImageSizeBytes(image);
