@@ -1235,6 +1235,9 @@ std::vector<std::uint8_t> pack_times; // per slot, the scanner's: how often it w
 std::atomic<bool> pack_refused{false};
 std::mutex pack_mutex; // the scanner's cold pass and packing, and eden_memory_recover
 thread_local bool holding_pack = false; // this thread holds pack_mutex (a heap growth inside must not wait for it)
+// A RecoverMemory pack loop is running (any thread). GiveBackIdleBlocks leaves the guest's
+// blocks alone while one runs: the pack may need one next.
+std::atomic<unsigned> recover_active{0};
 std::vector<std::size_t> recover_order; // eden_memory_recover's list, room made once (no allocation there)
 std::vector<std::size_t> pack_ready;    // PackPass's, likewise
 std::vector<char> pack_scratch;
@@ -1944,18 +1947,29 @@ namespace {
 // the JIT were refused their next piece and the app ended, while 768 MiB sat in these two; a
 // guest write or unpack that later finds the pool empty asks for packing as before.
 std::size_t GiveBackIdleBlocks(std::size_t bytes) noexcept {
+    // These are the guest's emergency blocks, not spare memory: a writer waiting for a block
+    // (memory_waiters) takes one from the reserve or the unpack keep, and a pack loop in flight
+    // may need them next. On 2026-11-14 the heap's recovery gave back 96 MiB here while a write
+    // fault was waiting for one block; that slot waited 2 s and the app died. Keep both while
+    // anyone is waiting, and keep half of each otherwise (the rule TakeHostReserveBlock uses).
+    if (memory_waiters.load(std::memory_order_acquire) != 0) return 0;
+    if (recover_active.load(std::memory_order_acquire) != 0 && !holding_pack) return 0;
+    const std::size_t keep_unpack = UnpackKeepTarget() / 2;
+    const std::size_t keep_reserve = ReserveTarget() / 2;
     std::size_t freed = 0;
     while (freed < bytes) {
         std::int64_t physical = -1;
         Spin(unpack_keep_lock);
-        if (const std::size_t count = unpack_keep_count.load(std::memory_order_relaxed); count > 0) {
+        if (const std::size_t count = unpack_keep_count.load(std::memory_order_relaxed);
+            count > keep_unpack) {
             physical = unpack_keep[count - 1];
             unpack_keep_count.store(count - 1, std::memory_order_relaxed);
         }
         unpack_keep_lock.clear(std::memory_order_release);
         if (physical < 0) {
             Spin(reserve_lock);
-            if (const std::size_t count = reserve_count.load(std::memory_order_relaxed); count > 0) {
+            if (const std::size_t count = reserve_count.load(std::memory_order_relaxed);
+                count > keep_reserve) {
                 physical = reserve[count - 1];
                 reserve_count.store(count - 1, std::memory_order_relaxed);
             }
@@ -1992,7 +2006,13 @@ std::size_t RecoverMemory(std::size_t bytes, bool wait) noexcept {
     if (wait) pack_lock.lock();
     else if (!pack_lock.try_lock()) return trimmed + GiveBackIdleBlocks(bytes);
     holding_pack = true;
-    struct Held { ~Held() { holding_pack = false; } } held;
+    struct Held {
+        Held() { recover_active.fetch_add(1, std::memory_order_relaxed); }
+        ~Held() {
+            recover_active.fetch_sub(1, std::memory_order_relaxed);
+            holding_pack = false;
+        }
+    } held;
     if (packed_slots.load(std::memory_order_acquire) == nullptr || cold_since.empty() ||
         recover_order.capacity() < cold_since.size())
         return trimmed + GiveBackIdleBlocks(bytes);
