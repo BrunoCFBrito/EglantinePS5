@@ -2404,7 +2404,9 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
             return;
         }
     }
-    if (!UploadInChunks(image)) {
+    // Converted images upload converted bytes, which UploadInChunks does not handle: a whole one
+    // would ask for its converted size in one staging buffer (214 MiB in the 18:55 run).
+    if (!UploadConvertedInChunks(image) && !UploadInChunks(image)) {
         auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));
         UploadImageContents(image, staging);
         runtime.InsertUploadMemoryBarrier();
@@ -2506,6 +2508,111 @@ bool TextureCache<P>::DownloadInChunks(Image& image) {
     }
     flush_group();
     return true;
+}
+
+template <class P>
+bool TextureCache<P>::UploadConvertedInChunks(Image& image) {
+    // A converted image is unswizzled and converted on the CPU. A whole upload makes a staging
+    // buffer of its converted size (hundreds of MiB for a large ASTC image), which the pool can
+    // refuse. Take the same 2D block-linear layout UploadInChunks takes, one band at a time:
+    // unswizzle the band into the scratch buffer, convert it, upload the <=32 MiB slice.
+    constexpr u64 min_size = 64_MiB;
+    constexpr ImageFlagBits excluded =
+        ImageFlagBits::Sparse | ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles |
+        ImageFlagBits::AcceleratedUpload | ImageFlagBits::Unbacked |
+        ImageFlagBits::TrimmedLevels;
+    if (False(image.flags & ImageFlagBits::Converted) || True(image.flags & excluded) ||
+        image.info.type != ImageType::e2D || MapSizeBytes(image) < min_size) {
+        return false;
+    }
+    // The whole layout is checked before anything is uploaded: a fallback after some bands would
+    // leave the image half updated.
+    const std::array whole_range{std::pair<u64, u64>{0, image.guest_size_bytes}};
+    const auto probe = PlanUnswizzleImageRows(image.gpu_addr, image.info, whole_range);
+    if (!probe.layout_valid || probe.copies.empty()) {
+        return false;
+    }
+    for (const BufferImageCopy& copy : probe.copies) {
+        // The conversion reads a run's rows at the run's own pitch. A run clamped at the right
+        // edge (a width not a multiple of the block row) would read the wrong blocks.
+        if (copy.buffer_row_length != copy.image_extent.width) {
+            return false;
+        }
+    }
+    for (u64 offset = 0; offset < image.guest_size_bytes;) {
+        size_t size = (std::min)(UploadSliceBytes, static_cast<size_t>(image.guest_size_bytes - offset));
+        UnswizzlePlan plan;
+        size_t output_bytes = 0;
+        for (;;) {
+            const std::array range{std::pair<u64, u64>{offset, offset + size}};
+            plan = PlanUnswizzleImageRows(image.gpu_addr, image.info, range);
+            if (!plan.layout_valid) {
+                return false;
+            }
+            boost::container::small_vector<BufferImageCopy, 16> layout{plan.copies.begin(),
+                                                                       plan.copies.end()};
+            ConvertedLayout(image.info, layout);
+            output_bytes =
+                layout.empty() ? 0 : layout.back().buffer_offset + layout.back().buffer_size;
+            // A block row is the smallest band; nothing smaller can be cut.
+            if (output_bytes <= UploadSliceBytes || size <= 64_KiB) {
+                break;
+            }
+            size = (std::max)(size / 2, size_t{64_KiB});
+        }
+        if (output_bytes > UploadSliceBytes) {
+            // A slice that cannot be cut under the bound: the caller uploads the image whole.
+            return false;
+        }
+        offset += size;
+        if (plan.copies.empty()) {
+            continue;
+        }
+        unswizzle_data_buffer.resize_destructive(plan.total_host_bytes);
+        ExecuteUnswizzlePlan(*gpu_memory, plan,
+                             std::span<u8>(unswizzle_data_buffer.data(), plan.total_host_bytes));
+        auto staging = runtime.UploadStagingBuffer(output_bytes);
+        std::vector<BufferImageCopy> copies(plan.copies.begin(), plan.copies.end());
+        ConvertImage(std::span<const u8>(unswizzle_data_buffer.data(), plan.total_host_bytes),
+                     image.info, staging.mapped_span, copies);
+        image.UploadMemory(staging, copies);
+    }
+    runtime.InsertUploadMemoryBarrier();
+    return true;
+}
+
+template <class P>
+void TextureCache<P>::UploadCopyGroups(Image& image, std::span<const u8> source,
+                                       std::span<const BufferImageCopy> copies, bool zero_fill) {
+    size_t begin = 0;
+    while (begin < copies.size()) {
+        size_t end = begin;
+        size_t group_bytes = 0;
+        while (end < copies.size() &&
+               (end == begin || group_bytes + copies[end].buffer_size <= UploadSliceBytes)) {
+            group_bytes += copies[end].buffer_size;
+            ++end;
+        }
+        auto staging = runtime.UploadStagingBuffer(group_bytes);
+        if (zero_fill) {
+            std::memset(staging.mapped_span.data(), 0, group_bytes);
+        }
+        boost::container::small_vector<BufferImageCopy, 16> group;
+        group.reserve(end - begin);
+        size_t offset = 0;
+        for (size_t i = begin; i < end; ++i) {
+            BufferImageCopy copy = copies[i];
+            if (!zero_fill) {
+                std::memcpy(staging.mapped_span.data() + offset,
+                            source.data() + copy.buffer_offset, copy.buffer_size);
+            }
+            copy.buffer_offset = offset;
+            offset += copies[i].buffer_size;
+            group.push_back(copy);
+        }
+        image.UploadMemory(staging, group);
+        begin = end;
+    }
 }
 
 template <class P>
@@ -3048,9 +3155,15 @@ void TextureCache<P>::QueueAsyncDecode(Image& image, ImageId image_id) {
                 }
                 if (zero) {
                     for (auto& copy : zero_copies) copy.image_subresource.base_layer = layer;
-                    auto zero_staging = runtime.UploadStagingBuffer(out);
-                    std::memset(zero_staging.mapped_span.data(), 0, out);
-                    image.UploadMemory(zero_staging, zero_copies);
+                    std::vector<BufferImageCopy> zero_bands;
+                    if (out > UploadSliceBytes &&
+                        SplitConvertedCopies(layer_info, zero_copies, UploadSliceBytes, zero_bands)) {
+                        UploadCopyGroups(image, {}, zero_bands, true);
+                    } else {
+                        auto zero_staging = runtime.UploadStagingBuffer(out);
+                        std::memset(zero_staging.mapped_span.data(), 0, out);
+                        image.UploadMemory(zero_staging, zero_copies);
+                    }
                 }
                 auto layer_func = [layer_out = out, layer, copies = layer_copies, info = layer_info,
                                    input = std::move(layer_input), async_decode = layer_ptr]() mutable {
@@ -3089,9 +3202,15 @@ void TextureCache<P>::QueueAsyncDecode(Image& image, ImageId image_id) {
         image.flags |= ImageFlagBits::ZeroFilled;
         auto zero_copies = copies;
         ConvertedLayout(image.info, zero_copies);
-        auto staging = runtime.UploadStagingBuffer(out_size);
-        std::memset(staging.mapped_span.data(), 0, out_size);
-        image.UploadMemory(staging, zero_copies);
+        std::vector<BufferImageCopy> zero_bands;
+        if (out_size > UploadSliceBytes &&
+            SplitConvertedCopies(image.info, zero_copies, UploadSliceBytes, zero_bands)) {
+            UploadCopyGroups(image, {}, zero_bands, true);
+        } else {
+            auto staging = runtime.UploadStagingBuffer(out_size);
+            std::memset(staging.mapped_span.data(), 0, out_size);
+            image.UploadMemory(staging, zero_copies);
+        }
         runtime.InsertUploadMemoryBarrier();
     }
 
@@ -3146,10 +3265,16 @@ void TextureCache<P>::TickAsyncDecode() {
             i = async_decodes.erase(i);
             continue;
         }
-        auto staging = runtime.UploadStagingBuffer(async_decode->decoded_data.size());
-        std::memcpy(staging.mapped_span.data(), async_decode->decoded_data.data(),
-                    async_decode->decoded_data.size());
-        image.UploadMemory(staging, async_decode->copies);
+        std::vector<BufferImageCopy> bands;
+        if (async_decode->decoded_data.size() > UploadSliceBytes &&
+            SplitConvertedCopies(image.info, async_decode->copies, UploadSliceBytes, bands)) {
+            UploadCopyGroups(image, async_decode->decoded_data, bands, false);
+        } else {
+            auto staging = runtime.UploadStagingBuffer(async_decode->decoded_data.size());
+            std::memcpy(staging.mapped_span.data(), async_decode->decoded_data.data(),
+                        async_decode->decoded_data.size());
+            image.UploadMemory(staging, async_decode->copies);
+        }
         if (std::none_of(async_decodes.begin(), async_decodes.end(), [&](const auto& other) {
                 return other.get() != async_decode && other->image_id == async_decode->image_id &&
                        !other->cancelled;

@@ -218,6 +218,17 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     /// Splits large 2D image downloads into row bands, avoiding multi-hundred MiB staging buffers.
     bool DownloadInChunks(Image& image);
 
+    /// Splits large converted 2D image uploads into row bands, unswizzled and converted per band.
+    bool UploadConvertedInChunks(Image& image);
+
+    /// Uploads converted copies (buffer offsets into `source`) in staging groups of at most
+    /// UploadSliceBytes; `zero_fill` uploads zeroes instead of `source`.
+    void UploadCopyGroups(Image& image, std::span<const u8> source,
+                          std::span<const BufferImageCopy> copies, bool zero_fill);
+
+    /// The largest staging slice a converted upload or decode upload takes.
+    static constexpr size_t UploadSliceBytes = 32U << 20;
+
     /// Large layered images whose refresh can decode only the layers written since the last one.
     [[nodiscard]] bool UploadsByLayer(const ImageBase& image) const noexcept;
 

@@ -130,6 +130,16 @@ void ExecuteUnswizzlePlan(Tegra::MemoryManager& gpu_memory, const UnswizzlePlan&
 /// Rewrites `copies` (from UnswizzleImage) to the layout ConvertImage produces, without converting.
 void ConvertedLayout(const ImageInfo& info, std::span<BufferImageCopy> copies);
 
+/// Bytes ConvertImage writes for `extent` texels over `layers` layers (one plane each).
+[[nodiscard]] u64 ConvertedCopyBytes(const ImageInfo& info, const Extent3D& extent, u64 layers);
+
+/// Splits converted-layout copies into copies of at most `max_bytes`, along texel rows (block rows
+/// for ASTC sources), keeping buffer offsets into the same converted image. False when a copy
+/// cannot be split (not a 2D image); `out` is then left empty.
+[[nodiscard]] bool SplitConvertedCopies(const ImageInfo& info,
+                                        std::span<const BufferImageCopy> copies, size_t max_bytes,
+                                        std::vector<BufferImageCopy>& out);
+
 void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8> output,
                   std::span<BufferImageCopy> copies);
 

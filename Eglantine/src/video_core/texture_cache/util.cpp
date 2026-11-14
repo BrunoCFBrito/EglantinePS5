@@ -1278,33 +1278,98 @@ void ExecuteUnswizzlePlan(Tegra::MemoryManager& gpu_memory, const UnswizzlePlan&
     }
 }
 
-void ConvertedLayout(const ImageInfo& info, std::span<BufferImageCopy> copies) {
-    // Same offsets and sizes as ConvertImage below.
+u64 ConvertedCopyBytes(const ImageInfo& info, const Extent3D& extent, u64 layers) {
     const auto recompression = Settings::GetAstcRecompression();
     const bool astc = IsPixelFormatASTC(info.format);
+    if (astc && recompression == Settings::AstcRecompression::Uncompressed) {
+        return u64{extent.width} * extent.height * layers *
+               BytesPerBlock(PixelFormat::A8B8G8R8_UNORM);
+    }
+    if (astc) {
+        const u64 bpp_div =
+            recompression == Settings::AstcRecompression::Bc1 || info.astc_opaque ? 2 : 1;
+        return u64{Common::AlignUp(extent.width, 4U)} * Common::AlignUp(extent.height, 4U) *
+               layers / bpp_div;
+    }
+    return u64{extent.width} * extent.height * layers * ConvertedBytesPerBlock(info.format);
+}
+
+void ConvertedLayout(const ImageInfo& info, std::span<BufferImageCopy> copies) {
+    // Same offsets and sizes as ConvertImage below. The row lengths describe the copy's own
+    // extent: row bands of a large image convert at their own pitch, whole mips are unchanged.
     u64 output_offset = 0;
     for (BufferImageCopy& copy : copies) {
-        const Extent3D mip_size = AdjustMipSize(info.size, copy.image_subresource.base_level);
         const u64 layers = static_cast<u64>(copy.image_subresource.num_layers) * copy.image_extent.depth;
-        u64 size;
-        if (astc && recompression == Settings::AstcRecompression::Uncompressed) {
-            size = u64{copy.image_extent.width} * copy.image_extent.height * layers *
-                   BytesPerBlock(PixelFormat::A8B8G8R8_UNORM);
-        } else if (astc) {
-            const u64 bpp_div =
-                recompression == Settings::AstcRecompression::Bc1 || info.astc_opaque ? 2 : 1;
-            size = u64{Common::AlignUp(copy.image_extent.width, 4U)} *
-                   Common::AlignUp(copy.image_extent.height, 4U) * layers / bpp_div;
-        } else {
-            size = u64{copy.image_extent.width} * copy.image_extent.height * layers *
-                   ConvertedBytesPerBlock(info.format);
-        }
+        const u64 size = ConvertedCopyBytes(info, copy.image_extent, layers);
         copy.buffer_offset = output_offset;
         copy.buffer_size = size;
-        copy.buffer_row_length = mip_size.width;
-        copy.buffer_image_height = mip_size.height;
+        copy.buffer_row_length = copy.image_extent.width;
+        copy.buffer_image_height = copy.image_extent.height;
         output_offset += size;
     }
+}
+
+bool SplitConvertedCopies(const ImageInfo& info, std::span<const BufferImageCopy> copies,
+                          size_t max_bytes, std::vector<BufferImageCopy>& out) {
+    out.clear();
+    // Converted rows are block rows (4 texels) of an ASTC source and single texels otherwise; a
+    // band has to cut on those boundaries to line up with ConvertImage's output.
+    const u32 row_alignment = IsPixelFormatASTC(info.format) ? 4 : 1;
+    const bool splittable = info.type == ImageType::e2D && info.size.depth == 1 &&
+                            info.num_samples == 1;
+    for (const BufferImageCopy& copy : copies) {
+        if (copy.buffer_size <= max_bytes) {
+            out.push_back(copy);
+            continue;
+        }
+        if (!splittable || copy.image_extent.depth != 1) {
+            out.clear();
+            return false;
+        }
+        const u32 layers = static_cast<u32>(copy.image_subresource.num_layers);
+        const u64 plane = ConvertedCopyBytes(info, copy.image_extent, 1);
+        if (layers == 0 || plane == 0 || plane * layers != copy.buffer_size) {
+            out.clear();
+            return false;
+        }
+        const u32 width = copy.image_extent.width;
+        const u32 height = copy.image_extent.height;
+        const u64 row_block = ConvertedCopyBytes(info, Extent3D{width, row_alignment, 1}, 1);
+        if (row_block == 0) {
+            out.clear();
+            return false;
+        }
+        const u32 blocks_y = Common::DivideUp(height, row_alignment);
+        const u32 block_step =
+            static_cast<u32>((std::max)(u64{1}, static_cast<u64>(max_bytes) / row_block));
+        for (u32 layer = 0; layer < layers; ++layer) {
+            const size_t layer_base = copy.buffer_offset + static_cast<size_t>(plane) * layer;
+            size_t written = 0;
+            for (u32 block = 0; block < blocks_y; block += block_step) {
+                const u32 y = block * row_alignment;
+                const u32 band_height =
+                    (std::min)(row_alignment * (blocks_y - block), height - y);
+                BufferImageCopy band = copy;
+                band.buffer_offset = layer_base + static_cast<size_t>(block) * row_block;
+                band.buffer_size =
+                    ConvertedCopyBytes(info, Extent3D{width, band_height, 1}, 1);
+                band.buffer_row_length = width;
+                band.buffer_image_height = band_height;
+                band.image_subresource.base_layer += static_cast<s32>(layer);
+                band.image_subresource.num_layers = 1;
+                band.image_offset = {copy.image_offset.x,
+                                     copy.image_offset.y + static_cast<s32>(y), 0};
+                band.image_extent = {width, band_height, 1};
+                written += band.buffer_size;
+                out.push_back(band);
+            }
+            if (written != plane) {
+                out.clear();
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8> output,
@@ -1314,13 +1379,10 @@ void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8
 
     const Extent2D tile_size = DefaultBlockSize(info.format);
     for (BufferImageCopy& copy : copies) {
-        const u32 level = copy.image_subresource.base_level;
-        const Extent3D mip_size = AdjustMipSize(info.size, level);
-        ASSERT(copy.image_offset == Offset3D{});
-        ASSERT(copy.image_subresource.base_layer == 0);
-        ASSERT(copy.image_extent == mip_size);
-        ASSERT(copy.buffer_row_length == Common::AlignUp(mip_size.width, tile_size.width));
-        ASSERT(copy.buffer_image_height == Common::AlignUp(mip_size.height, tile_size.height));
+        // Row bands of a large image arrive with their own extent and tight rows; a whole-mip copy
+        // has the mip's own. The conversion reads the extent's rows at its own pitch either way.
+        ASSERT(copy.buffer_row_length == copy.image_extent.width);
+        ASSERT(copy.buffer_image_height == copy.image_extent.height);
 
         const auto input_offset = input.subspan(copy.buffer_offset);
         copy.buffer_offset = output_offset;
@@ -1334,9 +1396,11 @@ void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8
                 copy.image_subresource.num_layers * copy.image_extent.depth, tile_size.width,
                 tile_size.height, output.subspan(output_offset));
 
-            output_offset += copy.image_extent.width * copy.image_extent.height *
-                             copy.image_subresource.num_layers *
-                             BytesPerBlock(PixelFormat::A8B8G8R8_UNORM);
+            copy.buffer_size =
+                ConvertedCopyBytes(info, copy.image_extent,
+                                   static_cast<u64>(copy.image_subresource.num_layers) *
+                                       copy.image_extent.depth);
+            output_offset += static_cast<u32>(copy.buffer_size);
         } else if (astc) {
             // BC1 uses 0.5 bytes per texel
             // BC3 uses 1 byte per texel
@@ -1375,13 +1439,15 @@ void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8
             output_offset += static_cast<u32>(copy.buffer_size);
         } else {
             DecompressBCn(input_offset, output.subspan(output_offset), copy, info.format);
-            output_offset += copy.image_extent.width * copy.image_extent.height *
-                             copy.image_subresource.num_layers *
-                             ConvertedBytesPerBlock(info.format);
+            copy.buffer_size =
+                ConvertedCopyBytes(info, copy.image_extent,
+                                   static_cast<u64>(copy.image_subresource.num_layers) *
+                                       copy.image_extent.depth);
+            output_offset += static_cast<u32>(copy.buffer_size);
         }
 
-        copy.buffer_row_length = mip_size.width;
-        copy.buffer_image_height = mip_size.height;
+        copy.buffer_row_length = copy.image_extent.width;
+        copy.buffer_image_height = copy.image_extent.height;
     }
 }
 
