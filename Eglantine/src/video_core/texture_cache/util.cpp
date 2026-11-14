@@ -1550,27 +1550,44 @@ void SwizzleImage(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const Ima
 std::vector<BufferImageCopy> PlanDownloadImageBands(const ImageInfo& info, size_t band_bytes) {
     std::vector<BufferImageCopy> bands;
     // A band is a run of whole rows of one level and layer, tightly packed: what SwizzleSubrect
-    // reads. A whole download of a very large image would need a staging buffer of its full size
-    // (rounded up to a power of two: 512 MiB for 288 MiB of data), which the console memory pool
-    // can refuse even with enough free bytes in smaller blocks.
+    // reads. Bands start and end on a block-linear block row, so the guest bytes a band touches
+    // are one contiguous run and SwizzleImageBand maps only that run. A whole download of a very
+    // large image would need a host copy of its full size, which the console can refuse even with
+    // enough free bytes in smaller blocks.
     if (info.type != ImageType::e2D || info.size.depth != 1 || info.num_samples != 1 ||
         info.tile_width_spacing != 0 || DefaultBlockWidth(info.format) != 1 ||
         DefaultBlockHeight(info.format) != 1) {
         return bands;
     }
     const u32 bytes_per_block = BytesPerBlock(info.format);
+    const LevelInfo level_info = MakeLevelInfo(info);
     const u32 levels = HostMipLevelCount(info.size.width, info.size.height, info.size.depth,
                                          static_cast<u32>(info.resources.levels));
     for (s32 level = 0; level < static_cast<s32>(levels); ++level) {
         const Extent3D level_size = AdjustMipSize(info.size, level);
-        const size_t row_bytes = size_t{level_size.width} * bytes_per_block;
-        const u32 rows = (std::max)(u32{1}, static_cast<u32>(band_bytes / row_bytes));
+        const u32 row_bytes = level_size.width * bytes_per_block;
+        const Extent3D num_tiles = AdjustTileSize(level_size, DefaultBlockSize(info.format));
+        const Extent3D block =
+            AdjustMipBlockSize(num_tiles, level_info.block, level, level_info.num_levels);
+        const u32 gobs_in_x =
+            Common::DivCeilLog2(Common::AlignUpLog2(level_size.width * bytes_per_block,
+                                                    GOB_SIZE_X_SHIFT),
+                                GOB_SIZE_X_SHIFT);
+        const u32 block_bytes = gobs_in_x << (GOB_SIZE_SHIFT + block.height + block.depth);
+        // One block row is the smallest run SwizzleImageBand can map on its own; a band smaller
+        // than that would map the whole block row anyway.
+        if (block_bytes > band_bytes) {
+            return {};
+        }
+        const u32 rows_per_block = GOB_SIZE_Y << block.height;
+        const u32 blocks_per_band = (std::max)(u32{1}, static_cast<u32>(band_bytes / block_bytes));
+        const u32 rows = rows_per_block * blocks_per_band;
         for (s32 layer = 0; layer < info.resources.layers; ++layer) {
             for (u32 y = 0; y < level_size.height; y += rows) {
                 const u32 height = (std::min)(rows, level_size.height - y);
                 bands.push_back(BufferImageCopy{
                     .buffer_offset = 0,
-                    .buffer_size = row_bytes * height,
+                    .buffer_size = size_t{row_bytes} * height,
                     .buffer_row_length = level_size.width,
                     .buffer_image_height = height,
                     .image_subresource =
@@ -1613,15 +1630,38 @@ void SwizzleImageBand(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const
     const size_t guest_offset =
         CalculateLevelBytes(sizes, level) +
         static_cast<size_t>(copy.image_subresource.base_layer) * layer_stride;
+    // The guest bytes the band touches: one contiguous run of block rows, from the block holding
+    // its first row to the end of the block holding its last. Mapping and writing this run keeps
+    // the host scratch at the band's size instead of the whole level (288 MiB for the
+    // 12288x12288 shadow map this was found on).
+    const u32 gobs_in_x =
+        Common::DivCeilLog2(Common::AlignUpLog2(level_size.width * bytes_per_block,
+                                                GOB_SIZE_X_SHIFT),
+                            GOB_SIZE_X_SHIFT);
+    const u32 block_bytes = gobs_in_x << (GOB_SIZE_SHIFT + block.height + block.depth);
+    const u32 block_height_mask = (1U << block.height) - 1;
+    const u32 first_y = static_cast<u32>(copy.image_offset.y);
+    const u32 last_y = first_y + copy.image_extent.height - 1;
+    const auto row_block_offset = [&](u32 y) {
+        const u32 block_y = y >> GOB_SIZE_Y_SHIFT;
+        return (block_y >> block.height) * block_bytes +
+               ((block_y & block_height_mask) << GOB_SIZE_SHIFT);
+    };
+    const u32 first_offset = row_block_offset(first_y);
+    const u32 span = row_block_offset(last_y) + block_bytes - first_offset;
+    const size_t level_bytes = sizes[level];
+    const size_t guest_size =
+        first_offset < level_bytes ? (std::min)(static_cast<size_t>(span), level_bytes - first_offset)
+                                   : 0;
 
     Tegra::Memory::GpuGuestMemoryScoped<u8, Tegra::Memory::GuestMemoryFlags::UnsafeReadWrite>
-        dst(gpu_memory, gpu_addr + guest_offset, sizes[level], &tmp_buffer);
+        dst(gpu_memory, gpu_addr + guest_offset + first_offset, guest_size, &tmp_buffer);
     Tegra::Texture::SwizzleSubrect(
         dst, memory.subspan(copy.buffer_offset), bytes_per_block, level_size.width,
         level_size.height, level_size.depth,
-        static_cast<u32>(copy.image_offset.x), static_cast<u32>(copy.image_offset.y),
+        static_cast<u32>(copy.image_offset.x), first_y,
         copy.image_extent.width, copy.image_extent.height, block.height, block.depth,
-        copy.buffer_row_length * bytes_per_block, gpu_memory.UsesNativeTiling());
+        copy.buffer_row_length * bytes_per_block, gpu_memory.UsesNativeTiling(), first_offset);
 }
 
 bool IsBlockLinearSizeCompatible(const ImageInfo& lhs, const ImageInfo& rhs, u32 lhs_level,

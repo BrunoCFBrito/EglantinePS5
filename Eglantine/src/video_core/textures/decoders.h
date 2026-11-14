@@ -40,10 +40,12 @@ void SwizzleTexture(std::span<u8> output, std::span<const u8> input, u32 bytes_p
 std::size_t CalculateSize(bool tiled, u32 bytes_per_pixel, u32 width, u32 height, u32 depth,
                           u32 block_height, u32 block_depth);
 
-/// Copies an untiled subrectangle into a tiled surface.
+/// Copies an untiled subrectangle into a tiled surface. `dst_offset` is the byte offset in the
+/// tiled level that `output[0]` stands for: a band of a large level maps and writes only itself.
 void SwizzleSubrect(std::span<u8> output, std::span<const u8> input, u32 bytes_per_pixel, u32 width,
                     u32 height, u32 depth, u32 origin_x, u32 origin_y, u32 extent_x, u32 extent_y,
-                    u32 block_height, u32 block_depth, u32 pitch_linear, bool native_tiling = false);
+                    u32 block_height, u32 block_depth, u32 pitch_linear, bool native_tiling = false,
+                    u32 dst_offset = 0);
 
 /// Copies a tiled subrectangle into a linear surface.
 void UnswizzleSubrect(std::span<u8> output, std::span<const u8> input, u32 bytes_per_pixel,
