@@ -418,11 +418,24 @@ struct System::Impl {
 
         // Switch 2 titles size their heap from the total memory and need the 12 GiB layout. Set it
         // as a per-game value, so RestoreGlobalState brings back the configured layout afterwards.
-        if (switch2_program &&
-            Settings::values.memory_layout_mode.GetValue() != Settings::MemoryLayout::Memory_12Gb) {
-            LOG_INFO(Core, "Switch 2 program: using the 12 GiB memory layout");
-            Settings::values.memory_layout_mode.SetGlobal(false);
-            Settings::values.memory_layout_mode.SetValue(Settings::MemoryLayout::Memory_12Gb);
+        // EDEN_NX2_MEMORY_LAYOUT_GB=4|6|8|10 picks a smaller layout (experiment, titles may not boot).
+        if (switch2_program) {
+            auto layout{Settings::MemoryLayout::Memory_12Gb};
+            int layout_gb{12};
+            if (const char* value = std::getenv("EDEN_NX2_MEMORY_LAYOUT_GB")) {
+                switch (std::strtoull(value, nullptr, 10)) {
+                case 4: layout = Settings::MemoryLayout::Memory_4Gb; layout_gb = 4; break;
+                case 6: layout = Settings::MemoryLayout::Memory_6Gb; layout_gb = 6; break;
+                case 8: layout = Settings::MemoryLayout::Memory_8Gb; layout_gb = 8; break;
+                case 10: layout = Settings::MemoryLayout::Memory_10Gb; layout_gb = 10; break;
+                default: break;
+                }
+            }
+            if (Settings::values.memory_layout_mode.GetValue() != layout) {
+                LOG_INFO(Core, "Switch 2 program: using the {} GiB memory layout", layout_gb);
+                Settings::values.memory_layout_mode.SetGlobal(false);
+                Settings::values.memory_layout_mode.SetValue(layout);
+            }
         }
 
         // The Switch 2 counter runs at 31.25 MHz and its SDK converts ticks with that constant

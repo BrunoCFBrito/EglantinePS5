@@ -839,6 +839,24 @@ void LogMemoryTrace(const Device& device) {
     LOG_INFO(Render_Vulkan, "Memory trace: types {}", types);
 }
 
+void PrintMemoryStatistics(const Device& device) {
+    const VmaAllocator allocator = device.GetAllocator();
+    const VkPhysicalDeviceMemoryProperties* properties{};
+    vmaGetMemoryProperties(allocator, &properties);
+    VmaTotalStatistics stats{};
+    vmaCalculateStatistics(allocator, &stats);
+    for (u32 type = 0; type < properties->memoryTypeCount; ++type) {
+        const VmaStatistics& s = stats.memoryType[type].statistics;
+        if (s.blockCount == 0) {
+            continue;
+        }
+        std::fprintf(stderr, "EDEN_MEM_SPLIT vma type=%u flags=0x%x blocks=%u/%lluMiB allocations=%u/%lluMiB\n",
+                     type, static_cast<unsigned>(properties->memoryTypes[type].propertyFlags), s.blockCount,
+                     static_cast<unsigned long long>(s.blockBytes >> 20), s.allocationCount,
+                     static_cast<unsigned long long>(s.allocationBytes >> 20));
+    }
+}
+
 void LogMemoryStatistics(const Device& device) {
     const VmaAllocator allocator = device.GetAllocator();
     const VkPhysicalDeviceMemoryProperties* properties{};

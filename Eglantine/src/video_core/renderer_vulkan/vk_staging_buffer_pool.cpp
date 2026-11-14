@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <utility>
 #include <vector>
 
@@ -42,7 +43,8 @@ constexpr VkDeviceSize MAX_ALIGNMENT = 256;
 constexpr VkDeviceSize MAX_STREAM_BUFFER_SIZE = 128_MiB;
 #else
 // 128 MiB on Windows too: 256 MiB sat mostly unused in device memory on Switch 2 titles.
-constexpr VkDeviceSize MAX_STREAM_BUFFER_SIZE = 128_MiB;
+// PS5 memory test: 64 MiB. The 288 MiB shadow-map uploads go to dedicated staging anyway.
+constexpr VkDeviceSize MAX_STREAM_BUFFER_SIZE = 64_MiB;
 #endif
 
 // Unused space after the end of the stream buffer. Constant buffers are bound from it and the
@@ -87,6 +89,35 @@ size_t GetStreamBufferSize(const Device& device) {
         size = MAX_STREAM_BUFFER_SIZE;
     }
     return (std::min)(Common::AlignUp(size, MAX_ALIGNMENT), MAX_STREAM_BUFFER_SIZE);
+}
+
+// Byte cap over the three staging caches together. The pool a title gets on the console is small
+// (Ocarina of Time: 12,224 MiB) and the caches held up to 264 MiB of device-local buffers and
+// 176 MiB of uploads besides. EDEN_STAGING_CAP_MIB overrides the cap in MiB; 0 lifts it.
+constexpr u64 DEFAULT_STAGING_CAP_BYTES = u64{192} << 20;
+constexpr u64 NO_STAGING_CAP_BYTES = ~u64{0};
+
+// An idle buffer larger than this is let go on the frame its tick completes, not on its level's
+// next sweep (up to 64 frames later). One 12288x12288 D16 shadow map is 288 MiB.
+constexpr u64 LARGE_IDLE_RELEASE_BYTES = u64{32} << 20;
+
+u64 GetStagingCapBytes() {
+    static const u64 cap = [] {
+        const char* const text = std::getenv("EDEN_STAGING_CAP_MIB");
+        if (text == nullptr || text[0] == '\0') {
+            return DEFAULT_STAGING_CAP_BYTES;
+        }
+        char* end = nullptr;
+        const unsigned long long mib = std::strtoull(text, &end, 10);
+        if (end == text || *end != '\0') {
+            return DEFAULT_STAGING_CAP_BYTES;
+        }
+        if (mib == 0 || mib > (NO_STAGING_CAP_BYTES >> 20)) {
+            return NO_STAGING_CAP_BYTES;
+        }
+        return u64{mib} << 20;
+    }();
+    return cap;
 }
 } // Anonymous namespace
 
@@ -163,6 +194,85 @@ void StagingBufferPool::TickFrame() {
     ReleaseCache(MemoryUsage::Download);
     if (::Eden::Performance::GraphicsMemoryIsShort()) {
         ReleaseCompleted();
+    }
+
+    const auto idle = [this](const StagingBuffer& entry) {
+        return !entry.deferred && scheduler.IsFree(entry.tick);
+    };
+    const auto bytes_of = [](const StagingBuffer& entry) {
+        return ::Eden::StagingBuffers::Holds(entry.mapped_span.size(), entry.log2_level);
+    };
+    StagingBuffersCache* const caches[] = {&device_local_cache, &upload_cache, &download_cache};
+
+    // Large idle buffers go on the frame their tick completes. Their level's sweep is up to 64
+    // frames away, and a large level is usually one buffer.
+    const auto is_large_idle = [&idle, &bytes_of](const StagingBuffer& entry) {
+        return idle(entry) && bytes_of(entry) > LARGE_IDLE_RELEASE_BYTES;
+    };
+    for (StagingBuffersCache* const cache : caches) {
+        for (StagingBuffers& level : *cache) {
+            ::Eden::StagingBuffers::ReleaseFrom(level, is_large_idle);
+        }
+    }
+
+    // Over the cap: let go of the largest idle buffers until the caches fit again. Buffers in use
+    // and deferred ones are counted, they hold memory, but they are never released here.
+    const u64 cap = GetStagingCapBytes();
+    struct IdleBuffer {
+        u64 index;
+        u64 bytes;
+    };
+    std::vector<IdleBuffer> idle_buffers;
+    u64 held = 0;
+    for (StagingBuffersCache* const cache : caches) {
+        for (const StagingBuffers& level : *cache) {
+            for (const StagingBuffer& entry : level.entries) {
+                const u64 bytes = bytes_of(entry);
+                held += bytes;
+                if (idle(entry)) {
+                    idle_buffers.push_back({entry.index, bytes});
+                }
+            }
+        }
+    }
+    if (held <= cap) {
+        return;
+    }
+    std::sort(idle_buffers.begin(), idle_buffers.end(),
+              [](const IdleBuffer& a, const IdleBuffer& b) { return a.bytes > b.bytes; });
+    u64 released_bytes = 0;
+    std::vector<u64> doomed;
+    for (const IdleBuffer& candidate : idle_buffers) {
+        if (held - released_bytes <= cap) {
+            break;
+        }
+        released_bytes += candidate.bytes;
+        doomed.push_back(candidate.index);
+    }
+    if (doomed.empty()) {
+        return;
+    }
+    std::sort(doomed.begin(), doomed.end());
+    const auto drop = [this, &doomed](const StagingBuffer& entry) {
+        return !entry.deferred && scheduler.IsFree(entry.tick) &&
+               std::binary_search(doomed.begin(), doomed.end(), entry.index);
+    };
+    size_t released_buffers = 0;
+    for (StagingBuffersCache* const cache : caches) {
+        for (StagingBuffers& level : *cache) {
+            released_buffers += ::Eden::StagingBuffers::ReleaseFrom(level, drop).buffers;
+        }
+    }
+    static std::atomic<unsigned long long> rows{0};
+    const auto row = rows.fetch_add(1, std::memory_order_relaxed);
+    if (row < 64 || (row & 255) == 0) {
+        std::fprintf(stderr,
+                     "EDEN_STAGING_CAP cap=%llu MiB held=%llu MiB released=%zu buffers (%llu MiB) "
+                     "left=%llu MiB\n",
+                     static_cast<unsigned long long>(cap >> 20),
+                     static_cast<unsigned long long>(held >> 20), released_buffers,
+                     static_cast<unsigned long long>(released_bytes >> 20),
+                     static_cast<unsigned long long>((held - released_bytes) >> 20));
     }
 }
 

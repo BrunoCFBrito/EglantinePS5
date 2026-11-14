@@ -561,6 +561,11 @@ static void ReportFileHandles() {
 static std::atomic<unsigned long long> largest_free_block{0};
 // The driver's own buffer bytes (RADV's PS5 winsys counter, renamed by tools/isolate-radv.py).
 extern "C" unsigned long long eden_radv_private_radv_ps5_allocated_bytes __attribute__((weak));
+// RADV's per-priority buffer report (RADV_PS5_MEMORY_REPORT=1 prints it every 10 s).
+extern "C" void eden_radv_private_radv_ps5_winsys_heap_usage(std::uint64_t*, std::uint64_t*,
+                                                            std::uint64_t*) __attribute__((weak));
+extern "C" void eden_radv_private_radv_ps5_memory_report(std::uint64_t, std::uint64_t,
+                                                         std::uint64_t) __attribute__((weak));
 static void RefreshFreeMemory() {
 #if defined(PS5_NATIVE) || defined(__linux__)
     Eden::HangStacks::Beat();
@@ -595,6 +600,14 @@ static void RefreshFreeMemory() {
                      &eden_radv_private_radv_ps5_allocated_bytes != nullptr
                          ? __atomic_load_n(&eden_radv_private_radv_ps5_allocated_bytes, __ATOMIC_RELAXED) >> 20 : 0ULL,
                      guest_held >> 20, guest_span >> 20);
+        // RADV only queries its heap info at device creation; poll it here so the driver's
+        // per-priority report (RADV_PS5_MEMORY_REPORT=1) reaches stderr through the session.
+        if (&eden_radv_private_radv_ps5_winsys_heap_usage != nullptr) {
+            std::uint64_t pool_bytes = 0, available_bytes = 0, driver_bytes = 0;
+            eden_radv_private_radv_ps5_winsys_heap_usage(&pool_bytes, &available_bytes, &driver_bytes);
+            if (&eden_radv_private_radv_ps5_memory_report != nullptr)
+                eden_radv_private_radv_ps5_memory_report(pool_bytes, available_bytes, driver_bytes);
+        }
         ReportHeap("every 20 s");
         ReportFileHandles();
         ::Kernel::Svc::MemoryStats::Report(stderr);

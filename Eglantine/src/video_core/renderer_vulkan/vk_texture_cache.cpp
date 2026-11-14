@@ -9,6 +9,7 @@
 #include <limits>
 #include <array>
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <optional>
 #include <set>
@@ -2909,6 +2910,14 @@ void TextureCacheRuntime::LogMemoryTrace() {
              staging_buffer_pool.CachedBytes(MemoryUsage::Download) >> 20,
              staging_buffer_pool.CachedBytes(MemoryUsage::DeviceLocal) >> 20);
     Vulkan::LogMemoryTrace(device);
+}
+
+void TextureCacheRuntime::PrintMemorySplit() {
+    std::fprintf(stderr, "EDEN_MEM_SPLIT staging upload_mib=%llu download_mib=%llu device_mib=%llu\n",
+                 static_cast<unsigned long long>(staging_buffer_pool.CachedBytes(MemoryUsage::Upload) >> 20),
+                 static_cast<unsigned long long>(staging_buffer_pool.CachedBytes(MemoryUsage::Download) >> 20),
+                 static_cast<unsigned long long>(staging_buffer_pool.CachedBytes(MemoryUsage::DeviceLocal) >> 20));
+    Vulkan::PrintMemoryStatistics(device);
 }
 
 bool TextureCacheRuntime::UseOpaqueAstcFormat() const {

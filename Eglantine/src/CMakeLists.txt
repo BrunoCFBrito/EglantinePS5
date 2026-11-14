@@ -189,9 +189,7 @@ else()
             $<$<COMPILE_LANGUAGE:C,CXX>:-Wextra>
             $<$<COMPILE_LANGUAGE:C,CXX>:-Wmissing-declarations>
             $<$<COMPILE_LANGUAGE:C,CXX>:-Wshadow>
-            $<$<COMPILE_LANGUAGE:C,CXX>:-Wunused>
-            # Some compilers could particularly misbehave :)
-            $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-error-all>)
+            $<$<COMPILE_LANGUAGE:C,CXX>:-Wunused>)
     endif()
     add_compile_options(
         $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-attributes>

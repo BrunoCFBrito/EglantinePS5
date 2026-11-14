@@ -126,6 +126,9 @@ public:
     /// EDEN_NX2_MEM_TRACE: staging buffers, then the process, DXGI and VMA (LogMemoryTrace).
     void LogMemoryTrace();
 
+    /// EDEN_NX2_MEM_SPLIT: staging pool and allocator totals, to stderr.
+    void PrintMemorySplit();
+
     /// True when ASTC is re-compressed to BC3 and opaque images may use BC1 instead.
     bool UseOpaqueAstcFormat() const;
 
@@ -529,6 +532,11 @@ public:
     /// Where the image's memory lies, for the collector (TextureCache::RunGarbageCollector).
     [[nodiscard]] vk::Image::MemoryBlock MemoryBlock() const noexcept {
         return original_image.GetMemoryBlock();
+    }
+
+    /// The rescaled copy's memory (size 0 when there is none), for EDEN_NX2_MEM_SPLIT.
+    [[nodiscard]] vk::Image::MemoryBlock ScaledMemoryBlock() const noexcept {
+        return scaled_image.GetMemoryBlock();
     }
 
     /// Returns true when the image is already initialized and mark it as initialized

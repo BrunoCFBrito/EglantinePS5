@@ -1238,8 +1238,33 @@ FN_MAX_LIMIT_LIST
     /// in host memory (title 1: a 245 MB file, ~0.35 GB of RAM for the session) and copied it whole
     /// at each save, which stalled frames, and pipelines built no slower without it.
     bool DriverCachesPipelines() const noexcept {
-        return properties.driver.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY ||
-               properties.driver.driverID == VK_DRIVER_ID_AMD_PROPRIETARY;
+        switch (properties.driver.driverID) {
+        case VK_DRIVER_ID_NVIDIA_PROPRIETARY:
+        case VK_DRIVER_ID_AMD_PROPRIETARY:
+            return true;
+        case VK_DRIVER_ID_MESA_RADV: {
+            // EDEN_NX2_DRIVER_PIPELINE_CACHE=1 enables it. Off by default: the 2026-11-14 PS5
+            // run with it on (391 s) ran at 1-8 fps against ~20 fps with Eden's own cache.
+            static const bool enable_radv_cache = [] {
+                const char* const value{std::getenv("EDEN_NX2_DRIVER_PIPELINE_CACHE")};
+                return value != nullptr && value[0] == '1' && value[1] == '\0';
+            }();
+            if (!enable_radv_cache) {
+                return false;
+            }
+            // RADV keeps one too through Mesa's on-disk shader cache, unless it is disabled.
+            const auto disabled = [](const char* name) {
+                const char* value = std::getenv(name);
+                if (value == nullptr) {
+                    return false;
+                }
+                return !(value[0] == '\0' || (value[0] == '0' && value[1] == '\0'));
+            };
+            return !disabled("MESA_SHADER_CACHE_DISABLE") && !disabled("MESA_GLSL_CACHE_DISABLE");
+        }
+        default:
+            return false;
+        }
     }
 
     bool IsMoltenVK() const noexcept {
