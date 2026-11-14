@@ -22,6 +22,8 @@
 //
 // 64-bit games only: a 32-bit game's fastmem window aliases the backing, which takes it whole.
 
+extern "C" std::size_t eden_memory_recover_try(std::size_t bytes) noexcept;
+
 namespace {
 enum : std::uint8_t { SlotZero = 0, SlotOwn = 1, SlotShared = 2, SlotFine = 3, SlotPacked = 4, SlotLock = 0x80, SlotMask = 0x7f };
 constexpr std::size_t FinePage = 16384, FinePages = SparseSlot / FinePage;
@@ -454,13 +456,13 @@ bool PromoteShared(SparseRange& range, std::size_t slot) noexcept {
     if (last) return mprotect(reinterpret_cast<void*>(at), SparseSlot, PROT_READ | PROT_WRITE) == 0;
     std::int64_t physical = -1;
     if (eden_direct_low(SparseSlot, SparseSlot, 12, &physical) != 0 && !ReserveBlock(&physical)) return false;
-    void* view = reinterpret_cast<void*>(cpu_mapping_hint);
-    if (sceKernelMapDirectMemory(&view, SparseSlot, PROT_READ | PROT_WRITE, 0, physical, SparseSlot) != 0) {
+    const std::uintptr_t view = MapCpuView(physical, SparseSlot, PROT_READ | PROT_WRITE);
+    if (view == 0) {
         (void)sceKernelReleaseDirectMemory(physical, SparseSlot);
         return false;
     }
-    std::memcpy(view, reinterpret_cast<const void*>(at), SparseSlot);
-    if (munmap(view, SparseSlot) != 0) std::abort();
+    std::memcpy(reinterpret_cast<void*>(view), reinterpret_cast<const void*>(at), SparseSlot);
+    UnmapCpuView(view, SparseSlot);
     if (!MapSlot(at, PROT_READ | PROT_WRITE, physical)) {
         (void)sceKernelReleaseDirectMemory(physical, SparseSlot);
         return false;
@@ -526,6 +528,27 @@ void ReturnSlot(SparseRange& range, std::size_t slot) noexcept {
     range.physical[slot] = -1;
 }
 
+// A packed slot about to be unpacked found no block. Packing cold slots is what frees guest
+// blocks; the driver's unused memory may pay as well. Throttled per thread, so the fault
+// handler's 20 ms retry loop does not turn into a pack storm.
+bool TryRecoverForUnpack() noexcept {
+    static thread_local std::uint64_t last_ns = 0;
+    timespec now{};
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return false;
+    const std::uint64_t ns = static_cast<std::uint64_t>(now.tv_sec) * 1'000'000'000ull +
+                             static_cast<std::uint64_t>(now.tv_nsec);
+    if (last_ns != 0 && ns - last_ns < 100'000'000ull) return false;
+    last_ns = ns;
+    return eden_memory_recover_try(SparseSlot) != 0;
+}
+
+void NoteUnpackWait() noexcept {
+    static std::atomic<unsigned> notes{0};
+    if (notes.fetch_add(1, std::memory_order_relaxed) < 24) {
+        Report("EDEN_CRAM_UNPACK_WAIT a written packed slot found no block: packing cold slots and waiting\n");
+    }
+}
+
 // Packed -> Own: a block of its own, read-write, with the slot's data unpacked into it.
 bool UnpackSlot(SparseRange& range, std::size_t slot) noexcept {
 #ifdef PS5_NATIVE
@@ -534,24 +557,35 @@ bool UnpackSlot(SparseRange& range, std::size_t slot) noexcept {
     const std::uintptr_t at = SlotAddress(range, slot);
     std::int64_t physical = -1;
     if (eden_direct_low(SparseSlot, SparseSlot, 12, &physical) != 0 && !UnpackBlock(&physical) &&
-        !ReserveBlock(&physical))
-        return false;
+        !ReserveBlock(&physical)) {
+        // Nothing idle: have cold slots packed and the driver's unused memory given back, then look
+        // again. The write fault path repeats this every 20 ms for up to 2 s (WaitForBlock).
+        TryRecoverForUnpack();
+        if (eden_direct_low(SparseSlot, SparseSlot, 12, &physical) != 0 && !UnpackBlock(&physical) &&
+            !ReserveBlock(&physical)) {
+            NoteUnpackWait();
+            return false;
+        }
+    }
     // Unpacked in a view of its own and only then mapped at the slot: mapped first, a reader that
-    // had not faulted yet would see the block half unpacked.
-    void* view = reinterpret_cast<void*>(cpu_mapping_hint);
-    if (sceKernelMapDirectMemory(&view, SparseSlot, PROT_READ | PROT_WRITE, 0, physical, SparseSlot) != 0) {
+    // had not faulted yet would see the block half unpacked. The view must be ours and backed
+    // before LZ4 writes to it; MapCpuView maps at a free view of the range reserved for them, and
+    // returns 0 (nothing written) when it cannot.
+    const std::uintptr_t view = MapCpuView(physical, SparseSlot, PROT_READ | PROT_WRITE);
+    if (view == 0) {
         (void)sceKernelReleaseDirectMemory(physical, SparseSlot);
         return false;
     }
-    const int out = LZ4_decompress_safe(static_cast<const char*>(table[slot].data), static_cast<char*>(view),
+    const int out = LZ4_decompress_safe(static_cast<const char*>(table[slot].data),
+                                        reinterpret_cast<char*>(view),
                                         static_cast<int>(table[slot].size), static_cast<int>(SparseSlot));
     if (out != static_cast<int>(SparseSlot)) std::abort(); // the guest's data is gone: never carry on
     if (pack_kept != nullptr && pack_kept[slot] >= 0) {
-        void* kept_view = reinterpret_cast<void*>(cpu_mapping_hint);
-        if (sceKernelMapDirectMemory(&kept_view, SparseSlot, PROT_READ, 0, pack_kept[slot], SparseSlot) == 0) {
+        const std::uintptr_t kept_view = MapCpuView(pack_kept[slot], SparseSlot, PROT_READ);
+        if (kept_view != 0) {
             pack_keep_compared.fetch_add(1, std::memory_order_relaxed);
-            const auto* a = static_cast<const std::uint64_t*>(view);
-            const auto* b = static_cast<const std::uint64_t*>(kept_view);
+            const auto* a = reinterpret_cast<const std::uint64_t*>(view);
+            const auto* b = reinterpret_cast<const std::uint64_t*>(kept_view);
             for (std::size_t i = 0; i < SparseSlot / 8; ++i)
                 if (a[i] != b[i]) {
                     if (pack_keep_differed.fetch_add(1, std::memory_order_relaxed) < 8) {
@@ -563,12 +597,12 @@ bool UnpackSlot(SparseRange& range, std::size_t slot) noexcept {
                     }
                     break;
                 }
-            (void)munmap(kept_view, SparseSlot);
+            UnmapCpuView(kept_view, SparseSlot);
         }
         (void)sceKernelReleaseDirectMemory(pack_kept[slot], SparseSlot);
         pack_kept[slot] = -1;
     }
-    if (munmap(view, SparseSlot) != 0) std::abort();
+    UnmapCpuView(view, SparseSlot);
     if (!MapSlot(at, PROT_READ | PROT_WRITE, physical)) {
         (void)sceKernelReleaseDirectMemory(physical, SparseSlot);
         return false;
@@ -611,13 +645,13 @@ bool PromoteFine(SparseRange& range, std::size_t slot) noexcept {
 #ifdef PS5_NATIVE
     std::int64_t physical = -1;
     if (eden_direct_low(SparseSlot, SparseSlot, 12, &physical) != 0 && !ReserveBlock(&physical)) return false;
-    void* view = reinterpret_cast<void*>(cpu_mapping_hint);
-    if (sceKernelMapDirectMemory(&view, SparseSlot, PROT_READ | PROT_WRITE, 0, physical, SparseSlot) != 0) {
+    const std::uintptr_t view = MapCpuView(physical, SparseSlot, PROT_READ | PROT_WRITE);
+    if (view == 0) {
         (void)sceKernelReleaseDirectMemory(physical, SparseSlot);
         return false;
     }
-    std::memcpy(view, reinterpret_cast<const void*>(at), SparseSlot);
-    if (munmap(view, SparseSlot) != 0) std::abort();
+    std::memcpy(reinterpret_cast<void*>(view), reinterpret_cast<const void*>(at), SparseSlot);
+    UnmapCpuView(view, SparseSlot);
     if (!MapSlot(at, PROT_READ | PROT_WRITE, physical)) {
         (void)sceKernelReleaseDirectMemory(physical, SparseSlot);
         return false;
@@ -652,8 +686,8 @@ bool MakeFine(SparseRange& range, std::size_t slot, const bool (&zero)[FinePages
 #ifdef PS5_NATIVE
     std::int64_t compact = -1;
     if (eden_direct_low(kept * FinePage, FinePage, 12, &compact) != 0) return false;
-    void* view = reinterpret_cast<void*>(cpu_mapping_hint);
-    if (sceKernelMapDirectMemory(&view, kept * FinePage, PROT_READ | PROT_WRITE, 0, compact, FinePage) != 0) {
+    const std::uintptr_t view = MapCpuView(compact, kept * FinePage, PROT_READ | PROT_WRITE);
+    if (view == 0) {
         (void)sceKernelReleaseDirectMemory(compact, kept * FinePage);
         return false;
     }
@@ -664,7 +698,7 @@ bool MakeFine(SparseRange& range, std::size_t slot, const bool (&zero)[FinePages
                         reinterpret_cast<const void*>(at + page * FinePage), FinePage);
             ++next;
         }
-    if (munmap(view, kept * FinePage) != 0) std::abort();
+    UnmapCpuView(view, kept * FinePage);
     const std::int64_t whole = range.physical[slot];
     if (munmap(reinterpret_cast<void*>(at), SparseSlot) != 0) std::abort();
     bool ok = true;

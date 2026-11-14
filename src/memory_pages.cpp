@@ -320,17 +320,96 @@ extern "C" int eden_direct_low(std::size_t size, std::size_t alignment, int type
 #ifdef PS5_NATIVE
 std::int64_t zero_block = -1;
 
+// Views of a direct memory block, for an unpack or a copy to write into before it is mapped at its
+// slot. cpu_mapping_hint is the heap's as well: the heap reserves its whole range there and commits
+// pieces into it with MAP_FIXED (ReserveAddressRange, CommitMemoryRangeFrom). A view that the kernel
+// placed inside that range could be replaced by a heap commit while UnpackSlot decompressed into
+// it: a write fault inside the signal handler, which no handler can recover from (2026-11-14,
+// 0x104e005114, inside a heap piece). The views reserve address space of their own instead, and
+// every concurrent view gets its own 2 MiB slot in it.
+constexpr std::size_t CpuViewSlots = 64;
+constexpr std::size_t CpuViewAlignment = 0x4000;
+std::atomic<std::uint64_t> cpu_views_used[(CpuViewSlots + 63) / 64] = {};
+std::atomic<int> cpu_views_state{0}; // 0 unmade, 1 made, 2 unavailable
+void* cpu_views_base = nullptr;
+std::atomic_flag cpu_views_lock = ATOMIC_FLAG_INIT;
+
+void* MakeCpuViewRange() {
+    int expected = 0;
+    if (!cpu_views_state.compare_exchange_strong(expected, 3, std::memory_order_acq_rel)) {
+        while (cpu_views_state.load(std::memory_order_acquire) == 3) sched_yield();
+        return cpu_views_state.load(std::memory_order_acquire) == 1 ? cpu_views_base : nullptr;
+    }
+    // Address space only: nothing is mapped into it until a view is.
+    void* address = reinterpret_cast<void*>(cpu_mapping_hint);
+    if (sceKernelReserveVirtualRange(&address, CpuViewSlots * SparseSlot, 0, SparseSlot) == 0) {
+        if (cpu_mapping_range(address, CpuViewSlots * SparseSlot)) {
+            cpu_views_base = address;
+            cpu_views_state.store(1, std::memory_order_release);
+            return cpu_views_base;
+        }
+        (void)munmap(address, CpuViewSlots * SparseSlot);
+    }
+    cpu_views_state.store(2, std::memory_order_release);
+    return nullptr;
+}
+
+// Maps `physical` at a view of its own. 0 when no view is free or the mapping was refused; nothing
+// is written in that case.
+std::uintptr_t MapCpuView(std::int64_t physical, std::size_t size, int protection) {
+    void* const base = MakeCpuViewRange();
+    if (base == nullptr) {
+        // The reservation was refused: a mapping the kernel places anywhere, as before.
+        void* view = reinterpret_cast<void*>(cpu_mapping_hint);
+        if (sceKernelMapDirectMemory(&view, size, protection, 0, physical, CpuViewAlignment) != 0)
+            return 0;
+        return reinterpret_cast<std::uintptr_t>(view);
+    }
+    std::size_t slot = CpuViewSlots;
+    while (atomic_flag_test_and_set_explicit(&cpu_views_lock, std::memory_order_acquire)) sched_yield();
+    for (std::size_t i = 0; i < CpuViewSlots; ++i) {
+        const std::uint64_t bit = std::uint64_t{1} << (i & 63);
+        if (!(cpu_views_used[i >> 6].fetch_or(bit, std::memory_order_relaxed) & bit)) {
+            slot = i;
+            break;
+        }
+    }
+    atomic_flag_clear_explicit(&cpu_views_lock, std::memory_order_release);
+    if (slot == CpuViewSlots) return 0;
+    void* at = static_cast<std::uint8_t*>(base) + slot * SparseSlot;
+    if (sceKernelMapDirectMemory(&at, size, protection, MAP_FIXED, physical, CpuViewAlignment) != 0 ||
+        at != static_cast<std::uint8_t*>(base) + slot * SparseSlot) {
+        cpu_views_used[slot >> 6].fetch_and(~(std::uint64_t{1} << (slot & 63)),
+                                            std::memory_order_relaxed);
+        return 0;
+    }
+    return reinterpret_cast<std::uintptr_t>(at);
+}
+
+void UnmapCpuView(std::uintptr_t at, std::size_t size) {
+    const auto base = reinterpret_cast<std::uintptr_t>(cpu_views_base);
+    if (cpu_views_base != nullptr && cpu_views_state.load(std::memory_order_acquire) == 1 &&
+        at >= base && at < base + CpuViewSlots * SparseSlot && (at - base) % SparseSlot == 0) {
+        if (munmap(reinterpret_cast<void*>(at), size) != 0) std::abort();
+        const std::size_t slot = (at - base) / SparseSlot;
+        cpu_views_used[slot >> 6].fetch_and(~(std::uint64_t{1} << (slot & 63)),
+                                            std::memory_order_relaxed);
+        return;
+    }
+    if (munmap(reinterpret_cast<void*>(at), size) != 0) std::abort();
+}
+
 // A 2 MiB block of direct memory, zeroed through a mapping of its own that is gone again.
 bool ZeroedBlock(std::int64_t* physical) {
     if (eden_direct_low(SparseSlot, SparseSlot, 12, physical) != 0)
         return false;
-    void* view = reinterpret_cast<void*>(cpu_mapping_hint);
-    if (sceKernelMapDirectMemory(&view, SparseSlot, PROT_READ | PROT_WRITE, 0, *physical, SparseSlot) != 0) {
+    const std::uintptr_t view = MapCpuView(*physical, SparseSlot, PROT_READ | PROT_WRITE);
+    if (view == 0) {
         (void)sceKernelReleaseDirectMemory(*physical, SparseSlot);
         return false;
     }
-    std::memset(view, 0, SparseSlot);
-    if (munmap(view, SparseSlot) != 0) std::abort();
+    std::memset(reinterpret_cast<void*>(view), 0, SparseSlot);
+    UnmapCpuView(view, SparseSlot);
     return true;
 }
 bool MapSlot(std::uintptr_t at, int protection, std::int64_t physical) {
