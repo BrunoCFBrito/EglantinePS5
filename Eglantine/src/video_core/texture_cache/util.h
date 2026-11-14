@@ -136,6 +136,18 @@ void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8
 [[nodiscard]] boost::container::small_vector<BufferImageCopy, 16> FullDownloadCopies(
     const ImageInfo& info);
 
+/// Row bands of a 2D block-linear image of 1x1-texel blocks, about `band_bytes` each, to be packed
+/// into staging buffers of about that size instead of downloading the whole image into one. Empty
+/// when the layout is not handled (such an image downloads whole, as FullDownloadCopies describes).
+[[nodiscard]] std::vector<BufferImageCopy> PlanDownloadImageBands(const ImageInfo& info,
+                                                                  size_t band_bytes);
+
+/// Writes one band from PlanDownloadImageBands into guest memory, reading `memory` at the band
+/// buffer offset.
+void SwizzleImageBand(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const ImageInfo& info,
+                      const BufferImageCopy& copy, std::span<const u8> memory,
+                      Common::ScratchBuffer<u8>& tmp_buffer);
+
 [[nodiscard]] Extent3D MipSize(Extent3D size, u32 level);
 
 [[nodiscard]] Extent3D MipBlockSize(const ImageInfo& info, u32 level);

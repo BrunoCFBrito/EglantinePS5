@@ -209,9 +209,14 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
 
     static constexpr u32 LayerUploadMinSize = 64U << 20;
     static constexpr size_t LargeScratchCapacity = 64U << 20;
+    /// Downloads at least this large are split into row bands (DownloadInChunks).
+    static constexpr u64 DownloadChunkMinSize = 64U << 20;
 
     /// Splits large 2D image uploads into smaller chunks, avoiding multi-hundred MiB staging buffers.
     bool UploadInChunks(Image& image);
+
+    /// Splits large 2D image downloads into row bands, avoiding multi-hundred MiB staging buffers.
+    bool DownloadInChunks(Image& image);
 
     /// Large layered images whose refresh can decode only the layers written since the last one.
     [[nodiscard]] bool UploadsByLayer(const ImageBase& image) const noexcept;

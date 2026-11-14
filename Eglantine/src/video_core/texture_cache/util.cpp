@@ -1547,6 +1547,83 @@ void SwizzleImage(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const Ima
     }
 }
 
+std::vector<BufferImageCopy> PlanDownloadImageBands(const ImageInfo& info, size_t band_bytes) {
+    std::vector<BufferImageCopy> bands;
+    // A band is a run of whole rows of one level and layer, tightly packed: what SwizzleSubrect
+    // reads. A whole download of a very large image would need a staging buffer of its full size
+    // (rounded up to a power of two: 512 MiB for 288 MiB of data), which the console memory pool
+    // can refuse even with enough free bytes in smaller blocks.
+    if (info.type != ImageType::e2D || info.size.depth != 1 || info.num_samples != 1 ||
+        info.tile_width_spacing != 0 || DefaultBlockWidth(info.format) != 1 ||
+        DefaultBlockHeight(info.format) != 1) {
+        return bands;
+    }
+    const u32 bytes_per_block = BytesPerBlock(info.format);
+    const u32 levels = HostMipLevelCount(info.size.width, info.size.height, info.size.depth,
+                                         static_cast<u32>(info.resources.levels));
+    for (s32 level = 0; level < static_cast<s32>(levels); ++level) {
+        const Extent3D level_size = AdjustMipSize(info.size, level);
+        const size_t row_bytes = size_t{level_size.width} * bytes_per_block;
+        const u32 rows = (std::max)(u32{1}, static_cast<u32>(band_bytes / row_bytes));
+        for (s32 layer = 0; layer < info.resources.layers; ++layer) {
+            for (u32 y = 0; y < level_size.height; y += rows) {
+                const u32 height = (std::min)(rows, level_size.height - y);
+                bands.push_back(BufferImageCopy{
+                    .buffer_offset = 0,
+                    .buffer_size = row_bytes * height,
+                    .buffer_row_length = level_size.width,
+                    .buffer_image_height = height,
+                    .image_subresource =
+                        {
+                            .base_level = level,
+                            .base_layer = layer,
+                            .num_layers = 1,
+                        },
+                    .image_offset = {0, static_cast<s32>(y), 0},
+                    .image_extent = {level_size.width, height, 1},
+                });
+            }
+        }
+    }
+    return bands;
+}
+
+void SwizzleImageBand(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const ImageInfo& info,
+                      const BufferImageCopy& copy, std::span<const u8> memory,
+                      Common::ScratchBuffer<u8>& tmp_buffer) {
+    const s32 level = copy.image_subresource.base_level;
+    const u32 levels = HostMipLevelCount(info.size.width, info.size.height, info.size.depth,
+                                         static_cast<u32>(info.resources.levels));
+    if (!IsHostMipLevel(level, levels)) {
+        // The host did not download this tail level. Preserve the guest bytes.
+        return;
+    }
+    const LevelInfo level_info = MakeLevelInfo(info);
+    const Extent2D tile_size = DefaultBlockSize(info.format);
+    const u32 bytes_per_block = BytesPerBlock(info.format);
+    const Extent3D level_size = AdjustMipSize(info.size, level);
+    const Extent3D num_tiles = AdjustTileSize(level_size, tile_size);
+    const Extent3D block =
+        AdjustMipBlockSize(num_tiles, level_info.block, level, level_info.num_levels);
+    const s32 num_levels = info.resources.levels;
+    const std::array sizes = CalculateLevelSizes(level_info, num_levels);
+    const size_t layer_stride =
+        AlignLayerSize(CalculateLevelBytes(sizes, num_levels), info.size, level_info.block,
+                       tile_size.height, info.tile_width_spacing);
+    const size_t guest_offset =
+        CalculateLevelBytes(sizes, level) +
+        static_cast<size_t>(copy.image_subresource.base_layer) * layer_stride;
+
+    Tegra::Memory::GpuGuestMemoryScoped<u8, Tegra::Memory::GuestMemoryFlags::UnsafeReadWrite>
+        dst(gpu_memory, gpu_addr + guest_offset, sizes[level], &tmp_buffer);
+    Tegra::Texture::SwizzleSubrect(
+        dst, memory.subspan(copy.buffer_offset), bytes_per_block, level_size.width,
+        level_size.height, level_size.depth,
+        static_cast<u32>(copy.image_offset.x), static_cast<u32>(copy.image_offset.y),
+        copy.image_extent.width, copy.image_extent.height, block.height, block.depth,
+        copy.buffer_row_length * bytes_per_block, gpu_memory.UsesNativeTiling());
+}
+
 bool IsBlockLinearSizeCompatible(const ImageInfo& lhs, const ImageInfo& rhs, u32 lhs_level,
                                  u32 rhs_level, bool strict_size) noexcept {
     ASSERT(lhs.type != ImageType::Linear);

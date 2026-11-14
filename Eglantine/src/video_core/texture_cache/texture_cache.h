@@ -242,11 +242,13 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             return false;
         }
         if (must_download) {
-            auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
-            const auto copies = FullDownloadCopies(image.info);
-            image.DownloadMemory(map, copies);
-            runtime.Finish();
-            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span, swizzle_data_buffer);
+            if (!DownloadInChunks(image)) {
+                auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
+                const auto copies = FullDownloadCopies(image.info);
+                image.DownloadMemory(map, copies);
+                runtime.Finish();
+                SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span, swizzle_data_buffer);
+            }
             ++gc_download_deletes;
             ClearStaleImage(image);
         } else {
@@ -1470,6 +1472,14 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
     };
     for (const ImageId image_id : images) {
         Image& image = slot_images[image_id];
+        if (image.unswizzled_size_bytes >= DownloadChunkMinSize) {
+            // Written in modification order with the images before it, then one band at a time.
+            flush_pending();
+            if (DownloadInChunks(image)) {
+                ClearStaleImage(image);
+                continue;
+            }
+        }
         if (!pending.empty() && pending_bytes + image.unswizzled_size_bytes > MaxBatchBytes) {
             flush_pending();
         }
@@ -2447,6 +2457,54 @@ bool TextureCache<P>::UploadInChunks(Image& image) {
         image.UploadMemory(staging, plan.copies);
     }
     runtime.InsertUploadMemoryBarrier();
+    return true;
+}
+
+template <class P>
+bool TextureCache<P>::DownloadInChunks(Image& image) {
+    // A whole download of a very large image needs a staging buffer of its full size, which the
+    // console memory pool can refuse when it has no free block that large. The image comes back in
+    // row bands packed into staging buffers of about 32 MiB, and each buffer is written into guest
+    // memory before the next one is recorded, so one buffer serves every group and the peak stays
+    // at the group size.
+    constexpr size_t band_bytes = 32_MiB;
+    // Each DownloadMemory call rescales a rescaled image down and back up, so such an image keeps
+    // the whole-image path. Sparse images have no plain level and layer layout to band.
+    constexpr ImageFlagBits excluded = ImageFlagBits::Rescaled | ImageFlagBits::Unbacked |
+                                       ImageFlagBits::Sparse | ImageFlagBits::SparseLayers |
+                                       ImageFlagBits::SparseTiles;
+    if (image.unswizzled_size_bytes < DownloadChunkMinSize || True(image.flags & excluded)) {
+        return false;
+    }
+    const std::vector<BufferImageCopy> bands = PlanDownloadImageBands(image.info, band_bytes);
+    if (bands.size() < 2) {
+        return false;
+    }
+    std::vector<BufferImageCopy> group;
+    size_t group_bytes = 0;
+    const auto flush_group = [&] {
+        if (group.empty()) {
+            return;
+        }
+        auto staging = runtime.DownloadStagingBuffer(group_bytes);
+        image.DownloadMemory(staging, group);
+        runtime.Finish();
+        for (const BufferImageCopy& copy : group) {
+            SwizzleImageBand(*gpu_memory, image.gpu_addr, image.info, copy, staging.mapped_span,
+                             swizzle_data_buffer);
+        }
+        group.clear();
+        group_bytes = 0;
+    };
+    for (BufferImageCopy band : bands) {
+        if (!group.empty() && group_bytes + band.buffer_size > band_bytes) {
+            flush_group();
+        }
+        band.buffer_offset = group_bytes;
+        group_bytes += band.buffer_size;
+        group.push_back(band);
+    }
+    flush_group();
     return true;
 }
 
