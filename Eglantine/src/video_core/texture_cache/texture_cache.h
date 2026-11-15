@@ -200,10 +200,25 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
     bool evict_old_costly = false;
     u64 ticks_to_destroy = 0;
     size_t num_iterations = 0;
+    // What the collector's marks bound: the cache's own image bytes where the PS5 sets the
+    // thresholds that way (#823), else the usage the runtime reports. The PS5's usage figure is
+    // the console pool's share less its largest free block, so it also holds the guest's memory,
+    // Eden's heap and the allocator's holes: against it a mark is only reached by evicting the
+    // images the game is using, every frame, and the pool still has no block to give (#739).
+    const bool own_marks = own_bytes_thresholds && own_critical_memory != 0;
+    const auto ActiveUsage = [this, own_marks]() -> u64 {
+        return own_marks ? own_image_bytes : total_used_memory;
+    };
+    const u64 active_expected = own_marks ? own_expected_memory : expected_memory;
+    const u64 active_critical = own_marks ? own_critical_memory : critical_memory;
+    // The pool is short while the cache's own bytes are under their mark: keep taking images
+    // nothing has used for a while, but not the game's live set (freeing that only clears room
+    // for the next frame's allocations and it is uploaded again, which is the #739 thrash).
+    const bool pool_short = own_marks && (out_of_memory || total_used_memory >= expected_memory);
     const auto Configure = [&](bool allow_aggressive) {
-        high_priority_mode = out_of_memory || total_used_memory >= expected_memory;
+        high_priority_mode = out_of_memory || pool_short || ActiveUsage() >= active_expected;
         aggressive_mode =
-            allow_aggressive && (out_of_memory || total_used_memory >= critical_memory);
+            allow_aggressive && (out_of_memory || ActiveUsage() >= active_critical);
         ticks_to_destroy = aggressive_mode ? 10ULL : high_priority_mode ? 25ULL : 50ULL;
         // EDEN_NX2_TC_MIN_AGE=<frames>: never evict images used more recently (thrash tests).
         static const u64 min_age = [] {
@@ -218,8 +233,8 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         // replaces an older one (bad overlaps). The cache grew ~15 images a frame, 4 GiB in two
         // seconds, until the device heap was full and the driver crashed on the next image.
         // So delete more the further past it, and sooner after an image's last use.
-        if (aggressive_mode && total_used_memory > critical_memory) {
-            const u64 over = total_used_memory - critical_memory;
+        if (aggressive_mode && ActiveUsage() > active_critical) {
+            const u64 over = ActiveUsage() - active_critical;
             num_iterations += static_cast<size_t>((std::min)(over / 2_MiB, u64{1024}));
             if (over >= 1_GiB) {
                 ticks_to_destroy = (std::max)(min_age, u64{3});
@@ -245,7 +260,8 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         return true;
     };
     const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode, &CanEvict,
-                          out_of_memory](ImageId image_id) {
+                          out_of_memory, &ActiveUsage, active_expected,
+                          active_critical](ImageId image_id) {
         if (num_iterations == 0) {
             return true;
         }
@@ -286,10 +302,10 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         if (out_of_memory) {
             return false;
         }
-        if (aggressive_mode && total_used_memory < critical_memory) {
+        if (aggressive_mode && ActiveUsage() < active_critical) {
             num_iterations >>= 2;
             aggressive_mode = false;
-        } else if (high_priority_mode && total_used_memory < expected_memory) {
+        } else if (high_priority_mode && ActiveUsage() < active_expected) {
             num_iterations >>= 1;
             high_priority_mode = false;
         }
@@ -364,7 +380,11 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         evict_old_costly = false;
     }
     Collect();
-    if (out_of_memory || total_used_memory >= critical_memory) {
+    // A hard pass only when the marks the collector follows say so: on the PS5 the pool being
+    // short keeps high priority on, but it is not a reason to evict the live set again.
+    const bool over_mark = own_marks ? ActiveUsage() >= active_critical
+                                     : total_used_memory >= critical_memory;
+    if (out_of_memory || over_mark) {
         Configure(true);
         Collect();
     }
@@ -577,7 +597,20 @@ void TextureCache<P>::TickFrame() {
                         // is added to the thresholds, up to the heap's own budget and the host's
                         // commit.
                         const u64 heap_budget = runtime.GetDeviceHeapMemoryBudget();
-                        if (heap_budget > budget) {
+                        // On the console the usage is the pool figure, and the driver's heap
+                        // budget estimate falls under the share while the pool fills: the test
+                        // then turned this path off exactly when it was needed, and the raw
+                        // EDEN_NX2_TC_*_MIB values became thresholds against the pool figure
+                        // (own ran past them with every image live). The overrides bound the
+                        // cache's own bytes on this path, so keep them on it.
+                        bool pool_figure = false;
+                        if constexpr (requires { runtime.IsDeviceMemoryUsagePoolBased(); }) {
+                            pool_figure = runtime.IsDeviceMemoryUsagePoolBased();
+                        }
+                        static const bool overridden_env =
+                            std::getenv("EDEN_NX2_TC_EXPECTED_MIB") != nullptr ||
+                            std::getenv("EDEN_NX2_TC_CRITICAL_MIB") != nullptr;
+                        if (heap_budget > budget || (pool_figure && overridden_env)) {
                             own_bytes_path = true;
                             u64 image_bytes = 0;
                             for (const auto [image_id, image] : slot_images) {
@@ -589,7 +622,9 @@ void TextureCache<P>::TickFrame() {
                             other_memory =
                                 total_used_memory - (std::min)(total_used_memory, image_bytes);
                             const u64 heap_critical =
-                                heap_budget - (std::min)(reserved, heap_budget / 2);
+                                heap_budget > reserved
+                                    ? heap_budget - (std::min)(reserved, heap_budget / 2)
+                                    : host_critical;
                             // Where the usage is the console's pool figure it stops at the
                             // budget, so a threshold raised past budget - margin would never
                             // be reached: stop there, which keeps the share's free-block
@@ -637,7 +672,26 @@ void TextureCache<P>::TickFrame() {
                                     (std::min)(host_critical, pool_cap));
                                 expected_memory =
                                     (std::min)(own_expected + other_memory, critical_memory);
+                                // The overrides bound the cache's own bytes (the comment above):
+                                // keep them as given, not less what isn't images. The pool cap
+                                // would otherwise shrink them as the guest takes more of the
+                                // shared pool, and the collector could never reach a mark the
+                                // game's live set exceeds, deleting live images every frame to
+                                // try.
+                                own_critical_memory = own_critical;
+                                own_expected_memory = own_expected;
+                            } else {
+                                own_critical_memory =
+                                    critical_memory -
+                                    (std::min)(critical_memory, other_memory);
+                                own_expected_memory =
+                                    expected_memory -
+                                    (std::min)(expected_memory, other_memory);
                             }
+                            own_bytes_thresholds = own_critical_memory != 0;
+                        }
+                        if (!own_bytes_path) {
+                            own_bytes_thresholds = false;
                         }
                     }
                     // Log the first values and real changes (the budget moves by a few MiB all
@@ -659,13 +713,11 @@ void TextureCache<P>::TickFrame() {
                                  other_memory >> 20);
                         if (own_bytes_path) {
                             // What the thresholds bound of the cache's own images: the EDEN_NX2_TC_*
-                            // overrides here, or the integrated GPU's share less what isn't images.
+                            // overrides as given, or the integrated GPU's share less what isn't
+                            // images. The collector compares own_image_bytes with these.
                             LOG_INFO(HW_GPU,
                                      "Texture cache own thresholds: expected {} MiB, critical {} MiB",
-                                     (expected_memory -
-                                      (std::min)(expected_memory, other_memory)) >> 20,
-                                     (critical_memory -
-                                      (std::min)(critical_memory, other_memory)) >> 20);
+                                     own_expected_memory >> 20, own_critical_memory >> 20);
                         }
                         if (commit_room) {
                             LOG_INFO(HW_GPU, "Host memory: {} MiB of commit left, {}",
@@ -773,6 +825,11 @@ void TextureCache<P>::TickFrame() {
                          mib(other_bytes), scaled, mib(scaled_bytes), mib(own_bytes), unbacked, mib(largest),
                          mib(total_used_memory), mib(not_textures), mib(expected_memory),
                          mib(critical_memory));
+            if (own_bytes_thresholds) {
+                std::fprintf(stderr,
+                             "EDEN_MEM_SPLIT own_marks expected=%lluMiB critical=%lluMiB\n",
+                             mib(own_expected_memory), mib(own_critical_memory));
+            }
         }
         if constexpr (requires { runtime.PrintMemorySplit(); }) {
             runtime.PrintMemorySplit();
@@ -857,6 +914,18 @@ void TextureCache<P>::TickFrame() {
         debug_stats = Common::Log::IsLevelEnabled(Common::Log::Class::HW_GPU, Common::Log::Level::Debug);
         gc_deletes = gc_costly_deletes = gc_download_deletes = async_decodes_queued = 0;
         images_created = images_deleted = 0;
+    }
+    // The bytes the own-bytes marks bound, at their allocation sizes (what the driver holds,
+    // not the guest-size estimate): kept current for the collector's comparison and stop test.
+    if (own_bytes_thresholds) {
+        u64 bytes = 0;
+        for (const auto [image_id, image] : slot_images) {
+            bytes += ImageAllocationBytes(*image);
+            if (image->HasScaled()) {
+                bytes += GetScaledImageSizeBytes(*image);
+            }
+        }
+        own_image_bytes = bytes;
     }
     // An image that could not be made at all: the driver is out of memory whatever the counts
     // say, so collect as at the critical threshold.
@@ -3513,6 +3582,9 @@ bool TextureCache<P>::ScaleUp(Image& image) {
     const bool rescaled = image.ScaleUp();
     if (!has_copy && image.HasScaled()) {
         total_used_memory += GetScaledImageSizeBytes(image);
+        if (own_bytes_thresholds) {
+            own_image_bytes += GetScaledImageSizeBytes(image);
+        }
     }
     if (!rescaled) {
         return false;
@@ -4442,6 +4514,9 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
     image.channel = current_channel_id;
     image.address_space = current_address_space;
     total_used_memory += ImageMemoryBytes(slot_images[image_id]);
+    if (own_bytes_thresholds) {
+        own_image_bytes += ImageAllocationBytes(slot_images[image_id]);
+    }
     image.lru_index = lru_cache.Insert(image_id, frame_tick);
 
     ForEachGPUPage(image.gpu_addr, image.guest_size_bytes, [this, image_id](u64 page) {
@@ -4678,6 +4753,9 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
     }
     ASSERT_MSG(False(image.flags & ImageFlagBits::Tracked), "Image was not untracked");
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered), "Image was not unregistered");
+    if (own_bytes_thresholds) {
+        own_image_bytes -= (std::min)(own_image_bytes, freed_bytes);
+    }
 
     // Mark render targets as dirty
     auto& dirty = maxwell3d->dirty.flags;

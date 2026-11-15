@@ -703,6 +703,14 @@ private:
     u64 minimum_memory;
     u64 expected_memory;
     u64 critical_memory;
+    /// Where the thresholds bound the cache's own image bytes instead of the usage the runtime
+    /// reports (the PS5's shared pool figure, #823): the collector compares own_image_bytes with
+    /// these marks. The pool figure also holds the guest's memory, Eden's heap and the
+    /// allocator's holes, so against it a mark is only reached by evicting live images.
+    bool own_bytes_thresholds{};
+    u64 own_expected_memory{};
+    u64 own_critical_memory{};
+    u64 own_image_bytes{};
     size_t gpu_unswizzle_maxsize = 0;
     size_t swizzle_chunk_size = 0;
     u32 swizzle_slices_per_batch = 0;
