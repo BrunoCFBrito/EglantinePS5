@@ -30,6 +30,11 @@ std::int64_t sceKernelGetDirectMemorySize();
 std::int32_t sceKernelAvailableDirectMemorySize(std::int64_t, std::int64_t, std::size_t, std::int64_t*, std::size_t*);
 std::size_t eden_heap_committed(void);
 std::size_t eden_heap_large_held(unsigned* blocks);
+// src/guest_memory_service.inc: the last guest write the memory service refused for want of a
+// block (0: none). why 1: 17 faults in a row at one address, its slot unchanged; 2: no block was
+// left for its slot. state is the slot's state (0 Zero, 1 Own, 2 Shared, 3 Fine, 4 Packed).
+// Weak: the crash reporter's standalone checks (tools/check-crash-report.py) link without it.
+[[gnu::weak]] std::uintptr_t eden_guest_write_refused(unsigned* why, unsigned* state) noexcept;
 #endif
 // The app's code, from the link (tools/unwind.ld).
 extern const char __eden_text_start[];
@@ -333,6 +338,22 @@ void Compose(const Kind* kind, int code, std::uint64_t address, const Registers&
     t.Put("\nwhere: ");
     t.Address(r.rip);
     if (!InCode(r.rip)) t.Put(" (outside the app's code: a system library or generated code)");
+#ifdef PS5_NATIVE
+    {
+        unsigned why = 0;
+        unsigned state = 0;
+        const std::uintptr_t refused =
+            eden_guest_write_refused != nullptr ? eden_guest_write_refused(&why, &state) : 0;
+        if (refused != 0) {
+            t.Put("\nguest write refused: 0x");
+            t.Hex(refused, 16);
+            t.Put(" why ");
+            t.Dec(why);
+            t.Put(" slot state ");
+            t.Dec(state);
+        }
+    }
+#endif
     const std::uintptr_t self = reporter.load(std::memory_order_relaxed);
     t.Put("\nthread: ");
     t.Put(ThreadName(self));

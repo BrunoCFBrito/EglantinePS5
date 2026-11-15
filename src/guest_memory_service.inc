@@ -23,6 +23,10 @@
 // 64-bit games only: a 32-bit game's fastmem window aliases the backing, which takes it whole.
 
 extern "C" std::size_t eden_memory_recover_try(std::size_t bytes) noexcept;
+#ifdef PS5_NATIVE
+// The Eden heap's empty arenas and spaces (headless/heap_arenas.inc), asked from a write fault.
+extern "C" [[gnu::weak]] std::size_t eden_heap_trim(void);
+#endif
 
 namespace {
 enum : std::uint8_t { SlotZero = 0, SlotOwn = 1, SlotShared = 2, SlotFine = 3, SlotPacked = 4, SlotLock = 0x80, SlotMask = 0x7f };
@@ -528,10 +532,54 @@ void ReturnSlot(SparseRange& range, std::size_t slot) noexcept {
     range.physical[slot] = -1;
 }
 
-// A packed slot about to be unpacked found no block. Packing cold slots is what frees guest
-// blocks; the driver's unused memory may pay as well. Throttled per thread, so the fault
-// handler's 20 ms retry loop does not turn into a pack storm.
-bool TryRecoverForUnpack() noexcept {
+#ifdef PS5_NATIVE
+// The last resort of a fault that found no block: the Eden heap's empty arenas and spaces go back
+// to the pool. The performance thread trims every 2 s while the pool is short (TrimHeap); a writer
+// in its fault handler cannot wait that long (on 2026-11-15 OoT gave up on a block while the heap
+// held 1948 MiB with 1218 in use). Throttled once per 250 ms process-wide: the faulting threads are
+// the ones the GPU waits on. Reentrancy-guarded: eden_heap_trim retires arenas under the heap's own
+// locks, and a heap growth inside it must not come back here.
+std::size_t TrimHeapForFault() noexcept {
+    if (&eden_heap_trim == nullptr) return 0;
+    timespec now{};
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
+    const std::uint64_t ns = static_cast<std::uint64_t>(now.tv_sec) * 1'000'000'000ull +
+                             static_cast<std::uint64_t>(now.tv_nsec);
+    static std::atomic<std::uint64_t> last_ns{0};
+    std::uint64_t last = last_ns.load(std::memory_order_relaxed);
+    if (last != 0 && ns - last < 250'000'000ull) return 0;
+    if (!last_ns.compare_exchange_strong(last, ns, std::memory_order_acq_rel)) return 0;
+    static thread_local bool inside = false;
+    if (inside) return 0;
+    inside = true;
+    const std::size_t freed = eden_heap_trim();
+    inside = false;
+    if (freed != 0) {
+        static std::atomic<unsigned> notes{0};
+        if (notes.fetch_add(1, std::memory_order_relaxed) < 8) {
+            char line[112];
+            const int length = std::snprintf(line, sizeof(line),
+                                             "EDEN_CRAM the Eden heap gave back %zu MiB for a guest write\n",
+                                             freed >> 20);
+            if (length > 0) Note(line);
+        }
+    }
+    return freed;
+}
+#endif
+
+// Writers a fault is being served for, not only those in WaitForBlock: the whole time a write fault
+// is handled. The graphics caches read it (eden_guest_memory_wanted), and GiveBackIdleBlocks and
+// TakeHostReserveBlock keep the emergency blocks for it while it is nonzero. Registering here,
+// before the first promotion tries to recover, is what stops that recovery from giving the reserve
+// away to the host heap just before the writer waits on it.
+std::atomic<unsigned> memory_waiters{0};
+
+// A fault that found no block. Packing cold slots is what frees guest blocks; the driver's unused
+// memory and the Eden heap's empty arenas/spaces may pay as well. The request covers every writer
+// being served, so one pass frees enough for the whole burst rather than a block per call.
+// Throttled per thread, so the fault handler's 20 ms retry loop does not turn into a pack storm.
+bool RecoverForFault() noexcept {
     static thread_local std::uint64_t last_ns = 0;
     timespec now{};
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return false;
@@ -539,7 +587,13 @@ bool TryRecoverForUnpack() noexcept {
                              static_cast<std::uint64_t>(now.tv_nsec);
     if (last_ns != 0 && ns - last_ns < 100'000'000ull) return false;
     last_ns = ns;
-    return eden_memory_recover_try(SparseSlot) != 0;
+    const unsigned waiters = memory_waiters.load(std::memory_order_acquire);
+    const std::size_t ask = SparseSlot * (1 + std::min<unsigned>(waiters, 32));
+    std::size_t recovered = eden_memory_recover_try(ask);
+#ifdef PS5_NATIVE
+    if (recovered == 0) recovered = TrimHeapForFault();
+#endif
+    return recovered != 0;
 }
 
 void NoteUnpackWait() noexcept {
@@ -558,9 +612,10 @@ bool UnpackSlot(SparseRange& range, std::size_t slot) noexcept {
     std::int64_t physical = -1;
     if (eden_direct_low(SparseSlot, SparseSlot, 12, &physical) != 0 && !UnpackBlock(&physical) &&
         !ReserveBlock(&physical)) {
-        // Nothing idle: have cold slots packed and the driver's unused memory given back, then look
-        // again. The write fault path repeats this every 20 ms for up to 2 s (WaitForBlock).
-        TryRecoverForUnpack();
+        // Nothing idle: have cold slots packed, the driver's unused memory and the Eden heap's empty
+        // arenas given back, then look again. The fault path repeats this every 100 ms for up to 2 s
+        // (WaitForBlock).
+        RecoverForFault();
         if (eden_direct_low(SparseSlot, SparseSlot, 12, &physical) != 0 && !UnpackBlock(&physical) &&
             !ReserveBlock(&physical)) {
             NoteUnpackWait();
@@ -824,8 +879,8 @@ void NoteWriter() noexcept {
 } // namespace
 
 namespace {
-// Writers waiting for a block (WaitForBlock), and how many waits ended with one.
-std::atomic<unsigned> memory_waiters{0};
+// How many waits ended with a block (WaitForBlock). The writers still being served are counted in
+// memory_waiters, above.
 std::atomic<std::uint64_t> memory_waits_won{0}, memory_waits_lost{0};
 
 // No block was left for a written slot. Most of what the pool gives out is held by the graphics
@@ -837,14 +892,15 @@ std::atomic<std::uint64_t> memory_waits_won{0}, memory_waits_lost{0};
 // again every 20 ms for up to 2 s while the caches give memory back. Only then is it refused.
 template <typename Promote>
 bool WaitForBlock(Promote&& promote) noexcept {
-    memory_waiters.fetch_add(1, std::memory_order_acq_rel);
     bool ok = false;
     for (unsigned tries = 0; tries < 100 && !ok; ++tries) {
+        // Every 100 ms, ask again for what the other owners can give: a fault that is not on a
+        // packed slot would otherwise wait with nothing packing or trimming.
+        if (tries % 5 == 0) RecoverForFault();
         const timespec pause{0, 20'000'000};
         nanosleep(&pause, nullptr);
         ok = promote();
     }
-    memory_waiters.fetch_sub(1, std::memory_order_acq_rel);
     (ok ? memory_waits_won : memory_waits_lost).fetch_add(1, std::memory_order_relaxed);
     Note(ok ? "EDEN_CRAM a written slot waited for the graphics caches to give memory back, and got a block\n"
             : "EDEN_CRAM a written slot waited 2 s for memory and found no block\n");
@@ -938,6 +994,13 @@ bool HandleGuestWriteFault(void* fault) noexcept {
     }
     SparseRange* const range = WriteRangeOf(address);
     if (range == nullptr) return false;
+    // A fault being served is a writer waiting for a block even before its first promotion fails:
+    // packing, GiveBackIdleBlocks and the graphics caches must not give the emergency blocks away
+    // while it runs.
+    struct WaiterRegistration {
+        WaiterRegistration() noexcept { memory_waiters.fetch_add(1, std::memory_order_acq_rel); }
+        ~WaiterRegistration() { memory_waiters.fetch_sub(1, std::memory_order_acq_rel); }
+    } const waiter;
     const std::size_t slot = (address - range->begin.load(std::memory_order_relaxed)) / SparseSlot;
     // The same address faulting again and again with nothing to change is not a slot to promote
     // but a real fault. A promotion starts the count again (below).
@@ -979,12 +1042,27 @@ bool HandleGuestWriteFault(void* fault) noexcept {
         return done;
     };
     bool ok = promote();
+    if (!ok) {
+        // Nothing idle for the first try: have the other owners give memory back now (cold slots
+        // packed, RADV trimmed, the Eden heap's empty arenas), then look again before waiting.
+        RecoverForFault();
+        ok = promote();
+    }
     if (!ok) ok = WaitForBlock(promote);
     UnlockSlot(*range, slot, ok ? SlotOwn : state);
     if (!ok) {
         counters.failures.fetch_add(1, std::memory_order_relaxed);
         Refused(address, 2, state);
-        Note("EDEN_CRAM out of memory: a written slot of the guest's memory found no block\n");
+        char line[256];
+        const int length = std::snprintf(line, sizeof(line),
+            "EDEN_GUEST_OOM the guest's memory found no block (fault slot %zu, state %u): "
+            "EDEN_CRAM out of memory, waiters=%u reserve=%zuMiB unpack_keep=%zuMiB packed=%zuMiB stored=%zuMiB\n",
+            slot, unsigned(state), memory_waiters.load(std::memory_order_relaxed),
+            reserve_count.load(std::memory_order_relaxed) * (SparseSlot >> 20),
+            unpack_keep_count.load(std::memory_order_relaxed) * (SparseSlot >> 20),
+            static_cast<std::size_t>(packed_bytes.load(std::memory_order_relaxed) >> 20),
+            store_held.load(std::memory_order_relaxed) >> 20);
+        if (length > 0) Note(line);
     } else if (state != SlotOwn) {
         // The slot was made writable. A game that writes one place each time its slot was given
         // back (cleared, freed or scanned) faults there again and again over a session, each time
