@@ -13,4 +13,9 @@ namespace Vulkan {
 /// Switch 2 game's 14 GiB of committed guest memory makes likely on 16 GB hosts (#462).
 void ReportPipelineBuildFailure(VkResult result);
 
+/// Whether a pipeline build that ran out of memory may be retried now. At most one build is
+/// retried per interval across the process, so that a full pool is not hammered with compiles;
+/// the callers also wait for the pool's own "not short" signal.
+bool PipelineOomRetryAllowed();
+
 } // namespace Vulkan

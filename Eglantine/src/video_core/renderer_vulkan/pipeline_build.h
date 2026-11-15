@@ -95,7 +95,13 @@ class PipelineBuild {
                 LOG_ERROR(Render_Vulkan,
                           "Graphics pipeline worker failed with an unknown exception");
             }
-            task = {};
+            if (failed) {
+                // The task is kept for a retry on a later draw (Retry below) and the timestamp
+                // starts its cooldown. claimed stays set so nothing runs it again by accident.
+                failed_at.store(NowNs(), std::memory_order_relaxed);
+            } else {
+                task = {};
+            }
             Complete();
         }
 
@@ -117,10 +123,19 @@ class PipelineBuild {
 
         std::function<void()> task;
         bool failed{};
+        /// When the failed build ended, for the retry cooldown (steady clock, nanoseconds).
+        std::atomic<u64> failed_at{};
         std::atomic_bool claimed{};
         std::atomic_bool complete{};
         std::mutex mutex;
         std::condition_variable condition;
+
+        static u64 NowNs() {
+            return static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count());
+        }
     };
 
 public:
@@ -177,6 +192,30 @@ public:
 
     bool Failed() const {
         return IsBuilt() && state->failed;
+    }
+
+    /// Whether a failed build may run again now: the task is kept for it and the cooldown has
+    /// passed. The caller also checks that the pool has room, then calls Retry().
+    bool RetryDue(std::chrono::milliseconds cooldown) const {
+        if (!Failed() || !state->task) {
+            return false;
+        }
+        const u64 now = State::NowNs();
+        const u64 failed_at = state->failed_at.load(std::memory_order_relaxed);
+        return now >= failed_at &&
+               now - failed_at >= static_cast<u64>(cooldown.count()) * 1000000ull;
+    }
+
+    /// Runs the kept task again on the calling thread, which is the one that records the draws:
+    /// the failed build is complete and no worker is running it.
+    void Retry() const {
+        if (!state->failed || !state->task) {
+            return;
+        }
+        state->failed = false;
+        state->complete.store(false, std::memory_order_release);
+        state->claimed.store(false, std::memory_order_release);
+        state->Run();
     }
 
     /// Builds it on this thread (owner_builds)

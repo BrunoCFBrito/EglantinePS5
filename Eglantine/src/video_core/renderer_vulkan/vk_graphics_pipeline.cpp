@@ -8,9 +8,11 @@
 #include "performance.h"
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -56,6 +58,10 @@
 
 namespace Vulkan {
 namespace {
+/// How long a failed build waits before a later draw retries it; the pool's own "short" signal
+/// and PipelineOomRetryAllowed() gate the retry as well.
+constexpr auto PipelineOomRetryDelay = std::chrono::milliseconds{1000};
+
 using boost::container::small_vector;
 using boost::container::static_vector;
 using Shader::ImageBufferDescriptor;
@@ -571,55 +577,76 @@ GraphicsPipeline::GraphicsPipeline(
         }
     }
 
+    // Completed once per pipeline: a retried build runs the same task again.
+    auto notified = std::make_shared<std::atomic_bool>(false);
+    const auto notify_complete = [notified, shader_notify] {
+        if (shader_notify && !notified->exchange(true, std::memory_order_relaxed)) {
+            shader_notify->MarkShaderComplete();
+        }
+    };
     // Shader cache v2: the emission is the CPU stage of the build's job.
     std::function<void()> emit;
     if (build_queue.jobs && emit_stages) {
-        emit = [this, shader_notify, emit_stages = std::exchange(emit_stages, {})] {
+        emit = [this, notify_complete, emit_stages = std::exchange(emit_stages, {})] {
             try {
                 spv_modules = emit_stages();
             } catch (const Shader::Exception& exception) {
                 LOG_ERROR(Render_Vulkan, "Graphics pipeline {:016x}: {}", key.Hash(),
                           exception.what());
-                if (shader_notify) {
-                    shader_notify->MarkShaderComplete();
-                }
+                notify_complete();
                 throw;
             } catch (...) {
-                if (shader_notify) {
-                    shader_notify->MarkShaderComplete();
-                }
+                notify_complete();
                 throw;
             }
         };
     }
-    auto func{[this, shader_notify, &render_pass_cache, pipeline_statistics,
-                emit_stages = std::move(emit_stages)] {
+    auto func{[this, notify_complete, &render_pass_cache, pipeline_statistics,
+                emit_stages = std::move(emit_stages)]() mutable {
         const auto begin = std::chrono::steady_clock::now();
-        SCOPE_EXIT {
-            if (shader_notify) {
-                shader_notify->MarkShaderComplete();
-            }
-        };
+        SCOPE_EXIT { notify_complete(); };
         try {
             if (emit_stages) {
                 spv_modules = emit_stages();
+                // Emitted once: a retried build (PipelineBuild::Retry) reuses these modules;
+                // the emitter consumes the job it captures.
+                emit_stages = {};
             }
             const VkRenderPass render_pass{render_pass_cache.Get(MakeRenderPassKey(key.state, device))};
             Validate();
             MakePipeline(render_pass);
         } catch (const Shader::Exception& exception) {
             LOG_ERROR(Render_Vulkan, "Graphics pipeline {:016x}: {}", key.Hash(), exception.what());
+            // Not an allocation failure: stop retrying this pipeline.
+            build_oom.store(false, std::memory_order_relaxed);
             throw;
         } catch (const vk::Exception& exception) {
+            const VkResult result = exception.GetResult();
+            const bool out_of_memory = result == VK_ERROR_OUT_OF_HOST_MEMORY ||
+                                       result == VK_ERROR_OUT_OF_DEVICE_MEMORY;
+            // Eden PS5: a pipeline the driver could not allocate is skipped and retried by a
+            // later ConfigureImpl once the pool has room; any other failure is final.
+            build_oom.store(out_of_memory, std::memory_order_relaxed);
+            if (out_of_memory && !oom_logged.exchange(true, std::memory_order_relaxed)) {
+                std::fprintf(stderr,
+                             "EDEN_PIPELINE_OOM stage=graphics shader=%016llx result=%d\n",
+                             static_cast<unsigned long long>(key.Hash()),
+                             static_cast<int>(result));
+            }
             LOG_CRITICAL(Render_Vulkan,
                          "Graphics pipeline build failed: {} (stages: tcs={} tes={} geom={}, "
                          "patch control points {}, device max patch size {})",
                          exception.what(), spv_modules[1] ? 1 : 0, spv_modules[2] ? 1 : 0,
                          spv_modules[3] ? 1 : 0, key.state.patch_control_points_minus_one.Value() + 1,
                          device.GetMaxTessellationPatchSize());
-            ReportPipelineBuildFailure(exception.GetResult());
+            ReportPipelineBuildFailure(result);
             throw;
         }
+        if (oom_logged.exchange(false, std::memory_order_relaxed)) {
+            std::fprintf(stderr, "EDEN_PIPELINE_OOM_RETRY_OK stage=graphics shader=%016llx\n",
+                         static_cast<unsigned long long>(key.Hash()));
+        }
+        build_oom.store(false, std::memory_order_relaxed);
         if (pipeline_statistics) {
             pipeline_statistics->Collect(device, *pipeline);
         }
@@ -1115,6 +1142,14 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             scheduler.RequestOutsideRenderPassOperationContext();
         }
     }
+    if (build_oom.load(std::memory_order_relaxed) &&
+        !::Eden::Performance::GraphicsMemoryIsShort() && PipelineOomRetryAllowed() &&
+        build->RetryDue(PipelineOomRetryDelay)) {
+        // Eden PS5: the driver could not allocate this pipeline during a full pool. Retry it
+        // here, on the thread that records this draw, now that the pool has room; a failed
+        // retry skips the draw as before.
+        build->Retry();
+    }
     if (IsBuilt() && (!pipeline || build->Failed())) {
         return false;
     }
@@ -1251,6 +1286,14 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
             (scheduler.RenderPassHasStores() || texture_cache.SamplesRenderTarget(view_span))) {
             scheduler.RequestOutsideRenderPassOperationContext();
         }
+    }
+    if (build_oom.load(std::memory_order_relaxed) &&
+        !::Eden::Performance::GraphicsMemoryIsShort() && PipelineOomRetryAllowed() &&
+        build->RetryDue(PipelineOomRetryDelay)) {
+        // Eden PS5: the driver could not allocate this pipeline during a full pool. Retry it
+        // here, on the thread that records this draw, now that the pool has room; a failed
+        // retry skips the draw as before.
+        build->Retry();
     }
     if (IsBuilt() && (!pipeline || build->Failed())) {
         return false;

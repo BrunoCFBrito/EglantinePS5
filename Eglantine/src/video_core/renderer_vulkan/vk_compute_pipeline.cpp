@@ -9,8 +9,10 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <memory>
 #include <vector>
 
 #include <boost/container/small_vector.hpp>
@@ -41,6 +43,19 @@
 #include "shader_recompiler/exception.h"
 
 namespace Vulkan {
+
+namespace {
+/// A failed build waits this long before a dispatch retries it. The pool's own "short" signal
+/// and PipelineOomRetryAllowed() gate the retry as well, so a full pool is not hammered with
+/// compiles.
+constexpr u64 PipelineOomRetryDelayNs = 1000ull * 1000ull * 1000ull;
+
+u64 PipelineRetryNowNs() {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+}
+} // Anonymous namespace
 
 using Shader::ImageBufferDescriptor;
 using Shader::Backend::SPIRV::RESCALING_LAYOUT_WORDS_OFFSET;
@@ -257,7 +272,14 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
         }
     }
 
-    auto func{[this, shader_notify, pipeline_statistics] {
+    // Completed once per pipeline: a retried build runs the same task again.
+    auto notified = std::make_shared<std::atomic_bool>(false);
+    const auto notify_complete = [notified, shader_notify] {
+        if (shader_notify && !notified->exchange(true, std::memory_order_relaxed)) {
+            shader_notify->MarkShaderComplete();
+        }
+    };
+    auto func{[this, pipeline_statistics, notify_complete] {
         const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_size_ci{
             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
             .pNext = nullptr,
@@ -319,16 +341,35 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
                 detach(reinterpret_cast<void*>(*spv_module));
             }
         } catch (const vk::Exception& exception) {
+            const VkResult result = exception.GetResult();
+            if (result == VK_ERROR_OUT_OF_HOST_MEMORY ||
+                result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+                // Eden PS5: the driver could not allocate the pipeline. Mark the build failed so
+                // the dispatch is skipped and a later Configure retries it once the pool has
+                // room, instead of treating the pipeline as built for the session.
+                build_failed.store(true, std::memory_order_relaxed);
+                retry_at_ns.store(PipelineRetryNowNs() + PipelineOomRetryDelayNs,
+                                  std::memory_order_relaxed);
+                if (!oom_logged.exchange(true, std::memory_order_relaxed)) {
+                    std::fprintf(stderr,
+                                 "EDEN_PIPELINE_OOM stage=compute shader=%016llx result=%d\n",
+                                 static_cast<unsigned long long>(shader_hash),
+                                 static_cast<int>(result));
+                }
+            }
             LOG_CRITICAL(Render_Vulkan, "Driver rejected compute shader {:016X}: {}", shader_hash,
                          exception.what());
-            ReportPipelineBuildFailure(exception.GetResult());
+            ReportPipelineBuildFailure(result);
             std::scoped_lock lock{build_mutex};
             is_built = true;
             build_condvar.notify_one();
-            if (shader_notify) {
-                shader_notify->MarkShaderComplete();
-            }
+            notify_complete();
             return;
+        }
+
+        if (oom_logged.exchange(false, std::memory_order_relaxed)) {
+            std::fprintf(stderr, "EDEN_PIPELINE_OOM_RETRY_OK stage=compute shader=%016llx\n",
+                         static_cast<unsigned long long>(shader_hash));
         }
 
         // Log compute pipeline creation
@@ -347,9 +388,7 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
         std::scoped_lock lock{build_mutex};
         is_built = true;
         build_condvar.notify_one();
-        if (shader_notify) {
-            shader_notify->MarkShaderComplete();
-        }
+        notify_complete();
     }};
     build_task = std::move(func);
     if (build_queue.jobs) {
@@ -361,7 +400,7 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
         };
         if (emit) {
             // The SPIR-V is emitted first, in the job's CPU stage (shader cache v2)
-            build_job.cpu = [this, shader_notify, emit = std::move(emit)](
+            build_job.cpu = [this, notify_complete, emit = std::move(emit)](
                                 VideoCommon::ShaderJobContext&) -> VideoCommon::ShaderDriverStage {
                 // A pipeline that fails here is built without a VkPipeline: its dispatches are
                 // skipped, as for one the driver rejects
@@ -372,9 +411,7 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
                     std::scoped_lock lock{build_mutex};
                     is_built = true;
                     build_condvar.notify_one();
-                    if (shader_notify) {
-                        shader_notify->MarkShaderComplete();
-                    }
+                    notify_complete();
                 };
                 try {
                     spv_module = emit();
@@ -411,7 +448,11 @@ void ComputePipeline::RunBuild() {
         return;
     }
     build_task();
-    build_task = nullptr;
+    if (!build_failed.load(std::memory_order_acquire)) {
+        build_task = nullptr;
+    }
+    // On failure the task is kept for the retry in Configure(), and claimed stays set: the
+    // failed attempt is complete until that retry resets it.
 }
 
 bool ComputePipeline::CanReplaceOcarinaUpscale() const {
@@ -680,6 +721,26 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         LOG_CRITICAL(Render_Vulkan, "Compute descriptor count mismatch: expected {}, got {}",
                      num_descriptor_entries, guest_descriptor_queue.UpdateCount());
         return false;
+    }
+
+    if (build_failed.load(std::memory_order::acquire) && (!jobs || job.Ready()) &&
+        !::Eden::Performance::GraphicsMemoryIsShort() && PipelineOomRetryAllowed() &&
+        retry_at_ns.load(std::memory_order::relaxed) <= PipelineRetryNowNs()) {
+        // Eden PS5: a build that ran out of memory is retried now that the pool has room. The
+        // attempt runs through the wait below; the dispatch is still skipped while the handle
+        // stays null.
+        is_built.store(false, std::memory_order::release);
+        build_failed.store(false, std::memory_order::relaxed);
+        build_claimed.store(false, std::memory_order::release);
+        if (jobs) {
+            VideoCommon::ShaderJob build_job{
+                .priority = VideoCommon::ShaderJobPriority::Soon,
+                .cpu_bytes = 0,
+                .driver_bytes = 0,
+            };
+            build_job.driver = [this] { RunBuild(); };
+            job = jobs->Submit(std::move(build_job));
+        }
     }
 
     if (!is_built.load(std::memory_order::relaxed)) {

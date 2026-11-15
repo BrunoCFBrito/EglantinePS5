@@ -1,12 +1,39 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <atomic>
+#include <chrono>
 
+#include "common/common_types.h"
 #include "common/logging.h"
 #include "common/memory_detect.h"
 #include "video_core/renderer_vulkan/pipeline_build_failure.h"
 
 namespace Vulkan {
+
+namespace {
+/// The least time between two out-of-memory build retries, process-wide.
+constexpr auto RetrySpacing = std::chrono::milliseconds{250};
+
+u64 NowNs() {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+}
+} // Anonymous namespace
+
+bool PipelineOomRetryAllowed() {
+    static std::atomic<u64> next_retry_ns{0};
+    const u64 now_ns = NowNs();
+    u64 expected = next_retry_ns.load(std::memory_order_relaxed);
+    do {
+        if (now_ns < expected) {
+            return false;
+        }
+    } while (!next_retry_ns.compare_exchange_weak(
+        expected, now_ns + static_cast<u64>(RetrySpacing.count()) * 1000000ull,
+        std::memory_order_relaxed));
+    return true;
+}
 
 void ReportPipelineBuildFailure(VkResult result) {
     static std::atomic_flag reported;

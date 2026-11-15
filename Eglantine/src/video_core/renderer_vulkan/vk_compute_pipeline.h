@@ -144,6 +144,11 @@ private:
     ::Eden::StripedCondition build_condvar;
     ::Eden::StripedMutex build_mutex;
     std::atomic_bool is_built{false};
+    /// Eden PS5: the last build failed for lack of memory; a later dispatch retries it once the
+    /// pool has room.
+    std::atomic_bool build_failed{false};
+    std::atomic<u64> retry_at_ns{0};
+    std::atomic_bool oom_logged{false};
     /// Shader cache v2: the job that builds it (PipelineBuildQueue::jobs)
     VideoCommon::ShaderJobScheduler* jobs{};
     VideoCommon::ShaderJobHandle job;

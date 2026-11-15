@@ -424,6 +424,10 @@ private:
     vk::PipelineLayout pipeline_layout;
     vk::DescriptorUpdateTemplate descriptor_update_template;
     vk::Pipeline pipeline;
+    /// Eden PS5: the driver build last failed for lack of memory; ConfigureImpl retries it once
+    /// the pool has room (see PipelineBuild::Retry).
+    std::atomic_bool build_oom{false};
+    std::atomic_bool oom_logged{false};
 
     DescriptorBufferLayout descriptor_buffer_layout;
     std::vector<DescriptorUpdateEntry> last_descriptor_payload;
