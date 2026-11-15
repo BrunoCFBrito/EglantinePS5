@@ -428,6 +428,102 @@ const RasterizerVulkan::MeshArena& RasterizerVulkan::AcquireMeshArena() {
     return *it;
 }
 
+RasterizerVulkan::MeshOutputAllocation RasterizerVulkan::AllocateMeshOutput(u64 bytes) {
+    const u64 tick{scheduler.CurrentTick()};
+    const u64 alignment{(std::max)(u64{16}, u64{device.GetStorageBufferAlignment()})};
+    bytes = (std::max)(bytes, u64{4});
+
+    const auto take = [&](MeshOutputArena& arena) -> std::optional<MeshOutputAllocation> {
+        const u64 offset{Common::AlignUp(arena.used, alignment)};
+        if (offset > arena.size || bytes > arena.size - offset) {
+            return std::nullopt;
+        }
+        arena.used = offset + bytes;
+        mesh_output_arena_used = static_cast<size_t>(&arena - mesh_output_arenas.data());
+        return MeshOutputAllocation{*arena.buffer, offset, bytes};
+    };
+
+    // A submission may have filled the most recently used arena but still have room in an older
+    // one. Prefer its tightest fit so large arenas remain available for large draws.
+    MeshOutputArena* same_tick{};
+    u64 same_tick_remaining{(std::numeric_limits<u64>::max)()};
+    for (MeshOutputArena& arena : mesh_output_arenas) {
+        if (arena.tick != tick) {
+            continue;
+        }
+        const u64 offset{Common::AlignUp(arena.used, alignment)};
+        if (offset <= arena.size && bytes <= arena.size - offset &&
+            arena.size - (offset + bytes) < same_tick_remaining) {
+            same_tick = &arena;
+            same_tick_remaining = arena.size - (offset + bytes);
+        }
+    }
+    if (same_tick != nullptr) {
+        return *take(*same_tick);
+    }
+
+    // Recycle the smallest completed arena that fits. Its Vulkan allocation remains stable while
+    // thousands of draw outputs come and go inside it.
+    MeshOutputArena* reusable{};
+    for (MeshOutputArena& arena : mesh_output_arenas) {
+        if (!scheduler.IsFree(arena.tick) || arena.size < bytes ||
+            (reusable != nullptr && reusable->size <= arena.size)) {
+            continue;
+        }
+        reusable = &arena;
+    }
+    if (reusable != nullptr) {
+        reusable->tick = tick;
+        reusable->used = 0;
+        return *take(*reusable);
+    }
+
+    const u64 size{(std::max)(mesh_output_arena_size, std::bit_ceil(bytes))};
+    vk::Buffer buffer = memory_allocator.TryCreateBuffer(
+        VkBufferCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .size = size,
+            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .queueFamilyIndexCount = 0,
+            .pQueueFamilyIndices = nullptr,
+        },
+        MemoryUsage::DeviceLocal);
+    if (!buffer) {
+        // No room for another arena: stage this draw's output on its own, as before the arena.
+        // The staging pool frees its idle buffers and degrades before it fails.
+        const StagingBufferRef ref{staging_pool.Request(bytes, MemoryUsage::DeviceLocal, true)};
+        mesh_draw_buffers.push_back(ref);
+        return MeshOutputAllocation{ref.buffer, ref.offset, bytes};
+    }
+    mesh_output_arenas.emplace_back(MeshOutputArena{
+        .buffer = std::move(buffer),
+        .size = size,
+        .used = 0,
+        .tick = tick,
+    });
+    LOG_INFO(Render_Vulkan, "Mesh emulation: created a {} MiB shared output arena ({} total)",
+             size >> 20, mesh_output_arenas.size());
+    return *take(mesh_output_arenas.back());
+}
+
+void RasterizerVulkan::ReleaseMeshEmulationBuffers() {
+    for (StagingBufferRef& ref : mesh_draw_buffers) {
+        staging_pool.FreeDeferred(ref);
+    }
+    mesh_draw_buffers.clear();
+    if (mesh_arena_used) {
+        mesh_arena_used = false;
+        mesh_arenas[mesh_arena_current].tick = scheduler.CurrentTick();
+    }
+    if (mesh_output_arena_used < mesh_output_arenas.size()) {
+        mesh_output_arenas[mesh_output_arena_used].tick = scheduler.CurrentTick();
+        mesh_output_arena_used = ~size_t{};
+    }
+}
+
 RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra::GPU& gpu_,
                                    Tegra::MaxwellDeviceMemoryManager& device_memory_,
                                    const Device& device_, MemoryAllocator& memory_allocator_,
@@ -818,6 +914,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     SCOPE_EXIT {
         gpu.TickWork();
     };
+    SCOPE_EXIT {
+        ReleaseMeshEmulationBuffers();
+    };
     bool submitted = false;
     SCOPE_EXIT {
         auto& native = maxwell3d->GetNativeMacroEngine();
@@ -985,13 +1084,20 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         u64 bytes{};
         if (has_task) {
             const MeshArena& arena{AcquireMeshArena()};
+            mesh_arena_used = true;
             bytes = arena.size;
             pipeline->SetMeshEmulationOutput(*arena.buffer, 0, bytes, groups);
         } else {
             bytes = (std::max)(u64{groups} * block_bytes, u64{4});
-            output = staging_pool.Request(bytes, probe_draw ? MemoryUsage::Download
-                                                            : MemoryUsage::DeviceLocal);
-            pipeline->SetMeshEmulationOutput(output.buffer, output.offset, bytes, groups);
+            if (probe_draw) {
+                output = staging_pool.Request(bytes, MemoryUsage::Download, true);
+                mesh_draw_buffers.push_back(output);
+                pipeline->SetMeshEmulationOutput(output.buffer, output.offset, bytes, groups);
+            } else {
+                const MeshOutputAllocation allocation{AllocateMeshOutput(bytes)};
+                pipeline->SetMeshEmulationOutput(allocation.buffer, allocation.offset,
+                                                 allocation.size, groups);
+            }
         }
         mesh_emulation_indirect = {};
         if (mesh_task_probe.pending && scheduler.IsFree(mesh_task_probe.tick)) {
@@ -1011,7 +1117,8 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
                                   render_trace_frame % 60 == 0};
             const auto request = [&](u64 size, MemoryUsage usage = MemoryUsage::DeviceLocal) {
                 size = (std::max)(size, u64{16});
-                const StagingBufferRef ref{staging_pool.Request(size, usage)};
+                const StagingBufferRef ref{staging_pool.Request(size, usage, true)};
+                mesh_draw_buffers.push_back(ref);
                 return std::make_pair(GraphicsPipeline::MeshEmulationBuffer{ref.buffer, ref.offset,
                                                                             size},
                                       ref.mapped_span.subspan(
