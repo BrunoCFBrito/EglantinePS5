@@ -74,6 +74,11 @@
  * arena stays with its thread's record when its blocks are freed (the next thread on the record
  * uses it), so this is also the most the heap keeps for small blocks alone. */
 #define EDEN_HEAP_MAX_ARENAS 1024u
+/* The shared long-lived arenas (eden_heap_long_lived_malloc/calloc, at the end of this file):
+ * pipeline-lifetime objects that would otherwise pin the compile threads' arenas. The same 2 MiB
+ * slot size, and the same 2 GiB the thread arenas may take; a request that finds no room in the
+ * set falls back to the thread's arena, as before. */
+#define EDEN_HEAP_LONG_LIVED_ARENAS 1024u
 /* One thread's arenas: at most 256 MiB of small blocks before they go to the heap's spaces. */
 #define EDEN_HEAP_THREAD_ARENAS 128u
 /* A request this large or larger that finds no room in the thread's arenas makes no new one. */
@@ -130,6 +135,22 @@ static atomic_flag eden_heap_arena_create_lock = ATOMIC_FLAG_INIT;
  * watchdog, headless/stall_watchdog.h). */
 static _Atomic unsigned long eden_heap_create_holder;
 static atomic_uint eden_heap_create_waiters;
+
+/* The shared long-lived arena set. They are not in eden_heap_arena_list: never given back by
+ * eden_heap_release_arenas and never handed to a thread by eden_heap_emptiest_arena. Each is
+ * registered in eden_heap_slots like a thread arena, so free() and realloc() of its blocks find
+ * its mspace the same way (eden_heap_release, eden_heap_owner). */
+static void *_Atomic eden_heap_long_lived_arena_list[EDEN_HEAP_LONG_LIVED_ARENAS];
+static atomic_uint eden_heap_long_lived_arena_count;
+static atomic_uint eden_heap_long_lived_arena_hint; /* the one that served last */
+/* Slots holding one: the PIN report leaves their blocks out (a long-lived arena is never given
+ * back, so its blocks pin no thread's arena), and eden_heap_slot_count keeps their live bytes. */
+static atomic_uchar eden_heap_slot_long_lived[EDEN_HEAP_SLOTS];
+static atomic_long eden_heap_long_lived_live;   /* usable bytes in live blocks (a measurement) */
+static atomic_long eden_heap_long_lived_blocks; /* live blocks (a measurement) */
+/* -1: EDEN_HEAP_LONG_LIVED not read yet; 0: off (the thread's arena, as before, for an A/B);
+ * 1: on. */
+static atomic_int eden_heap_long_lived_enabled = -1;
 
 /* The heap's own mspaces, a slot each; each spans one or more pieces in a row. Slot 0 is the
  * first space and stays. A slot whose space was given back (eden_heap_trim) is retired, and a
@@ -982,9 +1003,15 @@ static void *eden_heap_thread_arena(void) {
 }
 
 static void eden_heap_slot_count(const void *address, long sign) {
-  if (address != NULL)
-    atomic_fetch_add_explicit(&eden_heap_slot_live[eden_heap_slot(address)],
-                              sign * (long)sceLibcMspaceMallocUsableSize((void *)address), memory_order_relaxed);
+  if (address != NULL) {
+    const uintptr_t slot = eden_heap_slot(address);
+    const long bytes = sign * (long)sceLibcMspaceMallocUsableSize((void *)address);
+    atomic_fetch_add_explicit(&eden_heap_slot_live[slot], bytes, memory_order_relaxed);
+    if (atomic_load_explicit(&eden_heap_slot_long_lived[slot], memory_order_relaxed)) {
+      atomic_fetch_add_explicit(&eden_heap_long_lived_live, bytes, memory_order_relaxed);
+      atomic_fetch_add_explicit(&eden_heap_long_lived_blocks, sign, memory_order_relaxed);
+    }
+  }
 }
 static void *eden_heap_arena_try(void *arena, size_t count, size_t size, int zero) {
   eden_heap_arena_enter(arena);
@@ -1384,6 +1411,13 @@ static void eden_site_print_top(const char *tag, int pin) {
 }
 
 static void eden_heap_research_report(void) {
+  {
+    const unsigned arenas = atomic_load_explicit(&eden_heap_long_lived_arena_count, memory_order_relaxed);
+    const long live = atomic_load_explicit(&eden_heap_long_lived_live, memory_order_relaxed);
+    const long blocks = atomic_load_explicit(&eden_heap_long_lived_blocks, memory_order_relaxed);
+    fprintf(stderr, "EDEN_HEAP_LONG_LIVED arenas=%u (%u MiB) live=%ld KiB in %ld blocks\n", arenas,
+            arenas * (EDEN_HEAP_ARENA_SIZE >> 20), live >> 10, blocks);
+  }
   for (unsigned i = 0; i < EDEN_HEAP_THREADS; ++i) {
     const struct eden_heap_thread *t = &eden_heap_threads[i];
     if (t->owned < 2)
@@ -1402,6 +1436,8 @@ static void eden_heap_research_report(void) {
     if (address <= 1 || !eden_heap_in_range((const void *)address))
       continue;
     const uintptr_t slot = eden_heap_slot((const void *)address);
+    if (atomic_load_explicit(&eden_heap_slot_long_lived[slot], memory_order_relaxed))
+      continue; /* a shared long-lived arena: never given back, so it pins no thread's */
     if (atomic_load_explicit(&eden_heap_slots[slot], memory_order_relaxed) == NULL)
       continue; /* not in an arena */
     if (atomic_load_explicit(&eden_heap_slot_live[slot], memory_order_relaxed) >= (long)(EDEN_HEAP_ARENA_PAYLOAD / 4))
@@ -1650,3 +1686,130 @@ size_t __wrap_malloc_usable_size(const void *address) {
   return ps5_heap_owns(address) ? eden_heap_usable(address) : __real_malloc_usable_size(address);
 }
 
+/* ---- The shared long-lived arena set ----
+ *
+ * RADV allocates what lives as long as a pipeline (its object for a shader, its copy of the
+ * code, VS prologs, the strings it parses out of a binary, descriptor set layouts) with
+ * calloc/malloc on the threads that build shaders, between the compiler's temporary blocks. In a
+ * thread's arena those objects keep that arena from ever being empty, so eden_heap_release_arenas
+ * cannot give it back: after a cold pipeline-cache build 231 arenas held 462 MiB with 83 MiB
+ * live. These entry points put such objects in arenas shared by all threads and never given
+ * back, so the compiler's blocks stay in the thread's arenas and those empty after each build
+ * (bar the freed blocks each thread's cache keeps, a few MiB at most).
+ *
+ * To the rest of the heap a long-lived block is an ordinary heap block: it is registered in
+ * eden_heap_slots, so free() and realloc() (both wrapped, tools/link-headless-native.sh) find its
+ * mspace through eden_heap_owner and free it there, keeping the arena's live count. The RADV side
+ * only chooses where these objects are allocated; every free path stays free().
+ *
+ * EDEN_HEAP_LONG_LIVED=0 makes these entry points use the ordinary heap, as before, for an A/B
+ * of one build. A request the set cannot take (no room in an arena, no memory for another, or
+ * the limit) falls back to the ordinary heap, so failure modes match the allocator it replaces.
+ */
+static int eden_heap_long_lived_on(void) {
+  int enabled = atomic_load_explicit(&eden_heap_long_lived_enabled, memory_order_relaxed);
+  if (enabled >= 0)
+    return enabled;
+  const char *value = getenv("EDEN_HEAP_LONG_LIVED");
+  enabled = value == NULL || value[0] != '0';
+  atomic_store_explicit(&eden_heap_long_lived_enabled, enabled, memory_order_relaxed);
+  return enabled;
+}
+
+/* One request to an arena of the set, counted like any heap block (live bytes, blocks, site). */
+static void *eden_heap_long_lived_try(void *arena, int kind, size_t a, size_t b, size_t bytes) {
+  void *address = eden_heap_space_try(arena, kind, a, b);
+  if (address != NULL) {
+    eden_heap_slot_count(address, 1);
+    eden_heap_record(address, bytes);
+    eden_site_alloc(address, bytes);
+  }
+  return address;
+}
+
+/* The arenas of the set, from the one that served last; *index is where a block was found. */
+static void *eden_heap_long_lived_find(unsigned count, int kind, size_t a, size_t b, size_t bytes,
+                                       unsigned *index) {
+  const unsigned hint = atomic_load_explicit(&eden_heap_long_lived_arena_hint, memory_order_relaxed);
+  for (unsigned i = 0; i < count; ++i) {
+    const unsigned at = (hint + i) % count;
+    void *arena = atomic_load_explicit(&eden_heap_long_lived_arena_list[at], memory_order_acquire);
+    void *address = eden_heap_long_lived_try(arena, kind, a, b, bytes);
+    if (address != NULL) {
+      *index = at;
+      return address;
+    }
+  }
+  return NULL;
+}
+
+static void *eden_heap_long_lived_allocate(int kind, size_t a, size_t b, size_t bytes) {
+  if (!eden_heap_long_lived_on() || !ps5_heap_ready())
+    return NULL;
+  /* A request an empty arena cannot hold would make a new arena on every call, and never use
+   * one: such objects go to the ordinary heap (its large blocks), as they did before. Half a
+   * payload always fits beside the mspace's own records; a 0-byte request is the allocator's
+   * own answer and needs no arena at all. */
+  if (bytes == 0 || bytes > EDEN_HEAP_ARENA_PAYLOAD / 2)
+    return NULL;
+
+  unsigned count = atomic_load_explicit(&eden_heap_long_lived_arena_count, memory_order_acquire);
+  unsigned index = 0;
+  void *address = eden_heap_long_lived_find(count, kind, a, b, bytes, &index);
+  if (address != NULL) {
+    atomic_store_explicit(&eden_heap_long_lived_arena_hint, index, memory_order_relaxed);
+    return address;
+  }
+  if (count >= EDEN_HEAP_LONG_LIVED_ARENAS)
+    return NULL;
+
+  /* One more arena: a 2 MiB slot from the heap's spaces, made like a thread's first. The
+   * creation lock serialises makers; one that loses the race finds the other's arena below. */
+  const unsigned before = count;
+  eden_heap_create_acquire();
+  const unsigned made = atomic_load_explicit(&eden_heap_long_lived_arena_count, memory_order_acquire);
+  if (made == before) {
+    void *block = eden_heap_main(EDEN_HEAP_ALIGNED, EDEN_HEAP_ARENA_SIZE, EDEN_HEAP_ARENA_PAYLOAD);
+    void *arena = block != NULL ? sceLibcMspaceCreate("Eden-long-lived", block, EDEN_HEAP_ARENA_PAYLOAD, 0) : NULL;
+    if (arena != NULL) {
+      const uintptr_t slot = eden_heap_slot(block);
+      atomic_store_explicit(&eden_heap_slot_retired[slot], 0, memory_order_seq_cst);
+      atomic_store_explicit(&eden_heap_slots[slot], arena, memory_order_release);
+      atomic_store_explicit(&eden_heap_slot_long_lived[slot], 1, memory_order_release);
+      atomic_store_explicit(&eden_heap_long_lived_arena_list[before], arena, memory_order_release);
+      atomic_store_explicit(&eden_heap_long_lived_arena_count, before + 1, memory_order_release);
+    } else if (block != NULL) {
+      eden_heap_space_free(block);
+    }
+  }
+  eden_heap_create_release();
+
+  count = atomic_load_explicit(&eden_heap_long_lived_arena_count, memory_order_acquire);
+  if (count == before)
+    return NULL; /* no arena was made: the heap has no room for another */
+  address = eden_heap_long_lived_find(count, kind, a, b, bytes, &index);
+  if (address != NULL)
+    atomic_store_explicit(&eden_heap_long_lived_arena_hint, index, memory_order_relaxed);
+  return address;
+}
+
+/* For RADV's pipeline-lifetime objects: NULL falls back to the ordinary heap (and 0 bytes is the
+ * allocator's own answer, as malloc/calloc give it). */
+void *eden_heap_long_lived_malloc(size_t size) {
+  void *address = eden_heap_long_lived_allocate(EDEN_HEAP_MALLOC, size, 0, size);
+  return address != NULL ? address : __wrap_malloc(size);
+}
+
+void *eden_heap_long_lived_calloc(size_t count, size_t size) {
+  if (size != 0 && count > (size_t)-1 / size) {
+    eden_heap_failed((size_t)-1, EDEN_HEAP_WHY_OVERFLOW);
+    return NULL;
+  }
+  void *address = eden_heap_long_lived_allocate(EDEN_HEAP_CALLOC, count, size, count * size);
+  return address != NULL ? address : __wrap_calloc(count, size);
+}
+
+/* Every heap block frees through the same path, whichever arena made it (eden_heap_release). */
+void eden_heap_long_lived_free(void *address) {
+  __wrap_free(address);
+}
