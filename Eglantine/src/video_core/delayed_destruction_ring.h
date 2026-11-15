@@ -26,6 +26,14 @@ public:
         elements[index].push_back(std::move(object));
     }
 
+    /// Destroys every object now. Only after the GPU is idle (Scheduler::Finish): the ring
+    /// normally keeps them a few ticks because submitted work may still read them.
+    void Clear() noexcept {
+        for (auto& element : elements) {
+            element.clear();
+        }
+    }
+
 private:
     size_t index = 0;
     std::array<std::vector<T>, TICKS_TO_DESTROY> elements;

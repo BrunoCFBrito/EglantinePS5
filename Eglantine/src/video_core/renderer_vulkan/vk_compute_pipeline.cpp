@@ -641,6 +641,10 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     std::ranges::for_each(info.image_buffer_descriptors, add_buffer);
 
     buffer_cache.UpdateComputeBuffers();
+    if (buffer_cache.AllocationFailed()) {
+        // The rasterizer skips this dispatch; the next one resolves the bindings again.
+        return false;
+    }
     buffer_cache.BindHostComputeBuffers();
     if (buffer_cache.any_buffer_uploaded) {
         buffer_cache.runtime.PostCopyBarrier();

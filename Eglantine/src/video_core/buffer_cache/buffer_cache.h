@@ -122,6 +122,7 @@ void BufferCache<P>::TickFrame() {
         return;
     }
     runtime.TickFrame(slot_buffers);
+    frame_created_buffers.clear();
     native_indirect_uniforms_this_frame.clear();
     static const bool mem_trace = std::getenv("EDEN_NX2_MEM_TRACE") != nullptr;
     if (static std::chrono::steady_clock::time_point last{}; mem_trace) {
@@ -1438,6 +1439,11 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
         buffer_a = FindBuffer(*cpu_src_address, static_cast<u32>(amount), false);
         buffer_b = FindBuffer(*cpu_dest_address, static_cast<u32>(amount), false);
     } while (channel_state->has_deleted_buffers);
+    if (!buffer_a || !buffer_b) {
+        // Out of device memory (or an address the cache does not cover): leave the copy to the
+        // CPU's fallback path instead of recording one against a missing buffer.
+        return false;
+    }
     auto& src_buffer = slot_buffers[buffer_a];
     auto& dest_buffer = slot_buffers[buffer_b];
     SynchronizeBuffer(src_buffer, *cpu_src_address, static_cast<u32>(amount));
@@ -1503,6 +1509,9 @@ bool BufferCache<P>::DMAClear(GPUVAddr dst_address, u64 amount, u32 value) {
     gpu_modified_ranges.Subtract(*cpu_dst_address, size);
 
     const BufferId buffer = FindBuffer(*cpu_dst_address, static_cast<u32>(size), false);
+    if (!buffer) {
+        return false;
+    }
     Buffer& dest_buffer = slot_buffers[buffer];
     const u32 offset = dest_buffer.Offset(*cpu_dst_address);
     runtime.ClearBuffer(dest_buffer, offset, size, value);
@@ -1525,6 +1534,9 @@ template <class P>
 std::pair<typename P::Buffer*, u32> BufferCache<P>::ObtainCPUBuffer(
     DAddr device_addr, u32 size, ObtainBufferSynchronize sync_info, ObtainBufferOperation post_op) {
     const BufferId buffer_id = FindBuffer(device_addr, size, false);
+    if (!buffer_id) {
+        return {&slot_buffers[NULL_BUFFER_ID], 0};
+    }
     Buffer& buffer = slot_buffers[buffer_id];
 
     // synchronize op
@@ -1581,6 +1593,7 @@ void BufferCache<P>::DisableGraphicsUniformBuffer(size_t stage, u32 index) {
 
 template <class P>
 void BufferCache<P>::UpdateGraphicsBuffers(bool is_indexed) {
+    allocation_failed = false;
     do {
         channel_state->has_deleted_buffers = false;
         DoUpdateGraphicsBuffers(is_indexed);
@@ -1589,6 +1602,7 @@ void BufferCache<P>::UpdateGraphicsBuffers(bool is_indexed) {
 
 template <class P>
 void BufferCache<P>::UpdateComputeBuffers() {
+    allocation_failed = false;
     do {
         channel_state->has_deleted_buffers = false;
         DoUpdateComputeBuffers();
@@ -2250,11 +2264,24 @@ bool BufferCache<P>::IsRegionCpuModified(DAddr addr, size_t size) {
 
 template <class P>
 void BufferCache<P>::BindHostIndexBuffer() {
+    const auto& draw_state = maxwell3d->draw_manager.draw_state;
+    if (channel_state->index_buffer.buffer_id == NULL_BUFFER_ID) {
+        // No buffer for it (out of memory): Vulkan has no null index buffer, so bind the
+        // runtime's own and no range. The draw is skipped by the allocation-failure latch.
+        Buffer& null_buffer = slot_buffers[NULL_BUFFER_ID];
+        if constexpr (IS_OPENGL) {
+            runtime.BindIndexBuffer(null_buffer, 0, 0);
+        } else {
+            runtime.BindIndexBuffer(draw_state.topology, draw_state.index_buffer.format,
+                                    draw_state.index_buffer.first,
+                                    draw_state.index_buffer.count, null_buffer.Handle(), 0, 0);
+        }
+        return;
+    }
     Buffer& buffer = slot_buffers[channel_state->index_buffer.buffer_id];
     TouchBuffer(buffer, channel_state->index_buffer.buffer_id);
     const u32 offset = buffer.Offset(channel_state->index_buffer.device_addr);
     const u32 size = channel_state->index_buffer.size;
-    const auto& draw_state = maxwell3d->draw_manager.draw_state;
     if constexpr (requires { runtime.BindHostUint8IndexBuffer(std::span<const u8>{}); }) {
         if (draw_state.index_buffer.format == Maxwell::IndexFormat::UnsignedByte &&
             draw_state.topology != Maxwell::PrimitiveTopology::Quads &&
@@ -2465,6 +2492,10 @@ void BufferCache<P>::BindHostVertexBuffers() {
 template <class P>
 void BufferCache<P>::BindHostDrawIndirectBuffers() {
     const auto bind_buffer = [this](const Binding& binding) {
+        if (!binding.buffer_id) {
+            // Out of device memory: the draw is skipped, and there is no offset to compute.
+            return;
+        }
         Buffer& buffer = slot_buffers[binding.buffer_id];
         TouchBuffer(buffer, binding.buffer_id);
         SynchronizeBuffer(buffer, binding.device_addr, binding.size);
@@ -2761,6 +2792,16 @@ void BufferCache<P>::BindHostGraphicsStorageBuffers(size_t stage) {
             return;
         }
         Buffer& buffer = slot_buffers[binding.buffer_id];
+        if (binding.buffer_id == NULL_BUFFER_ID) {
+            // Out of memory: bind the null descriptor with a zero range; the draw is skipped.
+            if constexpr (NEEDS_BIND_STORAGE_INDEX) {
+                runtime.BindStorageBuffer(stage, binding_index, buffer, 0, 0, is_written);
+                ++binding_index;
+            } else {
+                runtime.BindStorageBuffer(buffer, 0, 0, is_written);
+            }
+            return;
+        }
         TouchBuffer(buffer, binding.buffer_id);
         const u32 size = binding.size;
         SynchronizeBuffer(buffer, binding.device_addr, size);
@@ -2786,6 +2827,19 @@ void BufferCache<P>::BindHostGraphicsTextureBuffers(size_t stage) {
     ForEachEnabledBit(channel_state->enabled_texture_buffers[stage], [&](u32 index) {
         const TextureBufferBinding& binding = channel_state->texture_buffers[stage][index];
         Buffer& buffer = slot_buffers[binding.buffer_id];
+        if (binding.buffer_id == NULL_BUFFER_ID) {
+            // Out of memory: a null texel buffer with no range; the draw is skipped.
+            if constexpr (SEPARATE_IMAGE_BUFFERS_BINDINGS) {
+                if (((channel_state->image_texture_buffers[stage] >> index) & 1) != 0) {
+                    runtime.BindImageBuffer(buffer, 0, 0, binding.format);
+                } else {
+                    runtime.BindTextureBuffer(buffer, 0, 0, binding.format);
+                }
+            } else {
+                runtime.BindTextureBuffer(buffer, 0, 0, binding.format);
+            }
+            return;
+        }
         const u32 size = binding.size;
         SynchronizeBuffer(buffer, binding.device_addr, size);
 
@@ -2916,6 +2970,16 @@ void BufferCache<P>::BindHostComputeStorageBuffers() {
             return;
         }
         Buffer& buffer = slot_buffers[binding.buffer_id];
+        if (binding.buffer_id == NULL_BUFFER_ID) {
+            // Out of memory: bind the null descriptor with a zero range; the dispatch is skipped.
+            if constexpr (NEEDS_BIND_STORAGE_INDEX) {
+                runtime.BindComputeStorageBuffer(binding_index, buffer, 0, 0, is_written);
+                ++binding_index;
+            } else {
+                runtime.BindStorageBuffer(buffer, 0, 0, is_written);
+            }
+            return;
+        }
         TouchBuffer(buffer, binding.buffer_id);
         const u32 size = binding.size;
         SynchronizeBuffer(buffer, binding.device_addr, size);
@@ -2943,6 +3007,19 @@ void BufferCache<P>::BindHostComputeTextureBuffers() {
     ForEachEnabledBit(channel_state->enabled_compute_texture_buffers, [&](u32 index) {
         const TextureBufferBinding& binding = channel_state->compute_texture_buffers[index];
         Buffer& buffer = slot_buffers[binding.buffer_id];
+        if (binding.buffer_id == NULL_BUFFER_ID) {
+            // Out of memory: a null texel buffer with no range; the dispatch is skipped.
+            if constexpr (SEPARATE_IMAGE_BUFFERS_BINDINGS) {
+                if (((channel_state->image_compute_texture_buffers >> index) & 1) != 0) {
+                    runtime.BindImageBuffer(buffer, 0, 0, binding.format);
+                } else {
+                    runtime.BindTextureBuffer(buffer, 0, 0, binding.format);
+                }
+            } else {
+                runtime.BindTextureBuffer(buffer, 0, 0, binding.format);
+            }
+            return;
+        }
         const u32 size = binding.size;
         SynchronizeBuffer(buffer, binding.device_addr, size);
 
@@ -3019,11 +3096,21 @@ void BufferCache<P>::UpdateIndexBuffer() {
         u32 buffer_size = Common::AlignUp(inline_index_size, CACHING_PAGESIZE);
         if (inline_buffer_id == NULL_BUFFER_ID) [[unlikely]] {
             inline_buffer_id = CreateBuffer(0, buffer_size, false);
+            if (inline_buffer_id == NULL_BUFFER_ID) {
+                channel_state->index_buffer = NULL_BINDING;
+                flags[Dirty::IndexBuffer] = true;
+                return;
+            }
         }
         if (slot_buffers[inline_buffer_id].SizeBytes() < buffer_size) [[unlikely]] {
             ++buffer_deletions;
             slot_buffers.erase(inline_buffer_id);
             inline_buffer_id = CreateBuffer(0, buffer_size, false);
+            if (inline_buffer_id == NULL_BUFFER_ID) {
+                channel_state->index_buffer = NULL_BINDING;
+                flags[Dirty::IndexBuffer] = true;
+                return;
+            }
         }
         channel_state->index_buffer = Binding{
             .device_addr = 0,
@@ -3063,10 +3150,18 @@ void BufferCache<P>::UpdateIndexBuffer() {
         channel_state->index_buffer = NULL_BINDING;
         return;
     }
+    const BufferId buffer_id = FindBuffer(*device_addr, size, false);
+    if (!buffer_id) {
+        // Out of device memory: bind nothing for this draw, which the pipeline skips, and ask
+        // for the buffer again on the next one.
+        channel_state->index_buffer = NULL_BINDING;
+        flags[Dirty::IndexBuffer] = true;
+        return;
+    }
     channel_state->index_buffer = Binding{
         .device_addr = *device_addr,
         .size = size,
-        .buffer_id = FindBuffer(*device_addr, size, false),
+        .buffer_id = buffer_id,
     };
 }
 
@@ -3109,6 +3204,15 @@ void BufferCache<P>::UpdateVertexBuffer(u32 index) {
         size = static_cast<u32>(gpu_memory->MaxContinuousRange(gpu_addr_begin, size));
     }
     const BufferId buffer_id = FindBuffer(*device_addr, size, false);
+    if (!buffer_id) {
+        // Out of device memory: bind nothing for this draw (the pipeline skips it) and resolve
+        // this stream again on the next one.
+        channel_state->vertex_buffers[index] = NULL_BINDING;
+        UpdateVertexBufferSlot(index, NULL_BINDING);
+        maxwell3d->dirty.flags[Dirty::VertexBuffers] = true;
+        maxwell3d->dirty.flags[Dirty::VertexBuffer0 + index] = true;
+        return;
+    }
     const Binding binding{
         .device_addr = *device_addr,
         .size = size,
@@ -3559,8 +3663,23 @@ typename BufferCache<P>::OverlapResult BufferCache<P>::ResolveOverlaps(DAddr dev
                                                                        u32 wanted_size) {
     static constexpr int STREAM_LEAP_THRESHOLD = 16;
     boost::container::small_vector<BufferId, 16> overlap_ids;
+    boost::container::small_vector<BufferId, 2> cut_ids;
     DAddr begin = device_addr;
     DAddr end = device_addr + wanted_size;
+    const DAddr wanted_begin = begin;
+    const DAddr wanted_end = end;
+    // A buffer this large that shares no more than a page with the wanted range is not joined.
+    // Yoshi and the Mysterious Book reads 4 MiB texel buffers from blocks laid end to end in its
+    // heap, a few new ones a second at rising addresses: each shared a page with the buffer
+    // before it, so one buffer took them all over and was copied whole for every block, past
+    // 2 GiB (and past what a u32 size holds). Such a buffer is deleted instead, after what the
+    // GPU wrote of it is downloaded, as when the collector evicts one; what the game still reads
+    // of it is uploaded again from its memory.
+    // A buffer made this frame is always joined. The callers resolve their ranges again after a
+    // buffer is deleted, and two large ranges of one draw or copy that share a page would
+    // otherwise delete each other's buffer in turn without end. This way a frame cuts only buffers
+    // older than itself, and once those are gone it joins as before.
+    static constexpr u64 CHAIN_LIMIT = 128_MiB;
     int stream_score = 0;
     bool has_stream_leap = false;
     auto expand_begin = [&](DAddr add_value) {
@@ -3584,6 +3703,7 @@ typename BufferCache<P>::OverlapResult BufferCache<P>::ResolveOverlaps(DAddr dev
     if (begin == 0) {
         return OverlapResult{
             .ids = std::move(overlap_ids),
+            .cut = std::move(cut_ids),
             .begin = begin,
             .end = end,
             .has_stream_leap = has_stream_leap,
@@ -3599,9 +3719,20 @@ typename BufferCache<P>::OverlapResult BufferCache<P>::ResolveOverlaps(DAddr dev
         if (overlap.IsPicked()) {
             continue;
         }
+        const DAddr overlap_device_addr = overlap.CpuAddr();
+        if (overlap.SizeBytes() >= CHAIN_LIMIT &&
+            std::ranges::find(frame_created_buffers, overlap_id) == frame_created_buffers.end()) {
+            const DAddr shared_begin = (std::max)(overlap_device_addr, wanted_begin);
+            const DAddr shared_end =
+                (std::min)(overlap_device_addr + overlap.SizeBytes(), wanted_end);
+            if (shared_end <= shared_begin + CACHING_PAGESIZE) {
+                overlap.Pick();
+                cut_ids.push_back(overlap_id);
+                continue;
+            }
+        }
         overlap_ids.push_back(overlap_id);
         overlap.Pick();
-        const DAddr overlap_device_addr = overlap.CpuAddr();
         const bool expands_left = overlap_device_addr < begin;
         if (expands_left) {
             begin = overlap_device_addr;
@@ -3626,6 +3757,7 @@ typename BufferCache<P>::OverlapResult BufferCache<P>::ResolveOverlaps(DAddr dev
     }
     return OverlapResult{
         .ids = std::move(overlap_ids),
+        .cut = std::move(cut_ids),
         .begin = begin,
         .end = end,
         .has_stream_leap = has_stream_leap,
@@ -3660,23 +3792,143 @@ template <class P>
 BufferId BufferCache<P>::CreateBuffer(DAddr device_addr, u32 wanted_size,
                                       bool sparse_compatible) {
     const StutterTrace::SiteScope site{StutterTrace::Site::BufferCreate};
+    const DAddr asked_addr = device_addr;
+    const u32 asked_size = wanted_size;
     DAddr device_addr_end = Common::AlignUp(device_addr + wanted_size, CACHING_PAGESIZE);
     device_addr = Common::AlignDown(device_addr, CACHING_PAGESIZE);
     wanted_size = static_cast<u32>(device_addr_end - device_addr);
-    const OverlapResult overlap = ResolveOverlaps(device_addr, wanted_size);
-    const u32 size = static_cast<u32>(overlap.end - overlap.begin);
-    const BufferId new_buffer_id =
-        slot_buffers.insert(runtime, overlap.begin, size, sparse_compatible);
-    auto& new_buffer = slot_buffers[new_buffer_id];
-    const size_t size_bytes = new_buffer.SizeBytes();
-    runtime.ClearBuffer(new_buffer, 0, size_bytes, 0);
-    new_buffer.MarkUsage(0, size_bytes);
-    for (const BufferId overlap_id : overlap.ids) {
-        JoinOverlap(new_buffer_id, overlap_id, !overlap.has_stream_leap);
+    OverlapResult overlap = ResolveOverlaps(device_addr, wanted_size);
+    bool created = false;
+    // Whatever way this function leaves without a buffer must clear the picked state
+    // ResolveOverlaps set: only the join (or the delete of a cut buffer) clears it otherwise,
+    // and a picked buffer is skipped by every later resolve.
+    SCOPE_EXIT {
+        if (!created) {
+            UnpickOverlaps(overlap);
+        }
+    };
+    for (int attempt = 0;; ++attempt) {
+        // Large buffers that only touch the range are replaced instead of joined. This runs
+        // again after a failed attempt re-resolved the overlaps.
+        for (const BufferId cut_id : overlap.cut) {
+            if (!slot_buffers.contains(cut_id)) {
+                continue;
+            }
+            DownloadBufferMemory(slot_buffers[cut_id]);
+            DeleteBuffer(cut_id);
+        }
+        const u32 size = static_cast<u32>(overlap.end - overlap.begin);
+        BufferId new_buffer_id{};
+        bool inserted = true;
+        if constexpr (requires { runtime.TryInsertBuffer([&] {}); }) {
+            inserted = runtime.TryInsertBuffer([&] {
+                new_buffer_id = slot_buffers.insert(runtime, overlap.begin, size, sparse_compatible);
+            });
+        } else {
+            // Renderer test mocks have no allocation failure to report.
+            new_buffer_id =
+                slot_buffers.insert(runtime, overlap.begin, size, sparse_compatible);
+        }
+        if (inserted) {
+            created = true;
+            frame_created_buffers.push_back(new_buffer_id);
+            auto& new_buffer = slot_buffers[new_buffer_id];
+            const size_t size_bytes = new_buffer.SizeBytes();
+            runtime.ClearBuffer(new_buffer, 0, size_bytes, 0);
+            new_buffer.MarkUsage(0, size_bytes);
+            for (const BufferId overlap_id : overlap.ids) {
+                if (slot_buffers.contains(overlap_id)) {
+                    JoinOverlap(new_buffer_id, overlap_id, !overlap.has_stream_leap);
+                }
+            }
+            Register(new_buffer_id);
+            TouchBuffer(new_buffer, new_buffer_id);
+            return new_buffer_id;
+        }
+        // The device is out of memory and the buffer object was not made. Free what the cache
+        // and the deferred destruction ring still hold, then try once more.
+        UnpickOverlaps(overlap);
+        if (attempt != 0 || !RecoverAllocationFailure(size)) {
+            ++buffer_allocation_failures;
+            allocation_failed = true;
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+                u64 joined_bytes = 0;
+                for (const BufferId id : overlap.ids) {
+                    if (slot_buffers.contains(id)) {
+                        joined_bytes += slot_buffers[id].SizeBytes();
+                    }
+                }
+                std::fprintf(stderr,
+                             "EDEN_BUFFER_OOM size=%lluMiB asked=%#llx+%#x begin=%#llx "
+                             "joins=%zu/%lluMiB cut=%zu cache=%lluMiB\n",
+                             static_cast<unsigned long long>(size >> 20),
+                             static_cast<unsigned long long>(asked_addr), asked_size,
+                             static_cast<unsigned long long>(overlap.begin),
+                             overlap.ids.size(),
+                             static_cast<unsigned long long>(joined_bytes >> 20),
+                             overlap.cut.size(),
+                             static_cast<unsigned long long>(buffer_bytes >> 20));
+            }
+            return NULL_BUFFER_ID;
+        }
+        overlap = ResolveOverlaps(device_addr, wanted_size);
     }
-    Register(new_buffer_id);
-    TouchBuffer(new_buffer, new_buffer_id);
-    return new_buffer_id;
+}
+
+template <class P>
+void BufferCache<P>::UnpickOverlaps(const OverlapResult& overlap) noexcept {
+    for (const BufferId id : overlap.ids) {
+        if (slot_buffers.contains(id)) {
+            slot_buffers[id].Unpick();
+        }
+    }
+    for (const BufferId id : overlap.cut) {
+        if (slot_buffers.contains(id)) {
+            slot_buffers[id].Unpick();
+        }
+    }
+}
+
+template <class P>
+bool BufferCache<P>::RecoverAllocationFailure(u64 size) {
+    if constexpr (!requires { runtime.TryRecover([&] {}); }) {
+        // Renderer test mocks have no GPU to wait for and no allocation failure to recover.
+        return false;
+    } else {
+        // Only the thread that owns the scheduler may wait for the GPU. A CPU thread that
+        // reaches this gives up at once; the next draw tries again.
+        if (!GpuSplit::OwnsScheduler()) {
+            return false;
+        }
+        // One wait and collection per frame: a frame with many refused draws must not stop the
+        // GPU thread after every one of them.
+        if (frame_tick == last_allocation_recovery_frame) {
+            return false;
+        }
+        last_allocation_recovery_frame = frame_tick;
+        // Everything recorded so far may still read the buffers the collector will evict: submit
+        // and wait first, so the ring can be dropped instead of holding them for its few ticks.
+        // A staging allocation inside the collection can itself run out of memory; the runtime
+        // wrapper turns that into "no recovery" instead of another exception.
+        const u64 before = buffer_bytes;
+        const bool recovered = runtime.TryRecover([&] {
+            runtime.Finish();
+            RunGarbageCollector(true);
+            // The collector downloaded what the GPU wrote of the evicted buffers; let those
+            // copies land before their buffers are destroyed.
+            runtime.Finish();
+            delayed_destruction_ring.Clear();
+        });
+        if (!recovered) {
+            return false;
+        }
+        const u64 evicted = before > buffer_bytes ? before - buffer_bytes : 0;
+        LOG_WARNING(HW_GPU,
+                    "A {} MiB buffer could not be made: evicted {} MiB of buffers and retrying",
+                    size >> 20, evicted >> 20);
+        return true;
+    }
 }
 
 template <class P>
@@ -3922,6 +4174,11 @@ void BufferCache<P>::InlineMemoryImplementation(DAddr dest_address, size_t copy_
     MarkVertexBuffersStale(dest_address, copy_size);
 
     BufferId buffer_id = FindBuffer(dest_address, static_cast<u32>(copy_size), false);
+    if (!buffer_id) {
+        // Out of device memory: the guest sees the CPU's write through guest memory; the GPU
+        // copy of it is dropped this time rather than recorded into a missing buffer.
+        return;
+    }
     auto& buffer = slot_buffers[buffer_id];
     SynchronizeBuffer(buffer, dest_address, static_cast<u32>(copy_size));
 
@@ -4416,12 +4673,18 @@ bool BufferCache<P>::HasFastUniformBufferBound(size_t stage, u32 binding_index) 
 
 template <class P>
 std::pair<typename BufferCache<P>::Buffer*, u32> BufferCache<P>::GetDrawIndirectCount() {
+    if (!channel_state->count_buffer_binding.buffer_id) {
+        return std::make_pair(&slot_buffers[NULL_BUFFER_ID], 0);
+    }
     auto& buffer = slot_buffers[channel_state->count_buffer_binding.buffer_id];
     return std::make_pair(&buffer, buffer.Offset(channel_state->count_buffer_binding.device_addr));
 }
 
 template <class P>
 std::pair<typename BufferCache<P>::Buffer*, u32> BufferCache<P>::GetDrawIndirectBuffer() {
+    if (!channel_state->indirect_buffer_binding.buffer_id) {
+        return std::make_pair(&slot_buffers[NULL_BUFFER_ID], 0);
+    }
     auto& buffer = slot_buffers[channel_state->indirect_buffer_binding.buffer_id];
     return std::make_pair(&buffer,
                           buffer.Offset(channel_state->indirect_buffer_binding.device_addr));

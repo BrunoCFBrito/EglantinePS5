@@ -233,6 +233,8 @@ class BufferCache : public VideoCommon::ChannelSetupCaches<BufferCacheChannelInf
 
     struct OverlapResult {
         boost::container::small_vector<BufferId, 16> ids;
+        /// Large buffers that only touch the range: deleted, not joined.
+        boost::container::small_vector<BufferId, 2> cut;
         DAddr begin;
         DAddr end;
         bool has_stream_leap = false;
@@ -347,6 +349,13 @@ public:
     void UpdateGraphicsBuffers(bool is_indexed);
 
     void UpdateComputeBuffers();
+
+    /// Whether a buffer could not be created for want of device memory since the last
+    /// UpdateGraphicsBuffers/UpdateComputeBuffers. The pipeline then skips the draw or dispatch
+    /// instead of recording it with missing bindings.
+    [[nodiscard]] bool AllocationFailed() const noexcept {
+        return allocation_failed;
+    }
 
     void BindHostGeometryBuffers(bool is_indexed);
 
@@ -645,6 +654,13 @@ private:
 
     [[nodiscard]] BufferId CreateBuffer(DAddr device_addr, u32 wanted_size,
                                         bool sparse_compatible);
+
+    /// Clears the picked state ResolveOverlaps set when CreateBuffer cannot make its buffer.
+    void UnpickOverlaps(const OverlapResult& overlap) noexcept;
+
+    /// Waits for the GPU and evicts buffers after a buffer allocation failed. Returns true when a
+    /// retry is worth it.
+    bool RecoverAllocationFailure(u64 size);
 
     void Register(BufferId buffer_id);
 
@@ -1084,6 +1100,14 @@ private:
     std::vector<MultiRangeSegment> graphics_segments;
     std::vector<MultiRangeSegment> compute_segments;
     u64 frame_tick = 0;
+    /// Buffers created since the last TickFrame; ResolveOverlaps does not cut these.
+    std::vector<BufferId> frame_created_buffers;
+    /// Set when a buffer could not be created for want of device memory; cleared by the next
+    /// UpdateGraphicsBuffers/UpdateComputeBuffers.
+    bool allocation_failed{};
+    /// The frame of the last eviction after an allocation failure: one GPU wait per frame at most.
+    u64 last_allocation_recovery_frame{~u64{0}};
+    u32 buffer_allocation_failures{};
     /// EDEN_NX2_TABLE_POINTER_TRACE: last table entry and size bound per table pointer slot.
     std::unordered_map<u64, std::pair<GPUVAddr, u32>> traced_table_pointers;
     u64 total_used_memory = 0;

@@ -114,6 +114,40 @@ public:
 
     void TickFrame(Common::SlotVector<Buffer>& slot_buffers) noexcept;
 
+    /// Runs `insert`, turning a device or host out-of-memory failure into false; any other Vulkan
+    /// error still throws. BufferCache::CreateBuffer uses this to skip a draw instead of letting
+    /// the exception leave the GPU thread, which ends the process.
+    template <typename F>
+    [[nodiscard]] bool TryInsertBuffer(F&& insert) {
+        try {
+            insert();
+            return true;
+        } catch (const vk::Exception& error) {
+            if (error.GetResult() != VK_ERROR_OUT_OF_DEVICE_MEMORY &&
+                error.GetResult() != VK_ERROR_OUT_OF_HOST_MEMORY) {
+                throw;
+            }
+            return false;
+        }
+    }
+
+    /// Runs `recover`, turning an out-of-memory failure into false; any other Vulkan error still
+    /// throws. BufferCache::RecoverAllocationFailure uses it to free buffers and wait for the GPU
+    /// without letting a staging allocation inside the collection end the process.
+    template <typename F>
+    [[nodiscard]] bool TryRecover(F&& recover) {
+        try {
+            recover();
+            return true;
+        } catch (const vk::Exception& error) {
+            if (error.GetResult() != VK_ERROR_OUT_OF_DEVICE_MEMORY &&
+                error.GetResult() != VK_ERROR_OUT_OF_HOST_MEMORY) {
+                throw;
+            }
+            return false;
+        }
+    }
+
     /// Returns the mask of bindings whose repacked state changed.
     u32 SetVertexRepackLayout(const Tegra::Engines::Maxwell3D::Regs& regs, bool dynamic_input);
 

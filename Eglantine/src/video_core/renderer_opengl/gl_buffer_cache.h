@@ -96,6 +96,19 @@ public:
 
     void TickFrame(Common::SlotVector<Buffer>&) noexcept {}
 
+    /// OpenGL buffer creation does not fail with device memory errors; same interface as Vulkan.
+    template <typename F>
+    [[nodiscard]] bool TryInsertBuffer(F&& insert) {
+        insert();
+        return true;
+    }
+
+    template <typename F>
+    [[nodiscard]] bool TryRecover(F&& recover) {
+        recover();
+        return true;
+    }
+
     void ClearBuffer(Buffer& dest_buffer, u32 offset, size_t size, u32 value);
 
     void BindIndexBuffer(Buffer& buffer, u32 offset, u32 size);

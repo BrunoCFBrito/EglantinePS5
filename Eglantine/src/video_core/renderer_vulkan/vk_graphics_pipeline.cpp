@@ -1024,6 +1024,11 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     {
         Profile::Scope scope{Profile::Zone::UpdateBuffers};
         buffer_cache.UpdateGraphicsBuffers(is_indexed);
+        if (buffer_cache.AllocationFailed()) {
+            // A binding above could not get a buffer: skipping the draw keeps its recorded
+            // state out of the command buffer, and the next draw resolves the binding again.
+            return false;
+        }
         buffer_cache.BindHostGeometryBuffers(is_indexed);
     }
 
@@ -1146,6 +1151,11 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
     {
         Profile::Scope scope{Profile::Zone::UpdateBuffers};
         buffer_cache.UpdateGraphicsBuffers(is_indexed);
+        if (buffer_cache.AllocationFailed()) {
+            // A binding above could not get a buffer: skipping the draw keeps its recorded
+            // state out of the command buffer, and the next draw resolves the binding again.
+            return false;
+        }
         buffer_cache.BindHostGeometryBuffers(is_indexed);
     }
     {

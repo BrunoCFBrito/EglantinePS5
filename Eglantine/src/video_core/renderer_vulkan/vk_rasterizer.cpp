@@ -883,6 +883,23 @@ bool RasterizerVulkan::TryNx2IndirectReset(bool is_indexed, u32 instance_count) 
 }
 
 namespace {
+// Runs a pipeline Configure, treating a Vulkan out-of-memory failure as "do not record this
+// draw". Anything else still propagates: the GPU thread lasts no longer than before on those.
+bool ConfigureIgnoringOom(auto&& configure) {
+    try {
+        return configure();
+    } catch (const vk::Exception& error) {
+        if (error.GetResult() != VK_ERROR_OUT_OF_DEVICE_MEMORY &&
+            error.GetResult() != VK_ERROR_OUT_OF_HOST_MEMORY) {
+            throw;
+        }
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+            LOG_WARNING(Render_Vulkan, "Draw skipped: out of device memory while configuring it");
+        }
+        return false;
+    }
+}
 // GPU thread only: the pipeline PrepareDraw refreshed for the draw in progress.
 GraphicsPipeline* prepared_pipeline = nullptr;
 // The pipeline of the last prepared draw, for the development fault probe.
@@ -1200,7 +1217,8 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     const DrawPath path = delta_holds && !verify_pipeline ? DrawPath::Delta : DrawPath::Full;
     buffer_cache.BeginGraphicsUniforms(path == DrawPath::Delta ? &taken_delta : nullptr);
     if (path == DrawPath::Delta) {
-        if (Profile::Scope scope{Profile::Zone::Configure}; !pipeline->ConfigureDelta(is_indexed)) {
+        if (Profile::Scope scope{Profile::Zone::Configure};
+            !ConfigureIgnoringOom([&] { return pipeline->ConfigureDelta(is_indexed); })) {
             report_failure("configure failed");
             TraceRenderState(is_indexed, "configure-failed", nullptr);
             return;
@@ -1213,7 +1231,8 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         if (fast_draw_on) {
             pipeline->CaptureNextDelta(verify_views);
         }
-        if (Profile::Scope scope{Profile::Zone::Configure}; !pipeline->Configure(is_indexed)) {
+        if (Profile::Scope scope{Profile::Zone::Configure};
+            !ConfigureIgnoringOom([&] { return pipeline->Configure(is_indexed); })) {
             report_failure("configure failed");
             TraceRenderState(is_indexed, "configure-failed", nullptr);
             return;
@@ -2377,9 +2396,28 @@ void RasterizerVulkan::DispatchCompute() {
     const bool marking_effects = oot_effects_frame == render_trace_frame && OcarinaTemporalEnabled() &&
                                  !indirect_address && !frame_dump.Capturing();
     ComputePipeline::BindCommand deferred_bind;
-    if (!pipeline->Configure(*kepler_compute, *gpu_memory, scheduler, buffer_cache,
-                             texture_cache, texture_cache_runtime, byte_addressed_shadow,
-                             can_replace || marking_effects ? &deferred_bind : nullptr)) {
+    bool configured{};
+    bool out_of_memory{};
+    try {
+        configured = pipeline->Configure(*kepler_compute, *gpu_memory, scheduler, buffer_cache,
+                                         texture_cache, texture_cache_runtime, byte_addressed_shadow,
+                                         can_replace || marking_effects ? &deferred_bind : nullptr);
+    } catch (const vk::Exception& error) {
+        if (error.GetResult() != VK_ERROR_OUT_OF_DEVICE_MEMORY &&
+            error.GetResult() != VK_ERROR_OUT_OF_HOST_MEMORY) {
+            throw;
+        }
+        out_of_memory = true;
+    }
+    if (!configured) {
+        if (out_of_memory || buffer_cache.AllocationFailed()) {
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                LOG_WARNING(Render_Vulkan,
+                            "Compute dispatch skipped: out of device memory while configuring it");
+            }
+            return;
+        }
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute resources unavailable");
         return;
     }
