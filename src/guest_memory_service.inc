@@ -1651,13 +1651,60 @@ void PackPass(SparseRange& range, std::size_t slots, std::vector<std::size_t>& c
     }
 }
 
+// ---- The scanner looks where something changed (2026-11-15) ----
+// AllZero reads half an Own slot and ScanFine all of it (~3 MiB together): at 5 GiB held that is
+// ~8 GiB of reads every pass, a second of a core and ~2 GB/s of memory bandwidth while the pool
+// is short and a game loads a new area. A slot whose sampled hash did not change, and whose bytes
+// the guest's kernel did not free part of, cannot have become all-zero or gained zero pages since
+// the last look, which is all those two checks ask; a full content pass every FullScanPasses
+// covers the rare write of zeroes that the sample misses. A skipped slot only delays a return,
+// never a wrong state: ScanZero and ScanFine re-read the slot under its lock.
+constexpr std::size_t FullScanPasses = 12; // a full content pass every 12 scans (24 s while the pool is short)
+std::vector<std::uint64_t> scan_hash; // per slot: the sampled hash the scanner last looked at (scanner only)
+// Per slot: the kernel freed part of it since the last look (set by a guest thread, cleared by the
+// scanner). The table is made once, before the scanner's first pass; a guest thread that runs
+// earlier finds it null and is simply caught by the hash.
+std::atomic<std::atomic<std::uint8_t>*> scan_dirty{nullptr};
+std::atomic<std::size_t> scan_dirty_slots{0};
+std::atomic<std::uint64_t> scan_skips{0}, scan_full_passes{0};
+
 void ScanPass(SparseRange& range) noexcept {
     const auto start = std::chrono::steady_clock::now();
     const std::size_t slots = (range.end - range.begin.load(std::memory_order_relaxed)) / SparseSlot;
+    if (scan_hash.size() != slots) {
+        scan_hash.assign(slots, 0);
+        delete[] scan_dirty.load(std::memory_order_relaxed);
+        auto* const marks = new (std::nothrow) std::atomic<std::uint8_t>[slots]();
+        scan_dirty_slots.store(marks != nullptr ? slots : 0, std::memory_order_relaxed);
+        scan_dirty.store(marks, std::memory_order_release);
+        // Without the per-slot marks, look at every slot (the old way).
+        if (marks == nullptr) scan_hash.clear();
+    }
+    auto* const dirty_marks = scan_dirty.load(std::memory_order_acquire);
+    const std::uint64_t pass = counters.passes.load(std::memory_order_relaxed);
+    // Duplicate sharing compares every slot's sample, so it keeps the full pass (it is off by
+    // default; on the console it cost FPS and found few pairs).
+    const bool full = scan_hash.empty() || dedup_requested.load(std::memory_order_relaxed) ||
+                      pass % FullScanPasses == 0;
+    if (full) scan_full_passes.fetch_add(1, std::memory_order_relaxed);
     std::vector<std::pair<std::uint64_t, std::size_t>> samples;
     for (std::size_t slot = 0; slot < slots; ++slot) {
-        if (SlotState(range, slot) != SlotOwn) continue;
+        if (SlotState(range, slot) != SlotOwn) {
+            if (!scan_hash.empty()) scan_hash[slot] = 0;
+            if (dirty_marks != nullptr) dirty_marks[slot].store(0, std::memory_order_relaxed);
+            continue;
+        }
         const std::uintptr_t at = SlotAddress(range, slot);
+        const bool dirty = dirty_marks != nullptr && dirty_marks[slot].exchange(0, std::memory_order_relaxed) != 0;
+        const std::uint64_t hash = ColdHash(at);
+        // A pass-based Fine back-off that has come due needs its try even when nothing changed.
+        const std::uint32_t fine_after = range.fine_after[slot];
+        const bool fine_due = fine_after != 0 && pass >= fine_after;
+        if (!full && !dirty && !fine_due && !scan_hash.empty() && hash == scan_hash[slot]) {
+            scan_skips.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        if (!scan_hash.empty()) scan_hash[slot] = hash;
         if (AllZero(at)) { // a read without the lock: only a hint, checked again fenced
             if (ScanZero(range, slot)) counters.returns_scan.fetch_add(1, std::memory_order_relaxed);
         } else if (fine_requested.load(std::memory_order_relaxed) && ScanFine(range, slot)) {
@@ -1709,7 +1756,8 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
         "EDEN_CRAM %s held=%zuMiB own=%zu shared=%zu zero=%zu faults=%llu promotions=%llu copies=%llu waits=%llu "
         "returns_clear=%llu returns_free=%llu returns_scan=%llu dedup=%llu reserve_used=%llu failures=%llu "
         "passes=%llu scan_ms=%llu fine=%zu fine_held=%zuMiB fined=%llu unfined=%llu fine_failures=%llu "
-        "reserve=%zuMiB host_transferred=%lluMiB freed_parts=%llu freed_parts_cleared=%lluMiB\n",
+        "reserve=%zuMiB host_transferred=%lluMiB freed_parts=%llu freed_parts_cleared=%lluMiB "
+        "scan_skipped=%llu full_scans=%llu\n",
         when, guest_committed.load(std::memory_order_relaxed) >> 20, own, shared, slots - own - shared - fine,
         (unsigned long long)counters.faults.load(), (unsigned long long)counters.promotions.load(),
         (unsigned long long)counters.copies.load(), (unsigned long long)counters.waits.load(),
@@ -1721,7 +1769,8 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
         (unsigned long long)counters.unfined.load(), (unsigned long long)counters.fine_failures.load(),
         reserve_count.load(std::memory_order_relaxed) * (SparseSlot >> 20),
         (unsigned long long)counters.host_reserve_used.load() * (SparseSlot >> 20),
-        (unsigned long long)freed_part_calls.load(), (unsigned long long)(freed_part_bytes.load() >> 20));
+        (unsigned long long)freed_part_calls.load(), (unsigned long long)(freed_part_bytes.load() >> 20),
+        (unsigned long long)scan_skips.load(), (unsigned long long)scan_full_passes.load());
     if (length > 0) Report(line);
     // Who wrote the slots that were promoted: the largest places (offsets in the app's image).
     struct Top { const WriterSite* site; std::uint64_t count; } top[10]{};
@@ -1806,9 +1855,11 @@ void ScannerLoop(SparseRange* range) {
     auto next_report = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     std::unique_lock lock{scanner_mutex};
     while (!scanner_stop) {
-        // Every 20 s; every 5 s while packing has a short pool to answer (the game grows ~10 MiB/s).
+        // Every 20 s; every 2 s while packing has a short pool to answer (the game grows ~10 MiB/s).
+        // A short-pool pass now reads only the slots that changed or were freed, so the cadence can
+        // be short enough to give a freed slot back within one pass instead of for a whole frame burst.
         const bool hurry = PackEnabled() && !pack_refused.load(std::memory_order_relaxed) && PoolShortForPacking();
-        scanner_wake.wait_for(lock, std::chrono::seconds(hurry ? 5 : 20), [] { return scanner_stop; });
+        scanner_wake.wait_for(lock, std::chrono::seconds(hurry ? 2 : 20), [] { return scanner_stop; });
         if (scanner_stop) break;
         lock.unlock();
         if (scan_requested.load(std::memory_order_relaxed)) ScanPass(*range);
@@ -2275,6 +2326,11 @@ void GuestMemoryFreedPart(std::uint64_t offset, std::size_t bytes) noexcept {
             std::memset(reinterpret_cast<void*>(SlotAddress(*range, slot) + at % SparseSlot), 0,
                         static_cast<std::size_t>(slot_end - at));
             freed_part_bytes.fetch_add(slot_end - at, std::memory_order_relaxed);
+            // The scanner looks at this slot next pass even if the sampled hash did not move: an
+            // 11 KiB free (the usual size) usually misses every sampled word.
+            if (auto* const marks = scan_dirty.load(std::memory_order_acquire);
+                marks != nullptr && slot < scan_dirty_slots.load(std::memory_order_relaxed))
+                marks[slot].store(1, std::memory_order_relaxed);
         }
         UnlockSlot(*range, slot, state);
         at = slot_end;
