@@ -1261,6 +1261,18 @@ std::shared_ptr<ShaderPools> PipelineCache::TakeSparePools() {
 }
 
 void PipelineCache::ReturnPools(std::shared_ptr<ShaderPools> pools) {
+    if (::Eden::Performance::GraphicsMemoryIsShort()) {
+        // The pool is short: do not keep translation memory for the next build. ReleaseContents()
+        // squashes the pool into one contiguous chunk as large as the build grew, and spare_pools
+        // keeps up to four of them; at the 2026-11-15 Ocarina of Time crash six such chunks
+        // (13-18 MiB each) were live while the largest free block of the pool was 1 MiB.
+        // Dropping the returned pool and the spares returns their chunks to the emulator heap;
+        // the next build allocates them again, which is cheaper than losing the session. The
+        // probe is the one the staging buffer pool uses, refreshed at most every 100 ms.
+        std::scoped_lock lock{spare_pools_mutex};
+        spare_pools.clear();
+        return;
+    }
     pools->ReleaseContents();
     std::scoped_lock lock{spare_pools_mutex};
     if (spare_pools.size() < 4) {
