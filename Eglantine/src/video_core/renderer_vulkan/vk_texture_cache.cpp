@@ -2984,8 +2984,26 @@ void TextureCacheRuntime::ReleaseMsaaScratchImage(VkImage image) {
 }
 
 // Finished decode images are kept for the next texture of a fitting shape up to this many
-// bytes.
-constexpr u64 MaxFreeTranscodeBytes = u64{256} << 20;
+// bytes. 256 MiB of them sat in the RADV pool outside the texture cache's own accounting
+// (EDEN_MEM_SPLIT not_textures): the console's live image set already runs at its own marks,
+// so what the reuse list buys is worth at most 64 MiB of it. The in-flight decodes have their
+// own bound (EDEN_PS5_TRANSCODE_PENDING_MIB, 64 MiB); EDEN_PS5_TRANSCODE_FREE_MIB overrides
+// this list, and 0 keeps no finished decode image at all.
+u64 TranscodeFreeCapBytes() {
+    static const u64 value = [] {
+        const char* const text = std::getenv("EDEN_PS5_TRANSCODE_FREE_MIB");
+        if (text == nullptr || text[0] == '\0') {
+            return u64{64} << 20;
+        }
+        char* end = nullptr;
+        const unsigned long long mib = std::strtoull(text, &end, 10);
+        if (end == text || *end != '\0') {
+            return u64{64} << 20;
+        }
+        return u64{mib} << 20;
+    }();
+    return value;
+}
 
 void TextureCacheRuntime::TickFrame() {
     while (!pending_byte_addressed_shadows.empty() &&
@@ -2994,7 +3012,7 @@ void TextureCacheRuntime::TickFrame() {
     }
     static constexpr u32 MAX_UNUSED_SCRATCH_FRAMES = 60;
     // Finished decode images wait for the next texture of a fitting shape, up to the file's
-    // MaxFreeTranscodeBytes.
+    // TranscodeFreeCapBytes().
     const auto decode_bytes = [](const PendingTranscode& t) {
         u64 bytes{};
         for (u32 level = 0; level < t.levels; ++level) {
@@ -3009,7 +3027,7 @@ void TextureCacheRuntime::TickFrame() {
     while (!pending_transcodes.empty() && scheduler.IsFree(pending_transcodes.front().tick)) {
         PendingTranscode& done = pending_transcodes.front();
         const u64 bytes = decode_bytes(done);
-        if (free_bytes + bytes <= MaxFreeTranscodeBytes) {
+        if (free_bytes + bytes <= TranscodeFreeCapBytes()) {
             done.unused_frames = 0;
             free_bytes += bytes;
             free_transcodes.push_back(std::move(done));
@@ -3019,6 +3037,11 @@ void TextureCacheRuntime::TickFrame() {
     std::erase_if(free_transcodes, [](PendingTranscode& t) {
         return ++t.unused_frames > MAX_UNUSED_SCRATCH_FRAMES;
     });
+    // While the console's pool is short, finished decode images are not kept for the next texture
+    // of their shape (up to the reuse cap): they go, and a later texture makes its own.
+    if (::Eden::Performance::GraphicsMemoryIsShort()) {
+        free_transcodes.clear();
+    }
     std::erase_if(msaa_scratch_images, [this](MsaaScratchImage& scratch) {
         if (!scheduler.IsFree(scratch.tick)) {
             scratch.unused_frames = 0;
@@ -5289,7 +5312,7 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
                 PendingTranscode& done = pending_transcodes.front();
                 const u64 bytes = bytes_of(done);
                 held_bytes -= bytes;
-                if (fits(done, batch) && free_bytes + bytes <= MaxFreeTranscodeBytes) {
+                if (fits(done, batch) && free_bytes + bytes <= TranscodeFreeCapBytes()) {
                     done.unused_frames = 0;
                     free_bytes += bytes;
                     free_transcodes.push_back(std::move(done));
