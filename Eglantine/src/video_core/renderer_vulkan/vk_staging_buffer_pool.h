@@ -29,6 +29,12 @@ struct StagingBufferRef {
     u64 index;
 };
 
+/// What releasing kept staging buffers let go of.
+struct StagingReleased {
+    size_t buffers = 0;
+    u64 bytes = 0;
+};
+
 class StagingBufferPool {
 public:
     static constexpr size_t NUM_SYNCS = 16;
@@ -50,7 +56,8 @@ public:
     }
 
     void TickFrame();
-    void ReleaseCompleted();
+    /// Lets go of every kept buffer the GPU is done with, and returns what went.
+    StagingReleased ReleaseCompleted();
 
     /// Bytes of the cached staging buffers of a kind, idle or in use (EDEN_NX2_MEM_TRACE).
     [[nodiscard]] u64 CachedBytes(MemoryUsage usage);
@@ -109,6 +116,11 @@ private:
     void ReleaseCache(MemoryUsage usage);
 
     void ReleaseLevel(StagingBuffersCache& cache, size_t log2);
+
+    /// Lets go of idle buffers, largest first, until the caches hold at most `cap` bytes.
+    /// `why` names the caller in EDEN_STAGING_CAP, which logs the release.
+    StagingReleased ReleaseIdleToCap(u64 cap, const char* why);
+
     size_t Region(size_t iter) const noexcept {
         return iter / region_size;
     }

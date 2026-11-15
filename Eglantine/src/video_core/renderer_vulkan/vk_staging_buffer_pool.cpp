@@ -198,15 +198,20 @@ void StagingBufferPool::KeepUntil(const StagingBufferRef& ref, u64 tick) {
     it->tick = (std::max)(it->tick, tick);
 }
 
-void StagingBufferPool::ReleaseCompleted() {
+StagingReleased StagingBufferPool::ReleaseCompleted() {
     const auto idle = [this](const StagingBuffer& entry) {
         return !entry.deferred && scheduler.IsFree(entry.tick);
     };
+    StagingReleased released;
     for (StagingBuffersCache* const cache : {&device_local_cache, &upload_cache, &download_cache}) {
         for (StagingBuffers& level : *cache) {
-            ::Eden::StagingBuffers::ReleaseFrom(level, idle);
+            const ::Eden::StagingBuffers::Released level_released =
+                ::Eden::StagingBuffers::ReleaseFrom(level, idle);
+            released.buffers += level_released.buffers;
+            released.bytes += level_released.bytes;
         }
     }
+    return released;
 }
 
 void StagingBufferPool::TickFrame() {
@@ -215,9 +220,6 @@ void StagingBufferPool::TickFrame() {
     ReleaseCache(MemoryUsage::DeviceLocal);
     ReleaseCache(MemoryUsage::Upload);
     ReleaseCache(MemoryUsage::Download);
-    if (::Eden::Performance::GraphicsMemoryIsShort()) {
-        ReleaseCompleted();
-    }
 
     const auto idle = [this](const StagingBuffer& entry) {
         return !entry.deferred && scheduler.IsFree(entry.tick);
@@ -238,9 +240,24 @@ void StagingBufferPool::TickFrame() {
         }
     }
 
-    // Over the cap: let go of the largest idle buffers until the caches fit again. Buffers in use
-    // and deferred ones are counted, they hold memory, but they are never released here.
-    const u64 cap = GetStagingCapBytes();
+    // Over the cap: let go of the largest idle buffers until the caches fit again. While the pool
+    // is short nothing idle is kept: the game's memory and the next allocation need it more than
+    // the next transfer of the same size does.
+    const bool short_memory = ::Eden::Performance::GraphicsMemoryIsShort();
+    ReleaseIdleToCap(short_memory ? 0 : GetStagingCapBytes(), short_memory ? "short" : "frame");
+}
+
+StagingReleased StagingBufferPool::ReleaseIdleToCap(u64 cap, const char* why) {
+    const auto idle = [this](const StagingBuffer& entry) {
+        return !entry.deferred && scheduler.IsFree(entry.tick);
+    };
+    const auto bytes_of = [](const StagingBuffer& entry) {
+        return ::Eden::StagingBuffers::Holds(entry.mapped_span.size(), entry.log2_level);
+    };
+    StagingBuffersCache* const caches[] = {&device_local_cache, &upload_cache, &download_cache};
+
+    // Buffers in use and deferred ones are counted, they hold memory, but they are never released
+    // here: only idle buffers can go while the caches are over the cap.
     struct IdleBuffer {
         u64 index;
         u64 bytes;
@@ -259,31 +276,34 @@ void StagingBufferPool::TickFrame() {
         }
     }
     if (held <= cap) {
-        return;
+        return {};
     }
     std::sort(idle_buffers.begin(), idle_buffers.end(),
               [](const IdleBuffer& a, const IdleBuffer& b) { return a.bytes > b.bytes; });
-    u64 released_bytes = 0;
+    u64 planned_bytes = 0;
     std::vector<u64> doomed;
     for (const IdleBuffer& candidate : idle_buffers) {
-        if (held - released_bytes <= cap) {
+        if (held - planned_bytes <= cap) {
             break;
         }
-        released_bytes += candidate.bytes;
+        planned_bytes += candidate.bytes;
         doomed.push_back(candidate.index);
     }
     if (doomed.empty()) {
-        return;
+        return {};
     }
     std::sort(doomed.begin(), doomed.end());
     const auto drop = [this, &doomed](const StagingBuffer& entry) {
         return !entry.deferred && scheduler.IsFree(entry.tick) &&
                std::binary_search(doomed.begin(), doomed.end(), entry.index);
     };
-    size_t released_buffers = 0;
+    StagingReleased released;
     for (StagingBuffersCache* const cache : caches) {
         for (StagingBuffers& level : *cache) {
-            released_buffers += ::Eden::StagingBuffers::ReleaseFrom(level, drop).buffers;
+            const ::Eden::StagingBuffers::Released level_released =
+                ::Eden::StagingBuffers::ReleaseFrom(level, drop);
+            released.buffers += level_released.buffers;
+            released.bytes += level_released.bytes;
         }
     }
     static std::atomic<unsigned long long> rows{0};
@@ -291,12 +311,13 @@ void StagingBufferPool::TickFrame() {
     if (row < 64 || (row & 255) == 0) {
         std::fprintf(stderr,
                      "EDEN_STAGING_CAP cap=%llu MiB held=%llu MiB released=%zu buffers (%llu MiB) "
-                     "left=%llu MiB\n",
+                     "left=%llu MiB why=%s\n",
                      static_cast<unsigned long long>(cap >> 20),
-                     static_cast<unsigned long long>(held >> 20), released_buffers,
-                     static_cast<unsigned long long>(released_bytes >> 20),
-                     static_cast<unsigned long long>((held - released_bytes) >> 20));
+                     static_cast<unsigned long long>(held >> 20), released.buffers,
+                     static_cast<unsigned long long>(released.bytes >> 20),
+                     static_cast<unsigned long long>((held - released.bytes) >> 20), why);
     }
+    return released;
 }
 
 StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {
@@ -406,6 +427,18 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
                    ::Eden::StagingBuffers::Holds(entry.mapped_span.size(), entry.log2_level) < size;
         });
     }
+    // The cap is enforced here too, not only in TickFrame: a burst inside one frame asked for
+    // more than the cap at once, and buffers that became idle after the frame's own check were
+    // still kept when the next allocation came. Under a short pool no idle buffer survives a
+    // request; otherwise the scan only runs for buffers of at least a MiB, the ones that can
+    // take the pool, so small allocations stay as cheap as they were.
+    {
+        const bool short_memory = ::Eden::Performance::GraphicsMemoryIsShort();
+        const u64 cap = short_memory ? 0 : GetStagingCapBytes();
+        if (short_memory || made >= (VkDeviceSize{1} << 20)) {
+            ReleaseIdleToCap(cap > made ? cap - made : 0, short_memory ? "short" : "request");
+        }
+    }
     VkBufferCreateInfo buffer_ci = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .pNext = nullptr,
@@ -434,15 +467,7 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
         }
         // Refused: the kept buffers the GPU is done with go, and the buffer is asked for once
         // more. Refused again, the error goes on as before.
-        const auto idle = [this](const StagingBuffer& entry) {
-            return !entry.deferred && scheduler.IsFree(entry.tick);
-        };
-        ::Eden::StagingBuffers::Released released;
-        for (StagingBuffersCache* const cache : {&device_local_cache, &upload_cache, &download_cache}) {
-            for (StagingBuffers& level : *cache) {
-                released += ::Eden::StagingBuffers::ReleaseFrom(level, idle);
-            }
-        }
+        const StagingReleased released = ReleaseCompleted();
         std::fprintf(stderr, "EDEN_STAGING_OOM asked=%zu made=%llu released=%zu buffers (%llu MiB)\n", size,
                      static_cast<unsigned long long>(made), released.buffers,
                      static_cast<unsigned long long>(released.bytes >> 20));

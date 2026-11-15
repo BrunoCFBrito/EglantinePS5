@@ -8,7 +8,7 @@ from eglantine_source import EGLANTINE, source as eglantine_source  # the core, 
 root = Path(__file__).resolve().parents[1]
 cache = Path((root / '.local/headless-cache').read_text().strip())
 source = eglantine_source('src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp')
-start = source.index('void StagingBufferPool::ReleaseCompleted() {')
+start = source.index('StagingReleased StagingBufferPool::ReleaseCompleted() {')
 end = source.index('\nvoid StagingBufferPool::TickFrame()', start)
 body = source[start:end]
 code = r'''
@@ -19,6 +19,10 @@ code = r'''
 #include <span>
 #include <vector>
 #include "staging_buffers.h"
+struct StagingReleased {
+    std::size_t buffers = 0;
+    std::uint64_t bytes = 0;
+};
 struct StagingBufferPool {
     struct StagingBuffer {
         unsigned index;
@@ -37,7 +41,7 @@ struct StagingBufferPool {
         bool IsFree(std::uint64_t tick) const { return tick <= completed; }
     } scheduler;
     StagingBuffersCache device_local_cache, upload_cache, download_cache;
-    void ReleaseCompleted();
+    StagingReleased ReleaseCompleted();
 };
 ''' + body + r'''
 int main() {
