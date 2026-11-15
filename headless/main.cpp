@@ -891,8 +891,9 @@ int main(int argc, char** argv) {
             value != nullptr && std::string_view{value} == "full") {
             dev_astc_full = true;
         }
-#ifdef EDEN_DEV_PROFILE
-        // One-run A/B switches written by the development runner; absent = defaults.
+        // One-run A/B switches written by the development runner; absent = defaults. Release
+        // builds read them too, so a console test needs no development build; the switches that
+        // only the development profile acts on (autoboot, replay, hang probes) do nothing there.
         {
             std::ifstream dev_settings(Eden::AppFile("dev-settings.txt"));
             for (std::string entry; dev_settings >> entry;) {
@@ -955,6 +956,7 @@ int main(int argc, char** argv) {
                 } else if (entry.starts_with("secondary_mask=")) {
                     // The CPUs secondary threads share, in hex (performance.cpp PlaceSecondary).
                     setenv("EDEN_SECONDARY_MASK", entry.substr(15).c_str(), 1);
+#ifdef EDEN_DEV_PROFILE
                 } else if (entry.starts_with("pc_core=") && entry.size() == 9 && entry[8] >= '0' && entry[8] <= '3') {
                     // Host PC samples from this guest core instead of core 0 (with --pc-sample).
                     Eden::Performance::pc_sample_core = static_cast<unsigned>(entry[8] - '0');
@@ -968,13 +970,16 @@ int main(int argc, char** argv) {
                 } else if (entry == "applets=firmware") {
                     // Eden's default library applets: several run from the firmware as guest programs.
                     Eden::Performance::firmware_applets = true;
+#endif
                 } else if (entry == "jit_list=on" || entry == "jit_list=off") {
                     // The saved block list (jit_list.h), whatever the settings file says.
                     Eden::JitList::enabled = entry.ends_with("on");
                     dev_block_list = true;
+#ifdef EDEN_DEV_PROFILE
                 } else if (entry == "jit_shared=off") {
                     // Every guest core keeps its own compiled blocks (headless/dynarmic/jit_group.h).
                     eden_jit_shared = false;
+#endif
                 } else if (entry == "cpu_accuracy=unsafe") {
                     // Dynarmic's unsafe FP shortcuts on top of Auto (reduced-error estimates, inaccurate NaN).
                     Settings::values.cpu_accuracy = Settings::CpuAccuracy::Unsafe;
@@ -983,10 +988,12 @@ int main(int argc, char** argv) {
                 } else if (entry == "large_pages=off" || entry == "sparse_tables=off" || entry == "heap=whole") {
                     // Read directly by the page allocator (src/memory_pages.cpp) before this parse:
                     // 16 KiB pages only; Eden's large tables dense; the heap's 3 GiB taken at start.
+#ifdef EDEN_DEV_PROFILE
                 } else if (entry == "stop_hang=on") {
                     dev_stop_hang = true;
                 } else if (entry == "load_hang=on") {
                     dev_load_hang = true;
+#endif
                 } else if (entry == "graphics_usage=driver") {
                     // The caches' "memory in use" as the driver counts it (performance.h).
                     Eden::Performance::graphics_usage_from_pool = false;
@@ -1080,8 +1087,10 @@ int main(int argc, char** argv) {
                     Common::Log::Filter filter;
                     filter.ParseFilterString(text);
                     Common::Log::SetGlobalFilter(filter);
+#ifdef EDEN_DEV_PROFILE
                 } else if (Eden::Watch::Parse(entry)) {
                     // Write watch / code dump on the main module, armed after load (watch.h).
+#endif
                 } else if (entry.starts_with("dyna_state=") && entry.size() == 12 &&
                            entry[11] >= '0' && entry[11] <= '3') {
                     Settings::values.dyna_state.SetValue(
@@ -1109,6 +1118,7 @@ int main(int argc, char** argv) {
                         static_cast<long long>(sceKernelGetDirectMemorySize()),
                         unsigned(Settings::values.vram_usage_mode.GetValue()));
         }
+#ifdef EDEN_DEV_PROFILE
         Settings::values.use_docked_mode.SetValue(Settings::ConsoleMode::Docked);
         std::puts("[headless-startup] console_mode=docked");
 #else

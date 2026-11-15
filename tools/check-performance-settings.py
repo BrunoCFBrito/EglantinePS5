@@ -11,9 +11,11 @@ from pathlib import Path
 root = Path(__file__).resolve().parents[1]
 main = (root / 'headless/main.cpp').read_text()
 
-begin = main.index('#ifdef EDEN_DEV_PROFILE\n        // One-run A/B switches')
+# The dev-settings parse runs in every build; the performance settings must reach the session
+# outside it, so it is cut out here together with the development-only docked mode after it.
+begin = main.index('        // One-run A/B switches')
 end = main.index('#else', begin)
-release = main[:begin] + main[end:]  # what a release build compiles
+release = main[:begin] + main[end:]  # what a release build compiles without dev-settings.txt
 
 assert 'const auto speed = Eden::LoadPerformance(eden_game_title_id(guest));' in release
 for statement in (
