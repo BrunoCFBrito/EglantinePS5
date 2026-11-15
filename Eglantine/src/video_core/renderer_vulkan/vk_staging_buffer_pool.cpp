@@ -40,13 +40,27 @@ constexpr VkDeviceSize MAX_ALIGNMENT = 256;
 // Windows ones however, can intake bigger buffers and generally do not OOM.
 // - GTX 960 on Windows will not OOM with 256mib
 // - GT 1030 on ^NIX will OOM with 256mib
-#if defined(__FreeBSD__)
-constexpr VkDeviceSize MAX_STREAM_BUFFER_SIZE = 128_MiB;
+// The console's toolchain predefines __FreeBSD__ (9), so the PS5 took the FreeBSD value and
+// kept 128 MiB bound for good in the direct-memory pool the CPU shares with the GPU (one VMA
+// type 3 allocation of 128 MiB in every RADV_PS5_MEMORY sample) where 64 MiB were intended.
+// EDEN_STREAM_BUFFER_MIB overrides; the 288 MiB shadow-map uploads go to dedicated staging.
+VkDeviceSize MaxStreamBufferSize() {
+    static const VkDeviceSize size = [] {
+        if (const char* const text = std::getenv("EDEN_STREAM_BUFFER_MIB"); text != nullptr) {
+            char* end = nullptr;
+            const unsigned long long mib = std::strtoull(text, &end, 10);
+            if (end != text && *end == '\0' && mib != 0 && mib <= 512) {
+                return VkDeviceSize{mib} << 20;
+            }
+        }
+#if defined(__FreeBSD__) && !defined(__PROSPERO__)
+        return VkDeviceSize{128} << 20;
 #else
-// 128 MiB on Windows too: 256 MiB sat mostly unused in device memory on Switch 2 titles.
-// PS5 memory test: 64 MiB. The 288 MiB shadow-map uploads go to dedicated staging anyway.
-constexpr VkDeviceSize MAX_STREAM_BUFFER_SIZE = 64_MiB;
+        return VkDeviceSize{64} << 20;
 #endif
+    }();
+    return size;
+}
 
 // Unused space after the end of the stream buffer. Constant buffers are bound from it and the
 // shaders declare each one at its full 64 KiB, so Metal checks 64 KiB from the binding offset
@@ -55,6 +69,7 @@ constexpr VkDeviceSize MAX_STREAM_BUFFER_SIZE = 64_MiB;
 constexpr VkDeviceSize STREAM_BUFFER_TAIL = 64_KiB;
 
 size_t GetStreamBufferSize(const Device& device) {
+    const VkDeviceSize max_size = MaxStreamBufferSize();
     if (!device.HasDebuggingToolAttached()) {
         if (device.IsIntegrated()) {
             // An integrated GPU's device-local host-visible heap can be no bigger than the stream
@@ -65,11 +80,11 @@ size_t GetStreamBufferSize(const Device& device) {
                 device, [&heap_size](size_t, VkMemoryHeap& heap) {
                     heap_size = (std::max)(heap_size, heap.size);
                 });
-            if (heap_size != 0 && heap_size <= MAX_STREAM_BUFFER_SIZE) {
+            if (heap_size != 0 && heap_size <= max_size) {
                 return Common::AlignUp(heap_size * 3 / 4, MAX_ALIGNMENT);
             }
         }
-        return MAX_STREAM_BUFFER_SIZE;
+        return max_size;
     }
 
     VkDeviceSize size{0};
@@ -83,13 +98,13 @@ size_t GetStreamBufferSize(const Device& device) {
         // If rebar is not supported, cut the max heap size to 40%. This will allow 2 captures to be
         // loaded at the same time in RenderDoc. If rebar is supported, this shouldn't be an issue
         // as the heap will be much larger.
-        if (size <= MAX_STREAM_BUFFER_SIZE) {
+        if (size <= max_size) {
             size = size * 40 / 100;
         }
     } else {
-        size = MAX_STREAM_BUFFER_SIZE;
+        size = max_size;
     }
-    return (std::min)(Common::AlignUp(size, MAX_ALIGNMENT), MAX_STREAM_BUFFER_SIZE);
+    return (std::min)(Common::AlignUp(size, MAX_ALIGNMENT), max_size);
 }
 
 // Byte cap over the three staging caches together. The pool a title gets on the console is small
