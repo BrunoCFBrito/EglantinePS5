@@ -20,6 +20,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <random>
 #include <span>
@@ -89,6 +90,11 @@
 #include "../../android/app/src/main/jni/android_settings.h"
 #endif
 
+// The guest memory service (PS5 port) gives memory back on demand: it trims the driver's unused
+// blocks and packs guest memory the game has not written for a while. Absent elsewhere. Same
+// declaration as vulkan_memory_allocator.cpp, which uses it for device allocations.
+extern "C" [[gnu::weak]] std::size_t eden_memory_recover(std::size_t bytes) noexcept;
+
 namespace Vulkan {
 
 namespace {
@@ -107,6 +113,40 @@ constexpr u32 CACHE_VERSION = VideoCommon::VulkanPipelineCacheVersion;
 constexpr size_t VULKAN_CACHE_FLUSH_PIPELINES = 128;
 constexpr size_t VULKAN_CACHE_FLUSH_MIN_SECONDS = 30;
 constexpr auto& VULKAN_CACHE_MAGIC_NUMBER = VideoCommon::VulkanDriverPipelineCacheMagic;
+
+/// How long a pipeline whose build ran out of memory for its translation pools waits before a
+/// later draw or dispatch tries it again. One attempt a second keeps a full pool from being
+/// hammered with translations that cannot finish.
+constexpr u64 PoolOomRetryDelayNs = 1'000'000'000;
+
+u64 SteadyNowNs() {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+}
+
+/// EDEN_PIPELINE_OOM where=pools: a build could not allocate its translation pools (the emulator
+/// heap refused a ShaderPools or an ObjectPool chunk). `attempt` is the try that failed and
+/// `recovered` is what RecoverPoolMemory() gave back for the retry. Shares the prefix of the
+/// driver pipeline failures' lines, which carry stage= and result= but no where=.
+void LogPoolOom(const char* stage, u64 shader, u32 attempt, std::size_t recovered,
+                bool giving_up) {
+    static std::atomic<u64> events{};
+    const u64 event{events.fetch_add(1, std::memory_order_relaxed) + 1};
+    if (event > 64 && event % 256 != 0) {
+        return;
+    }
+    std::fprintf(stderr,
+                 "EDEN_PIPELINE_OOM where=pools stage=%s shader=%016llx attempt=%u recovered=%zu"
+                 "MiB%s\n",
+                 stage, static_cast<unsigned long long>(shader), attempt, recovered >> 20,
+                 giving_up ? " giving_up=1" : "");
+}
+
+void LogPoolOomRetryOk(const char* stage, u64 shader) {
+    std::fprintf(stderr, "EDEN_PIPELINE_OOM_RETRY_OK where=pools stage=%s shader=%016llx\n",
+                 stage, static_cast<unsigned long long>(shader));
+}
 
 template <typename Container>
 auto MakeSpan(Container& container) {
@@ -999,7 +1039,9 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
 
 ComputePipeline* ComputePipelineCacheEntry::Get(bool native, GPUVAddr address,
                                                 const ComputePipelineCacheKey& key) const {
-    if (!pipeline && native) {
+    // A build that ran out of memory for its translation pools is retried by a later dispatch
+    // (CurrentComputePipeline): its dispatch is skipped, not reported as a broken native shader.
+    if (!pipeline && native && !oom) {
         throw Shader::RuntimeError(
             "Native compute pipeline unavailable: address={:#x} shader={:#016x} pipeline={:#016x}: {}",
             address, key.unique_hash, key.Hash(),
@@ -1078,6 +1120,7 @@ ComputePipeline* PipelineCache::CurrentComputePipeline(u64& native_key) {
 
     const ShaderInfo* const shader{ComputeShader()};
     if (!shader) {
+        compute_pipeline_oom = false;
         return nullptr;
     }
     native_key = shader->lowered_native ? shader->lowered_native->native_program_key : 0;
@@ -1091,6 +1134,12 @@ ComputePipeline* PipelineCache::CurrentComputePipeline(u64& native_key) {
     auto& entry{pair->second};
     if (is_new) {
         entry = CreateComputePipeline(key, shader);
+    } else if (entry.oom && SteadyNowNs() >= entry.oom_retry_ns) {
+        // A build that ran out of pool memory is tried again now that the pool may have room;
+        // the dispatch is skipped until it translates.
+        auto rebuilt{CreateComputePipeline(key, shader, entry.mapped_pointers)};
+        rebuilt.used = entry.used;
+        entry = std::move(rebuilt);
     } else if (!entry.null_pointer_slots.empty() && entry.rebuilds < MaxComputeRebuilds &&
                StaleNullPointerSlot(entry)) {
         // The translation dropped accesses through a pointer that was null back then. Which slots
@@ -1118,6 +1167,7 @@ ComputePipeline* PipelineCache::CurrentComputePipeline(u64& native_key) {
             is_new ? VideoCommon::StutterTrace::Lookup::ComputeNew
                    : VideoCommon::StutterTrace::Lookup::ComputePrebuilt);
     }
+    compute_pipeline_oom = entry.oom;
     return entry.Get(kepler_compute->IsNativeMode(),
                      kepler_compute->regs.code_loc.Address() + qmd.program_start, key);
 }
@@ -1262,22 +1312,63 @@ std::shared_ptr<ShaderPools> PipelineCache::TakeSparePools() {
 
 void PipelineCache::ReturnPools(std::shared_ptr<ShaderPools> pools) {
     if (::Eden::Performance::GraphicsMemoryIsShort()) {
-        // The pool is short: do not keep translation memory for the next build. ReleaseContents()
-        // squashes the pool into one contiguous chunk as large as the build grew, and spare_pools
-        // keeps up to four of them; at the 2026-11-15 Ocarina of Time crash six such chunks
-        // (13-18 MiB each) were live while the largest free block of the pool was 1 MiB.
-        // Dropping the returned pool and the spares returns their chunks to the emulator heap;
-        // the next build allocates them again, which is cheaper than losing the session. The
-        // probe is the one the staging buffer pool uses, refreshed at most every 100 ms.
+        // The pool is short: keep the one set the GPU thread's next build needs and release only
+        // the extras. Releasing every set made the next build construct ShaderPools itself, whose
+        // first IR chunk is about 960 KiB (EDEN_HEAP_FAILURE requested=983048 at the 2026-11-15
+        // Ocarina of Time crash) - an allocation asked for during the very shortage that had just
+        // released the spares. The set kept is squashed by ReleaseContents() as usual, the same
+        // 13-18 MiB one chunk the crash report counted; each further one is an extra and goes
+        // back to the emulator heap with its chunks.
         std::scoped_lock lock{spare_pools_mutex};
-        spare_pools.clear();
+        if (spare_pools.size() > 1) {
+            // The shortage started while the normal path still kept up to four sets: everything
+            // past the one set is an extra and goes back to the heap now.
+            spare_pools.resize(1);
+        }
+        if (!spare_pools.empty()) {
+            return;
+        }
+        try {
+            pools->ReleaseContents();
+            spare_pools.push_back(std::move(pools));
+        } catch (const std::bad_alloc&) {
+            // Squashing a grown pool needs a chunk of its own, and ReturnPools runs in the
+            // build's cleanup (SCOPE_EXIT), where a second exception would end the session:
+            // keep nothing rather than throw.
+        }
         return;
     }
-    pools->ReleaseContents();
+    try {
+        pools->ReleaseContents();
+    } catch (const std::bad_alloc&) {
+        return;
+    }
     std::scoped_lock lock{spare_pools_mutex};
     if (spare_pools.size() < 4) {
-        spare_pools.push_back(std::move(pools));
+        try {
+            spare_pools.push_back(std::move(pools));
+        } catch (const std::bad_alloc&) {
+        }
     }
+}
+
+std::size_t PipelineCache::RecoverPoolMemory() {
+    // The recovery the rest of the tree runs when memory is refused: the staging buffers the GPU
+    // is done with, the emulator heap's empty spaces, then the guest memory service's trim of the
+    // driver's unused memory and packing of cold guest memory. Any of them can give the retry
+    // the blocks it needs.
+    std::size_t recovered{0};
+    recovered += buffer_cache.runtime.ReleaseIdleStaging();
+    recovered += ::Eden::Performance::TrimHeap("pipeline pools out of memory");
+    if (&eden_memory_recover != nullptr) {
+        recovered += eden_memory_recover(std::size_t{64} << 20);
+    }
+    return recovered;
+}
+
+bool PipelineCache::PoolOomGraphicsRetryDue(u64 key_hash) const {
+    const auto it{pool_oom_graphics.find(key_hash)};
+    return it != pool_oom_graphics.end() && SteadyNowNs() >= it->second;
 }
 
 void PipelineCache::StopBackgroundJobs() {
@@ -2109,7 +2200,55 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
         }
         if (!pipeline) {
             const auto keep = evicted_pointer_slots.Take(graphics_key.Hash());
-            pipeline = CreateGraphicsPipeline(keep ? &*keep : nullptr);
+            bool pool_oom{};
+            pipeline = CreateGraphicsPipeline(keep ? &*keep : nullptr, &pool_oom);
+            if (pool_oom) {
+                // The build could not allocate its translation pools: it is not kept, and a
+                // later draw with this state translates it again once the recovery has made
+                // room. The evicted pipeline's pointer slots wait for that try.
+                bool noted{false};
+                try {
+                    if (keep) {
+                        evicted_pointer_slots.Remember(graphics_key.Hash(), *keep);
+                    }
+                    pool_oom_graphics.insert_or_assign(graphics_key.Hash(),
+                                                       SteadyNowNs() + PoolOomRetryDelayNs);
+                    noted = true;
+                } catch (const std::bad_alloc&) {
+                }
+                if (!noted) {
+                    // The retry's bookkeeping could not be allocated either: forget the entry,
+                    // so a later draw treats this state as new instead of one never to build.
+                    graphics_cache.erase(pair);
+                }
+                return nullptr;
+            }
+        }
+    } else if (!pipeline && PoolOomGraphicsRetryDue(graphics_key.Hash())) {
+        // A build that ran out of pool memory is translated again now that the recovery has run;
+        // the draw is skipped until it is ready.
+        bool pool_oom{};
+        pipeline = CreateGraphicsPipeline(nullptr, &pool_oom);
+        const u64 hash{graphics_key.Hash()};
+        if (pipeline) {
+            pool_oom_graphics.erase(hash);
+        } else if (pool_oom) {
+            bool noted{false};
+            try {
+                pool_oom_graphics.insert_or_assign(hash, SteadyNowNs() + PoolOomRetryDelayNs);
+                noted = true;
+            } catch (const std::bad_alloc&) {
+            }
+            if (!noted) {
+                // No memory for the retry's bookkeeping: forget the entry rather than leave a
+                // null pipeline cached that no later draw would try.
+                graphics_cache.erase(pair);
+                return nullptr;
+            }
+        } else {
+            // Not memory: the pipeline cannot be built at all (an unsupported shader), so stop
+            // trying it on every draw.
+            pool_oom_graphics.erase(hash);
         }
     } else if (StutterTrace::Enabled() && pipeline && !pipeline->WasUsed()) {
         StutterTrace::CountLookup(StutterTrace::Lookup::GraphicsPrebuilt);
@@ -2863,6 +3002,37 @@ void PipelineCache::WarnKeptPointer(size_t program, u64 slot) const {
 }
 
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+    const VideoCommon::EvictedPointerSlots::Slots* keep_pointers, bool* pool_oom) {
+    if (pool_oom) {
+        *pool_oom = false;
+    }
+    std::size_t recovered{0};
+    for (u32 attempt = 0;; ++attempt) {
+        try {
+            auto pipeline{CreateGraphicsPipelineOnce(keep_pointers)};
+            if (pipeline && attempt != 0) {
+                LogPoolOomRetryOk("graphics", graphics_key.Hash());
+            }
+            return pipeline;
+        } catch (const std::bad_alloc&) {
+            const bool retry{attempt == 0};
+            if (retry) {
+                // Once per build: the retry gets what this gave back, and a second failure is
+                // reported rather than recovered for again.
+                recovered = RecoverPoolMemory();
+            }
+            LogPoolOom("graphics", graphics_key.Hash(), attempt + 1, recovered, !retry);
+            if (!retry) {
+                if (pool_oom) {
+                    *pool_oom = true;
+                }
+                return nullptr;
+            }
+        }
+    }
+}
+
+std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipelineOnce(
     const VideoCommon::EvictedPointerSlots::Slots* keep_pointers) {
     const VideoCommon::Nx2Profile::Scope profile_scope{
         VideoCommon::Nx2Profile::Zone::GraphicsPipelineMiss};
@@ -2968,6 +3138,34 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
 ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(const ComputePipelineCacheKey& key,
                                                                const ShaderInfo* shader,
                                                                std::span<const u64> keep_pointers) {
+    std::size_t recovered{0};
+    for (u32 attempt = 0;; ++attempt) {
+        try {
+            auto entry{CreateComputePipelineOnce(key, shader, keep_pointers)};
+            if (entry.pipeline && attempt != 0) {
+                LogPoolOomRetryOk("compute", key.unique_hash);
+            }
+            return entry;
+        } catch (const std::bad_alloc&) {
+            const bool retry{attempt == 0};
+            if (retry) {
+                recovered = RecoverPoolMemory();
+            }
+            LogPoolOom("compute", key.unique_hash, attempt + 1, recovered, !retry);
+            if (!retry) {
+                // Short enough to stay in the string's small buffer: building this entry must
+                // not allocate either. The EDEN_PIPELINE_OOM line carries the detail.
+                return {.failure = "pool oom",
+                        .oom = true,
+                        .oom_retry_ns = SteadyNowNs() + PoolOomRetryDelayNs};
+            }
+        }
+    }
+}
+
+ComputePipelineCacheEntry PipelineCache::CreateComputePipelineOnce(
+    const ComputePipelineCacheKey& key, const ShaderInfo* shader,
+    std::span<const u64> keep_pointers) {
     const VideoCommon::Nx2Profile::Scope profile_scope{
         VideoCommon::Nx2Profile::Zone::ComputePipelineMiss};
     const auto begin = std::chrono::steady_clock::now();

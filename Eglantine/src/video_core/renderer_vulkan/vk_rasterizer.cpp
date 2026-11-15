@@ -2373,7 +2373,12 @@ void RasterizerVulkan::DispatchCompute() {
     u64 native_key{};
     ComputePipeline* const pipeline{pipeline_cache.CurrentComputePipeline(native_key)};
     if (!pipeline) {
-        if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute pipeline unavailable");
+        // A build that ran out of memory for its translation pools is retried by a later
+        // dispatch; skipping this one is not the permanent failure of a native shader.
+        if (kepler_compute->IsNativeMode() &&
+            !pipeline_cache.ComputePipelineRetryPending()) {
+            throw Shader::RuntimeError("Native compute pipeline unavailable");
+        }
         return;
     }
     std::scoped_lock lock{texture_cache.mutex, buffer_cache.mutex};

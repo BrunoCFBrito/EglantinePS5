@@ -148,6 +148,11 @@ public:
         }
     }
 
+    /// Lets go of every staging buffer the GPU is done with (out of memory) and returns the
+    /// bytes it gave back. PipelineCache calls it when a build could not allocate its translation
+    /// pools: those staging buffers are Vulkan buffer memory of the pool the heap grows from.
+    u64 ReleaseIdleStaging();
+
     /// Returns the mask of bindings whose repacked state changed.
     u32 SetVertexRepackLayout(const Tegra::Engines::Maxwell3D::Regs& regs, bool dynamic_input);
 

@@ -442,6 +442,10 @@ BufferCacheRuntime::BufferCacheRuntime(const Device& device_, MemoryAllocator& m
                                                                      scheduler_, staging_pool_);
 }
 
+u64 BufferCacheRuntime::ReleaseIdleStaging() {
+    return staging_pool.ReleaseCompleted().bytes;
+}
+
 u32 BufferCacheRuntime::SetVertexRepackLayout(const Tegra::Engines::Maxwell3D::Regs& regs,
                                             bool dynamic_input) {
     const u32 old_mask = vertex_repack_mask;

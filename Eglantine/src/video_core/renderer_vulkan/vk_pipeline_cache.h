@@ -117,6 +117,11 @@ struct ComputePipelineCacheEntry {
     u32 rebuilds{};
     /// Whether a dispatch looked it up yet (kept only with EDEN_NX2_STUTTER_TRACE)
     bool used{};
+    /// The build could not allocate its translation pools. The dispatch is skipped and a later
+    /// one retries it (CreateComputePipeline); it is not a translation failure.
+    bool oom{};
+    /// When that failed build may run again (steady clock, nanoseconds)
+    u64 oom_retry_ns{};
 
     [[nodiscard]] ComputePipeline* Get(bool native, GPUVAddr address,
                                        const ComputePipelineCacheKey& key) const;
@@ -138,6 +143,13 @@ public:
 
     [[nodiscard]] ComputePipeline* CurrentComputePipeline(u64& native_key);
 
+    /// Whether the last compute pipeline lookup found a build that ran out of memory for its
+    /// translation pools and will run again on a later dispatch. DispatchCompute skips those
+    /// too, instead of taking the null pipeline for a permanent native failure.
+    [[nodiscard]] bool ComputePipelineRetryPending() const noexcept {
+        return compute_pipeline_oom;
+    }
+
     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                            const VideoCore::DiskResourceLoadCallback& callback);
 
@@ -149,9 +161,25 @@ private:
     [[nodiscard]] GraphicsPipeline* BuiltPipeline(GraphicsPipeline* pipeline) noexcept;
 
     /// With `keep_pointers`, the slots an evicted pipeline of this key bound stay storage buffer
-    /// pointers whatever they hold now.
+    /// pointers whatever they hold now. A build that runs out of memory for its translation pools
+    /// is recovered for and tried once more; when it still fails, nullptr is returned and
+    /// `pool_oom` says so: the pipeline is not ready, and a later draw translates it again.
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline(
-        const VideoCommon::EvictedPointerSlots::Slots* keep_pointers = nullptr);
+        const VideoCommon::EvictedPointerSlots::Slots* keep_pointers = nullptr,
+        bool* pool_oom = nullptr);
+
+    /// The build CreateGraphicsPipeline runs and retries
+    std::unique_ptr<GraphicsPipeline> CreateGraphicsPipelineOnce(
+        const VideoCommon::EvictedPointerSlots::Slots* keep_pointers);
+
+    /// Whether a graphics pipeline whose build ran out of pool memory may be translated again
+    /// now; its draws are skipped until then.
+    [[nodiscard]] bool PoolOomGraphicsRetryDue(u64 key_hash) const;
+
+    /// Runs the recovery there is for a full memory pool -- the idle staging buffers, the
+    /// emulator heap's empty spaces, and the guest memory service's driver trim and packing --
+    /// and returns the bytes it gave back.
+    std::size_t RecoverPoolMemory();
 
     /// Logs a kept pointer slot (an index of keep_pointers) that this translation would otherwise
     /// have classified as no pointer: null, unmapped, or out of range right now.
@@ -187,6 +215,11 @@ private:
     ComputePipelineCacheEntry CreateComputePipeline(const ComputePipelineCacheKey& key,
                                                     const ShaderInfo* shader,
                                                     std::span<const u64> keep_pointers = {});
+
+    /// The build CreateComputePipeline runs and retries
+    ComputePipelineCacheEntry CreateComputePipelineOnce(const ComputePipelineCacheKey& key,
+                                                        const ShaderInfo* shader,
+                                                        std::span<const u64> keep_pointers);
 
     /// Builds the pipeline as CreateGraphicsPipeline does. With `emit_pools`, which `pools` must
     /// be, the SPIR-V is emitted by the CPU stage of the pipeline's job, which takes the pools and
@@ -299,6 +332,13 @@ private:
     ShaderPools main_pools;
     std::mutex spare_pools_mutex;
     std::vector<std::shared_ptr<ShaderPools>> spare_pools;
+
+    /// Key hash -> the next time a graphics pipeline whose build ran out of pool memory may be
+    /// tried again (steady clock, nanoseconds). GPU thread only.
+    std::unordered_map<u64, u64> pool_oom_graphics;
+    /// Whether the last CurrentComputePipeline found a build out of pool memory (see
+    /// ComputePipelineRetryPending). GPU thread only.
+    bool compute_pipeline_oom{};
 
     Shader::Profile profile;
     Shader::HostTranslateInfo host_info;
