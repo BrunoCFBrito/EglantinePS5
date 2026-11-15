@@ -114,17 +114,15 @@ enum class AcquireCheck {
     Drain,       ///< Drain the split and read the word as before
 };
 
-// Checks a greater-or-equal acquire without draining the split. The words Switch 2 syncs on only
-// advance (NVN2 even releases QMD completions as maxima, KeplerCompute::ProcessNativeMethod), so
-// a value that meets one now still does once the back ran the queued work. Only the last release
-// the front sent to the word decides instead, when the back may not have run it yet.
+// Checks an acquire without draining the split (PendingAcquire::CheckEarly). The words Switch 2
+// syncs on only advance (NVN2 even releases QMD completions as maxima,
+// KeplerCompute::ProcessNativeMethod), so a value that meets a greater-or-equal acquire now still
+// does once the back ran the queued work. Equal and mask acquires (most of the drains in Ocarina
+// of Time) pass on the word in memory as the hardware's puller does. Only the last release the
+// front sent to the word decides instead, when the back may not have run it yet.
 AcquireCheck CheckWithoutDrain(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire) {
     auto& split = VideoCommon::GpuSplit::Get();
     auto& stats = VideoCommon::g_acquire_stats;
-    if (!acquire.WaitsToReach()) {
-        VideoCommon::Count(stats.drain_operation);
-        return AcquireCheck::Drain;
-    }
     if (!split.Active() || !split.FrontMacros() || !ReleasesLandAtOnce()) {
         VideoCommon::Count(stats.drain_settings);
         return AcquireCheck::Drain;
@@ -135,16 +133,33 @@ AcquireCheck CheckWithoutDrain(DmaPusher& dma_pusher, const Puller::PendingAcqui
         VideoCommon::Count(stats.drain_word);
         return AcquireCheck::Drain;
     }
-    if (const auto queued = split.QueuedSemaphoreWriteAt(*device)) {
-        if (queued->known && acquire.Matches(queued->payload)) {
-            return AcquireCheck::MetByQueued;
-        }
-        VideoCommon::Count(stats.drain_queued);
-        return AcquireCheck::Drain;
+    const auto queued = split.QueuedSemaphoreWriteAt(*device);
+    // As ReadSemaphoreWord (without its flush, which the guard above made unnecessary): GPU
+    // acquires see a word's mirror shadow while guest memory still holds what it was set over.
+    const u32 guest = queued ? 0 : dma_pusher.memory_manager.Read<u32>(acquire.address);
+    const u32 word = queued ? 0 : Nx2MirrorShadow::Get().Read(*device, guest).value_or(guest);
+    using EarlyCheck = Puller::PendingAcquire::EarlyCheck;
+    std::optional<Puller::PendingAcquire::QueuedRelease> release;
+    if (queued) {
+        release = Puller::PendingAcquire::QueuedRelease{.payload = queued->payload,
+                                                        .known = queued->known};
     }
-    return acquire.Matches(dma_pusher.memory_manager.Read<u32>(acquire.address))
-               ? AcquireCheck::Met
-               : AcquireCheck::NotMet;
+    switch (acquire.CheckEarly(release, word)) {
+    case EarlyCheck::Met:
+        return AcquireCheck::Met;
+    case EarlyCheck::MetByQueued:
+        return AcquireCheck::MetByQueued;
+    case EarlyCheck::NotMet:
+        return AcquireCheck::NotMet;
+    case EarlyCheck::Drain:
+        break;
+    }
+    if (!queued) {
+        VideoCommon::Count(stats.drain_operation);
+    } else {
+        VideoCommon::Count(stats.drain_queued);
+    }
+    return AcquireCheck::Drain;
 }
 
 // EDEN_NX2_ACQUIRE_VERIFY=1: drains anyway and counts where the word after the drain disagrees
@@ -197,6 +212,28 @@ bool Puller::PendingAcquire::Matches(u32 current) const {
 
 bool Puller::PendingAcquire::WaitsToReach() const {
     return static_cast<GpuSemaphoreOperation>(operation) == GpuSemaphoreOperation::AcquireGequal;
+}
+
+Puller::PendingAcquire::EarlyCheck Puller::PendingAcquire::CheckEarly(
+    const std::optional<QueuedRelease>& queued, u32 word) const {
+    if (queued) {
+        // The last release the front sent to the word decides once it landed. GpuSplit records
+        // exact known payloads (no lower-bound maxima here), so a queued release either meets
+        // the acquire or the word is read after a drain.
+        if (queued->known && Matches(queued->payload)) {
+            return EarlyCheck::MetByQueued;
+        }
+        return EarlyCheck::Drain;
+    }
+    // Met by the word in memory: as the hardware's puller, which compares the word when it gets
+    // to the acquire, without waiting for the engines' earlier work.
+    if (Matches(word)) {
+        return EarlyCheck::Met;
+    }
+    // A word an equal or mask acquire waits on may also be met by queued work the front doesn't
+    // record (a QMD release, a report): read it after a drain, as before. The words greater or
+    // equal acquires wait on only advance, so nothing queued for the back makes them met.
+    return WaitsToReach() ? EarlyCheck::NotMet : EarlyCheck::Drain;
 }
 
 bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
