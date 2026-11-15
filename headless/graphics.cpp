@@ -723,6 +723,25 @@ void GraphicsWindow::OnFrameDisplayed() {
             std::printf("EDEN_LOADING_DONE frames=%u seconds=%.2f\n", vulkan_loading_frames,
                         now - vulkan_loading_start);
         vulkan_loading = false;
+        // EDEN_FPS every 5 s in stderr.log: frames shown, their rate, the slowest frame and the
+        // emulation speed, so a run's frame rate can be read from the logs (the HUD is not logged).
+        static double fps_start = now, fps_prior = now, fps_worst = 0;
+        static unsigned fps_frames = 0;
+        fps_worst = (std::max)(fps_worst, now - fps_prior);
+        fps_prior = now;
+        ++fps_frames;
+        if (now - fps_start >= 5.0) {
+            double speed = 0;
+#ifdef EDEN_PS5_VULKAN
+            speed = vulkan_hud_speed;
+#endif
+            std::fprintf(stderr, "EDEN_FPS fps=%.1f frames=%u seconds=%.2f worst_ms=%.1f speed=%.0f\n",
+                         fps_frames / (now - fps_start), fps_frames, now - fps_start,
+                         fps_worst * 1000.0, speed);
+            fps_start = now;
+            fps_frames = 0;
+            fps_worst = 0;
+        }
 #ifdef EDEN_PS5_VULKAN
         vulkan_hud_clock.Present(now);
         if (system && now - vulkan_hud_stats_time >= 1.0) {
