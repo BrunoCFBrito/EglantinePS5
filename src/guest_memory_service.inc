@@ -701,7 +701,15 @@ bool MakeFine(SparseRange& range, std::size_t slot, const bool (&zero)[FinePages
         }
     UnmapCpuView(view, kept * FinePage);
     const std::int64_t whole = range.physical[slot];
-    if (munmap(reinterpret_cast<void*>(at), SparseSlot) != 0) std::abort();
+    // The 2 MiB mapping is taken away whole first (a large mapping is never split): empty the slot
+    // without a hole, so the system cannot place a non-fixed allocation in it between here and
+    // the page runs below (MakeCpuViewRange). A reservation or a PROT_NONE guard faults a thread
+    // that touches the slot meanwhile, as the munmap did.
+    if (!VoidRange(at, SparseSlot)) {
+        if (!MapSlot(at, PROT_READ, whole)) std::abort();
+        (void)sceKernelReleaseDirectMemory(compact, kept * FinePage);
+        return false;
+    }
     bool ok = true;
     next = 0;
     for (std::size_t page = 0; page < FinePages && ok;) {

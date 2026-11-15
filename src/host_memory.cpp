@@ -337,8 +337,13 @@ private:
         const std::size_t bytes = count * Granule;
         return Kernel([&] {
 #ifdef PS5_NATIVE
-            if (munmap(at, bytes) != 0) return false;
+            // A reservation straight over the live mapping (as VoidWindowRegion does) keeps the
+            // window's address space occupied; unmapping first opens a hole the system can place
+            // a non-fixed allocation in, which the next alias here would replace.
             void* address = at;
+            if (sceKernelReserveVirtualRange(&address, bytes, MAP_FIXED, Granule) == 0 && address == at) return true;
+            if (munmap(at, bytes) != 0) return false;
+            address = at;
             return sceKernelReserveVirtualRange(&address, bytes, MAP_FIXED, Granule) == 0 && address == at;
 #else
             return mmap(at, bytes, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE,

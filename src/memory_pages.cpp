@@ -78,6 +78,9 @@ namespace {
 // guest memory access, and 16 KiB pages cover only a few MiB of TLB reach.
 struct Header { std::int64_t physical; std::size_t total; std::size_t lead; };
 constexpr std::size_t LargePage = 0x200000;
+// The kernel's own page, and the granularity of the heap's page-out: a guard that cannot use a
+// large page is mapped from the shared zero block in these.
+constexpr std::size_t SmallPage = 0x4000;
 // Development A/B: dev-settings large_pages=off keeps every block 16 KiB-aligned. The heap takes
 // its blocks before the frontend parses the file, so read it here with plain system calls.
 bool DevSetting(const char* entry) {
@@ -331,6 +334,8 @@ constexpr std::size_t CpuViewSlots = 64;
 std::atomic<std::uint64_t> cpu_views_used[(CpuViewSlots + 63) / 64] = {};
 std::atomic<int> cpu_views_state{0}; // 0 unmade, 1 made, 2 unavailable
 void* cpu_views_base = nullptr;
+bool cpu_views_guarded = false;
+bool MapSlot(std::uintptr_t at, int protection, std::int64_t physical); // below
 std::atomic_flag cpu_views_lock = ATOMIC_FLAG_INIT;
 
 void* MakeCpuViewRange() {
@@ -339,10 +344,23 @@ void* MakeCpuViewRange() {
         while (cpu_views_state.load(std::memory_order_acquire) == 3) sched_yield();
         return cpu_views_state.load(std::memory_order_acquire) == 1 ? cpu_views_base : nullptr;
     }
-    // Address space only: nothing is mapped into it until a view is.
+    // A reservation is not a guard: the system places a non-fixed direct-memory mapping (flags 0,
+    // the hint cpu_mapping_hint) in a range the app reserved at that hint while the range shows no
+    // mapping. On 2026-11-14 the 256 KiB dense block of Host1x's 32-bit GMMU page table
+    // (Tegra::MemoryManager::entries, 0x40000 bytes: too small for a sparse range) was placed at
+    // 0x1180000000, the base of this range, because ZeroedBlock had just unmapped slot 0. A view
+    // then took slot 0 and UnmapCpuView unmapped its last page, so the block's free at shutdown
+    // read the gone Header (SIGSEGV, error 0x4, FreeMemoryPages+0x2e). Every slot is backed before
+    // the range is published, and stays backed: the shared zero block, read-only, is what a free
+    // slot shows; a view replaces it with MAP_FIXED and UnmapCpuView puts it back.
     void* address = reinterpret_cast<void*>(cpu_mapping_hint);
     if (sceKernelReserveVirtualRange(&address, CpuViewSlots * SparseSlot, 0, SparseSlot) == 0) {
-        if (cpu_mapping_range(address, CpuViewSlots * SparseSlot)) {
+        const auto base = reinterpret_cast<std::uintptr_t>(address);
+        bool guarded = cpu_mapping_range(address, CpuViewSlots * SparseSlot) && zero_block >= 0;
+        for (std::size_t slot = 0; guarded && slot < CpuViewSlots; ++slot)
+            guarded = MapSlot(base + slot * SparseSlot, PROT_READ, zero_block);
+        if (guarded) {
+            cpu_views_guarded = true;
             cpu_views_base = address;
             cpu_views_state.store(1, std::memory_order_release);
             {
@@ -396,7 +414,14 @@ void UnmapCpuView(std::uintptr_t at, std::size_t size) {
     const auto base = reinterpret_cast<std::uintptr_t>(cpu_views_base);
     if (cpu_views_base != nullptr && cpu_views_state.load(std::memory_order_acquire) == 1 &&
         at >= base && at < base + CpuViewSlots * SparseSlot && (at - base) % SparseSlot == 0) {
-        if (munmap(reinterpret_cast<void*>(at), size) != 0) std::abort();
+        // The slot shows the shared zero block again in one MAP_FIXED step, never a hole: the
+        // system can place a non-fixed allocation in a hole (MakeCpuViewRange). A view may have
+        // mapped only part of the slot (MakeFine's compact block); the guard covers all of it.
+        if (cpu_views_guarded) {
+            if (!MapSlot(at, PROT_READ, zero_block)) std::abort();
+        } else if (munmap(reinterpret_cast<void*>(at), size) != 0) {
+            std::abort();
+        }
         const std::size_t slot = (at - base) / SparseSlot;
         cpu_views_used[slot >> 6].fetch_and(~(std::uint64_t{1} << (slot & 63)),
                                             std::memory_order_relaxed);
@@ -422,6 +447,72 @@ bool MapSlot(std::uintptr_t at, int protection, std::int64_t physical) {
     void* address = reinterpret_cast<void*>(at);
     return sceKernelMapDirectMemory(&address, SparseSlot, protection, MAP_FIXED, physical, SparseSlot) == 0 &&
            address == reinterpret_cast<void*>(at);
+}
+
+// One line the first time each way of emptying a range is used, so a console run says which one
+// this kernel took: reserve is the expected one, guard is safe but spends page tables, munmap is
+// the old two-call hole.
+void NoteVoidRange(unsigned bit, const char* method, std::size_t size) {
+    static std::atomic<unsigned> seen{0};
+    if (seen.fetch_or(bit, std::memory_order_relaxed) & bit) return;
+    char line[80];
+    const int length = std::snprintf(line, sizeof(line), "EDEN_MEMORY_VOID method=%s bytes=%zu\n", method, size);
+    if (length > 0) Note(line);
+}
+
+// Backs [begin, begin+size) with the shared zero block, PROT_NONE, in one MAP_FIXED step per
+// piece: the address stays occupied and unreadable, so the system cannot place a non-fixed
+// allocation in it, and a later commit maps over the guard. A whole 2 MiB slot goes through
+// MapSlot (a large-page mapping); a piece that starts or ends inside a slot is mapped from the
+// zero block at its offset in 16 KiB pages.
+bool GuardRange(std::uintptr_t begin, std::size_t size) {
+    if (zero_block < 0 || size == 0 || begin % SmallPage != 0 || size % SmallPage != 0) return false;
+    for (std::size_t done = 0; done < size;) {
+        const std::uintptr_t at = begin + done;
+        const std::size_t left = size - done;
+        if (at % SparseSlot == 0 && left >= SparseSlot) {
+            if (!MapSlot(at, PROT_NONE, zero_block)) return false;
+            done += SparseSlot;
+            continue;
+        }
+        const std::size_t offset = at % SparseSlot;
+        const std::size_t piece = std::min(left, SparseSlot - offset);
+        void* address = reinterpret_cast<void*>(at);
+        if (sceKernelMapDirectMemory(&address, piece, PROT_NONE, MAP_FIXED,
+                                     zero_block + static_cast<std::int64_t>(offset), SmallPage) != 0 ||
+            address != reinterpret_cast<void*>(at))
+            return false;
+        done += piece;
+    }
+    return true;
+}
+
+// Takes the mapping at [begin, begin+size) away while leaving the address occupied, so the
+// system cannot place a non-fixed allocation there: the hole UnmapCpuView made was this bug one
+// layer up. A reservation straight over the live mapping (as VoidWindowRegion does) is the first
+// choice: one entry, no page table, and the range is address space only again. Where the system
+// refuses that, the shared zero block goes over it PROT_NONE: a mapping, with page-table cost,
+// but a range nothing else can land in. Unmapping first is the last resort: it opens the hole
+// this function exists to avoid.
+bool VoidRange(std::uintptr_t begin, std::size_t size) {
+    if (size == 0 || begin % SmallPage != 0 || size % SmallPage != 0) return false;
+    void* again = reinterpret_cast<void*>(begin);
+    if (sceKernelReserveVirtualRange(&again, size, MAP_FIXED, SmallPage) == 0 &&
+        again == reinterpret_cast<void*>(begin)) {
+        NoteVoidRange(1, "reserve", size);
+        return true;
+    }
+    if (GuardRange(begin, size)) {
+        NoteVoidRange(2, "guard", size);
+        return true;
+    }
+    if (munmap(reinterpret_cast<void*>(begin), size) != 0) return false;
+    again = reinterpret_cast<void*>(begin);
+    if (sceKernelReserveVirtualRange(&again, size, MAP_FIXED, SmallPage) != 0 ||
+        again != reinterpret_cast<void*>(begin))
+        return false;
+    NoteVoidRange(4, "munmap", size);
+    return true;
 }
 #endif
 
@@ -544,12 +635,22 @@ bool SparseAvailable() {
                     step = "own-read";
                 }
 #ifdef PS5_NATIVE
-                // The written slot goes back; the shared block must still be all zeroes.
-                if (munmap(const_cast<std::uint64_t*>(probe) + words, SparseSlot) != 0 ||
-                    sceKernelReleaseDirectMemory(physical, SparseSlot) != 0)
+                // The written slot shows the shared block again in one MAP_FIXED step, and the
+                // block goes back only once nothing maps it. Unmapping first would cut a hole in
+                // a reserved range (MakeCpuViewRange): the next MapSlot would replace whatever
+                // the system placed in it.
+                if (!MapSlot(reinterpret_cast<std::uintptr_t>(probe) + SparseSlot, PROT_READ, zero_block)) {
+                    // No shared block to put back: take the slot away, as before. This is the
+                    // self-test's own range and goes back whole below, so a hole here is not
+                    // reused.
+                    if (munmap(const_cast<std::uint64_t*>(probe) + words, SparseSlot) != 0 ||
+                        sceKernelReleaseDirectMemory(physical, SparseSlot) != 0)
+                        std::abort();
+                    ok = false;
+                    step = "shared-map";
+                } else if (sceKernelReleaseDirectMemory(physical, SparseSlot) != 0) {
                     std::abort();
-                if (!MapSlot(reinterpret_cast<std::uintptr_t>(probe) + SparseSlot, PROT_READ, zero_block) ||
-                    probe[words] != 0 || probe[2 * words - 1] != 0) {
+                } else if (probe[words] != 0 || probe[2 * words - 1] != 0) {
                     ok = false;
                     step = "shared-zero";
                 }
@@ -905,12 +1006,9 @@ bool CommitMemoryRangeFrom(void* address, std::size_t size, bool high) noexcept 
             break;
         }
         if (!RecordCommitted(begin + done, block, physical)) {
-            // No entry left to give it back with: unmap it now, keeping the address space.
-            if (munmap(at, block) == 0) {
-                void* again = at;
-                (void)sceKernelReserveVirtualRange(&again, block, MAP_FIXED, LargePage);
-                (void)sceKernelReleaseDirectMemory(physical, block);
-            }
+            // No entry left to give it back with: empty it now, keeping the address space, without
+            // the hole a munmap would open.
+            if (VoidRange(begin + done, block)) (void)sceKernelReleaseDirectMemory(physical, block);
             break;
         }
         done += block;
@@ -947,25 +1045,27 @@ int DecommitMemoryRange(void* address, std::size_t size) noexcept {
     const auto begin = reinterpret_cast<std::uintptr_t>(address);
     const auto end = begin + size;
     int result = 1;
+    bool partial = false;
     std::size_t covered = 0;
     LockCommitted();
     for (auto& block : committed_blocks) {
         if (block.address < begin || block.address >= end || block.address == 0) continue;
-        void* at = reinterpret_cast<void*>(block.address);
-        // As the guest's memory gives a block back (src/host_memory.cpp): unmapped, the address
-        // space reserved again at once, then the memory released.
-        if (munmap(at, block.size) != 0) {
+        // The address stays occupied: a reservation straight over the mapping, or the shared zero
+        // block over it. Never a munmap first: the system places a non-fixed allocation in a hole
+        // of a reserved range, and the next commit here would replace it (MakeCpuViewRange).
+        if (!VoidRange(block.address, block.size)) {
+            // The range may be partly emptied (a guard that failed half way): the caller must not
+            // use it again, so this is not reported as "nothing done".
+            partial = true;
             result = -1;
             continue;
         }
-        void* again = at;
-        if (sceKernelReserveVirtualRange(&again, block.size, MAP_FIXED, LargePage) != 0 || again != at) result = -1;
         if (sceKernelReleaseDirectMemory(block.physical, block.size) != 0) result = -1;
         covered += block.size;
         block = CommittedBlock{};
     }
     UnlockCommitted();
-    if (covered != size) result = covered == 0 ? 0 : -1;
+    if (!partial && covered != size) result = covered == 0 ? 0 : -1;
     return result;
 #else
     void* at = mmap(address, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, -1, 0);
@@ -978,7 +1078,6 @@ int DecommitMemoryRange(void* address, std::size_t size) noexcept {
 // a released arena's 2 MiB back this way (headless/heap_arenas.inc): its block stays the heap's, as
 // the 16 KiB after it hold the heap's own record of the next block. 1: done; 0: nothing done (the
 // range is as it was).
-constexpr std::size_t SmallPage = 0x4000;
 int PageOutRange(void* address, std::size_t size) noexcept {
     const auto begin = reinterpret_cast<std::uintptr_t>(address);
     if (address == nullptr || size == 0 || size % SmallPage != 0 || begin % SmallPage != 0) return 0;
@@ -1010,19 +1109,22 @@ int PageOutRange(void* address, std::size_t size) noexcept {
         }
     }
     const std::int64_t physical = owner->physical + static_cast<std::int64_t>(left);
-    void* at = address;
-    if (munmap(at, size) != 0) {
+    const auto restore = [&] {
+        // Map the block back where it was, as it was (the heap's block would be gone under it).
+        void* back = reinterpret_cast<void*>(begin);
+        if (sceKernelMapDirectMemory(&back, size, PROT_READ | PROT_WRITE, MAP_FIXED, physical, SmallPage) != 0 ||
+            back != reinterpret_cast<void*>(begin))
+            std::abort();
+    };
+    if (!VoidRange(begin, size)) {
+        // The range could not be emptied without a hole: put the block back as it was.
+        restore();
         UnlockCommitted();
         return 0;
     }
-    void* again = at;
-    const bool reserved = sceKernelReserveVirtualRange(&again, size, MAP_FIXED, SmallPage) == 0 && again == at;
-    if (!reserved || sceKernelReleaseDirectMemory(physical, size) != 0) {
+    if (sceKernelReleaseDirectMemory(physical, size) != 0) {
         // The system kept the memory: map it back where it was, as it was.
-        void* back = at;
-        if (sceKernelMapDirectMemory(&back, size, PROT_READ | PROT_WRITE, MAP_FIXED, physical, SmallPage) != 0 ||
-            back != at)
-            std::abort(); // the heap's block would be gone under it
+        restore();
         UnlockCommitted();
         return 0;
     }
@@ -1052,11 +1154,8 @@ int PageInRange(void* address, std::size_t size) noexcept {
         return 0;
     }
     if (!RecordCommitted(begin, size, physical)) {
-        if (munmap(at, size) == 0) {
-            void* again = at;
-            (void)sceKernelReserveVirtualRange(&again, size, MAP_FIXED, SmallPage);
-            (void)sceKernelReleaseDirectMemory(physical, size);
-        }
+        // No record to give the block back with: empty the range without a hole, then release.
+        if (VoidRange(begin, size)) (void)sceKernelReleaseDirectMemory(physical, size);
         return 0;
     }
     return 1;
