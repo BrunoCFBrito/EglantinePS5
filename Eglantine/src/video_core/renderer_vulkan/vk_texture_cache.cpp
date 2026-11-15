@@ -2878,6 +2878,15 @@ u64 TextureCacheRuntime::GetDeviceMemoryBudget() const {
     return device.GetDeviceMemoryBudget();
 }
 
+u64 TextureCacheRuntime::GetDeviceHeapMemoryBudget() const {
+    return device.GetDeviceHeapMemoryBudget();
+}
+
+bool TextureCacheRuntime::IsDeviceMemoryUsagePoolBased() const {
+    return ::Eden::Performance::graphics_memory_free.load(std::memory_order_relaxed) != nullptr &&
+           ::Eden::Performance::graphics_usage_from_pool.load(std::memory_order_relaxed);
+}
+
 u64 TextureCacheRuntime::GetDeviceMemorySlack() const {
     return device.GetDeviceMemorySlack();
 }

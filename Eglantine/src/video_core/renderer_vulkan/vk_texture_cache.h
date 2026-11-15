@@ -108,6 +108,13 @@ public:
 
     u64 GetDeviceMemoryBudget() const;
 
+    u64 GetDeviceHeapMemoryBudget() const;
+
+    /// True where GetDeviceMemoryUsage() is the console's pool figure (the share less the
+    /// largest free block) instead of the driver's count: it cannot rise past the device
+    /// budget, so a threshold raised past it would never be reached.
+    bool IsDeviceMemoryUsagePoolBased() const;
+
     u64 GetDeviceMemorySlack() const;
 
     bool CanReportMemoryUsage() const;
