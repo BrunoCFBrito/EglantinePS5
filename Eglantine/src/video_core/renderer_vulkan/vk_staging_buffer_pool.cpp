@@ -16,6 +16,7 @@
 #include "common/bit_util.h"
 #include "common/common_types.h"
 #include "common/literals.h"
+#include "common/logging.h"
 #include "video_core/nx2_stutter_trace.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
@@ -458,20 +459,70 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
     if (device.IsBufferDeviceAddressSupported()) {
         buffer_ci.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     }
-    vk::Buffer buffer;
-    try {
-        buffer = memory_allocator.CreateBuffer(buffer_ci, usage);
-    } catch (const vk::Exception& refused) {
-        if (refused.GetResult() != VK_ERROR_OUT_OF_DEVICE_MEMORY) {
-            throw;
+    vk::Buffer buffer = memory_allocator.TryCreateBuffer(buffer_ci, usage);
+    StagingReleased released;
+    if (!buffer) {
+        // No memory left for it (#262: a 128 MiB upload on an 8 GB laptop with Intel UHD). Free
+        // the idle staging buffers and try again, then wait for the GPU so the ones it was still
+        // reading are idle too. Those handed out in the current tick may feed commands not
+        // recorded yet (the caller's input while it asks for its output): they move to the tick
+        // after Finish, so they are neither freed nor handed out again.
+        released += ReleaseIdleBuffers();
+        buffer = memory_allocator.TryCreateBuffer(buffer_ci, usage);
+        if (!buffer) {
+            const u64 current_tick = scheduler.CurrentTick();
+            scheduler.Finish();
+            const u64 next_tick = scheduler.CurrentTick();
+            for (StagingBuffersCache* const cache :
+                 {&device_local_cache, &upload_cache, &download_cache}) {
+                for (StagingBuffers& staging : *cache) {
+                    for (StagingBuffer& entry : staging.entries) {
+                        if (!entry.deferred && entry.tick >= current_tick) {
+                            entry.tick = next_tick;
+                        }
+                    }
+                }
+            }
+            for (u64& sync_tick : sync_ticks) {
+                if (sync_tick >= current_tick) {
+                    sync_tick = next_tick;
+                }
+            }
+            released += ReleaseIdleBuffers();
+            buffer = memory_allocator.TryCreateBuffer(buffer_ci, usage);
         }
-        // Refused: the kept buffers the GPU is done with go, and the buffer is asked for once
-        // more. Refused again, the error goes on as before.
-        const StagingReleased released = ReleaseCompleted();
-        std::fprintf(stderr, "EDEN_STAGING_OOM asked=%zu made=%llu released=%zu buffers (%llu MiB)\n", size,
-                     static_cast<unsigned long long>(made), released.buffers,
+    }
+    if (!buffer) {
+        std::fprintf(stderr, "EDEN_STAGING_OOM asked=%zu made=%llu released=%zu buffers (%llu MiB)\n",
+                     size, static_cast<unsigned long long>(made), released.buffers,
                      static_cast<unsigned long long>(released.bytes >> 20));
-        buffer = memory_allocator.CreateBuffer(buffer_ci, usage);
+        static u32 logged{};
+        if (logged++ == 0) {
+            LogMemoryTrace(device);
+        }
+        // The GPU is idle after Finish, so the stream buffer after its last range is free. The
+        // ranges before it may hold data for commands not recorded yet, so it does not wrap.
+        if (usage != MemoryUsage::Upload || deferred || iterator + size >= stream_buffer_size) {
+            LOG_CRITICAL(Render_Vulkan, "No memory for a {} byte staging buffer (usage {})", size,
+                         static_cast<u32>(usage));
+            throw vk::Exception(VK_ERROR_OUT_OF_DEVICE_MEMORY);
+        }
+        if (logged <= 32) {
+            LOG_ERROR(Render_Vulkan, "No memory for a {} byte upload buffer; using the stream buffer",
+                      size);
+        }
+        const size_t offset = iterator;
+        free_iterator = (std::max)(free_iterator, offset + size);
+        iterator = Common::AlignUp(offset + size, MAX_ALIGNMENT);
+        return StagingBufferRef{
+            .buffer = *stream_buffer,
+            .device_address = stream_buffer_address,
+            .offset = static_cast<VkDeviceSize>(offset),
+            .mapped_span = stream_pointer.subspan(offset, size),
+            .usage{},
+            .log2_level{},
+            .index{},
+        };
     }
     // A large buffer smaller than the power of two: the 1st, 2nd, 4th, 8th ... in the log.
     if (exact && made >= (VkDeviceSize{64} << 20) && made < (VkDeviceSize{1} << log2_size)) {
@@ -529,6 +580,24 @@ u64 StagingBufferPool::CachedBytes(MemoryUsage usage) {
         }
     }
     return bytes;
+}
+
+StagingReleased StagingBufferPool::ReleaseIdleBuffers() {
+    const auto idle = [this](const StagingBuffer& entry) {
+        return !entry.deferred && scheduler.IsFree(entry.tick);
+    };
+    StagingReleased released;
+    for (StagingBuffersCache* const cache : {&device_local_cache, &upload_cache, &download_cache}) {
+        for (StagingBuffers& staging : *cache) {
+            const ::Eden::StagingBuffers::Released level_released =
+                ::Eden::StagingBuffers::ReleaseFrom(staging, idle);
+            released.buffers += level_released.buffers;
+            released.bytes += level_released.bytes;
+            staging.delete_index = 0;
+            staging.iterate_index = 0;
+        }
+    }
+    return released;
 }
 
 void StagingBufferPool::ReleaseCache(MemoryUsage usage) {

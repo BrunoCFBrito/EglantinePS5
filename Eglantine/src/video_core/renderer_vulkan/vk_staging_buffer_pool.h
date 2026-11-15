@@ -33,6 +33,11 @@ struct StagingBufferRef {
 struct StagingReleased {
     size_t buffers = 0;
     u64 bytes = 0;
+    StagingReleased& operator+=(const StagingReleased& other) noexcept {
+        buffers += other.buffers;
+        bytes += other.bytes;
+        return *this;
+    }
 };
 
 class StagingBufferPool {
@@ -114,6 +119,9 @@ private:
     StagingBuffersCache& GetCache(MemoryUsage usage);
 
     void ReleaseCache(MemoryUsage usage);
+
+    /// Frees every staging buffer the GPU is done with, of every kind (out of memory).
+    StagingReleased ReleaseIdleBuffers();
 
     void ReleaseLevel(StagingBuffersCache& cache, size_t log2);
 
