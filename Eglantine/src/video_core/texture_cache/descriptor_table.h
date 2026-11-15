@@ -78,9 +78,13 @@ public:
         current_gpu_addr = gpu_addr;
         current_limit = limit;
         ++changes;
-        // Mario Brothership reallocates a lot of times, so use aggressive pre-alloc sizes
-        // std::vector<T> by default uses quadratic growth, but that isn't even enough to satisfy brothership
-        const size_t num_descriptors = ((limit + 0x80000) & (~0x7ffff)) + 1;
+        // Round up to 0x8000 entries rather than 0x80000: the old floor made every table
+        // 0x80000 * sizeof(T) bytes whatever the guest limit, and a channel holds four of them.
+        // At the 2026-11-15 Ocarina crash six 16 MiB tables (96 MiB) and 12 MiB of id vectors
+        // were live while the guest bound far fewer descriptors. Mario Brothership reallocates
+        // a lot, so keep a step: 0x8000 entries per growth, and a shrinking limit keeps capacity.
+        const size_t num_descriptors =
+            ((static_cast<size_t>(limit) + 0x8000) & ~static_cast<size_t>(0x7fff)) + 1;
         read_descriptors.resize(Common::DivCeil(num_descriptors, 64U));
         ClearReadDescriptors();
         invalidated = false;
