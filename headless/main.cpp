@@ -880,6 +880,17 @@ int main(int argc, char** argv) {
         [[maybe_unused]] bool dev_block_list = false;  // read where a session applies its settings
         [[maybe_unused]] bool dev_astc_cpu = false;   // dev-settings astc=cpu
         [[maybe_unused]] bool dev_astc_full = false;  // dev-settings astc_textures=full
+        // The same two ASTC switches for release builds, from env.txt (read above):
+        // EDEN_PS5_ASTC=cpu decodes on the CPU, EDEN_PS5_ASTC_TEXTURES=full keeps textures
+        // decoded instead of BC3 (the core also needs EDEN_NX2_KEEP_ASTC=1 for that).
+        if (const char* value = std::getenv("EDEN_PS5_ASTC"); value != nullptr &&
+                                                              std::string_view{value} == "cpu") {
+            dev_astc_cpu = true;
+        }
+        if (const char* value = std::getenv("EDEN_PS5_ASTC_TEXTURES");
+            value != nullptr && std::string_view{value} == "full") {
+            dev_astc_full = true;
+        }
 #ifdef EDEN_DEV_PROFILE
         // One-run A/B switches written by the development runner; absent = defaults.
         {
