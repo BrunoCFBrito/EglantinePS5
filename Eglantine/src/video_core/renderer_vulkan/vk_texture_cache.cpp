@@ -5215,6 +5215,11 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
             }
         }
     }
+    // The flush and the waits above can submit the tick `map` was requested in (the pending
+    // transcode's encode and copy are recorded in it), while the decode that reads `map` is
+    // recorded in the tick after. The pool would then hand the buffer to the next upload, which
+    // overwrites the ASTC blocks before the decoder reads them: keep it until the decode's tick.
+    staging_buffer_pool.KeepUntil(map, scheduler.CurrentTick());
     const auto reusable = std::ranges::find_if(free_transcodes, [&](const PendingTranscode& t) {
         return t.width == width && t.height == height && t.levels == levels && t.layers == layers;
     });

@@ -40,6 +40,11 @@ public:
     StagingBufferRef Request(size_t size, MemoryUsage usage, bool deferred = false);
     void FreeDeferred(StagingBufferRef& ref);
 
+    /// Keeps `ref` in the pool until the GPU is past `tick`. A transfer that reads the buffer in a
+    /// later tick than the one it was requested in holds it this way: the ASTC transcode's decode
+    /// runs after the pending-transcode waits have submitted the requesting tick.
+    void KeepUntil(const StagingBufferRef& ref, u64 tick);
+
     [[nodiscard]] VkBuffer StreamBuf() const noexcept {
         return *stream_buffer;
     }

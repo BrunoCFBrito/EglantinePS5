@@ -175,6 +175,29 @@ void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {
     it->deferred = false;
 }
 
+void StagingBufferPool::KeepUntil(const StagingBufferRef& ref, u64 tick) {
+    if (ref.buffer == *stream_buffer) {
+        // A stream buffer region is reused once the GPU is past the sync tick it was handed out
+        // with: keep every region the transfer spans until `tick`.
+        const size_t begin = (std::min)(static_cast<size_t>(ref.offset / region_size), NUM_SYNCS);
+        const size_t end = (std::min)(
+            static_cast<size_t>((ref.offset + ref.mapped_span.size_bytes() + region_size - 1) /
+                                region_size),
+            NUM_SYNCS);
+        for (size_t i = begin; i < end; ++i) {
+            sync_ticks[i] = (std::max)(sync_ticks[i], tick);
+        }
+        return;
+    }
+    auto& entries = GetCache(ref.usage)[ref.log2_level].entries;
+    const auto is_this_one = [&ref](const StagingBuffer& entry) {
+        return entry.index == ref.index;
+    };
+    const auto it = std::find_if(entries.begin(), entries.end(), is_this_one);
+    ASSERT(it != entries.end());
+    it->tick = (std::max)(it->tick, tick);
+}
+
 void StagingBufferPool::ReleaseCompleted() {
     const auto idle = [this](const StagingBuffer& entry) {
         return !entry.deferred && scheduler.IsFree(entry.tick);
