@@ -74,7 +74,31 @@ size_t BytesPerIndex(VkIndexType index_type) {
     }
 }
 
-vk::Buffer CreateBuffer(const Device& device, const MemoryAllocator& memory_allocator, u64 size,
+template <typename Create>
+auto CreateBufferAfterStagingRelease(Create&& create, StagingBufferPool& staging_pool, u64 size) {
+    try {
+        return create();
+    } catch (const vk::Exception& exception) {
+        if (exception.GetResult() != VK_ERROR_OUT_OF_DEVICE_MEMORY &&
+            exception.GetResult() != VK_ERROR_OUT_OF_HOST_MEMORY) {
+            throw;
+        }
+        static u32 logged{};
+        if (logged++ < 32) {
+            LOG_WARNING(Render_Vulkan,
+                        "No memory for a {} byte buffer; freeing staging buffers and retrying",
+                        size);
+        }
+        // The staging pool holds most of the memory that can be freed at once after a scene
+        // change: a console session had 926 MiB of a 3.2 GB heap in it when a 128 KiB buffer
+        // had no room.
+        staging_pool.ReleaseMemory();
+    }
+    return create();
+}
+
+vk::Buffer CreateBuffer(const Device& device, const MemoryAllocator& memory_allocator,
+                        StagingBufferPool& staging_pool, u64 size,
                         VkDeviceSize sparse_alignment) {
     VkBufferUsageFlags flags =
         VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
@@ -101,11 +125,16 @@ vk::Buffer CreateBuffer(const Device& device, const MemoryAllocator& memory_allo
         .queueFamilyIndexCount = 0,
         .pQueueFamilyIndices = nullptr,
     };
-    if (sparse_alignment > 1) {
-        return memory_allocator.CreateBuffer(buffer_ci, MemoryUsage::DeviceLocal, sparse_alignment);
-    }
-    return memory_allocator.CreateBuffer(
-        buffer_ci, device.IsMoltenVK() ? MemoryUsage::Stream : MemoryUsage::DeviceLocal);
+    return CreateBufferAfterStagingRelease(
+        [&] {
+            if (sparse_alignment > 1) {
+                return memory_allocator.CreateBuffer(buffer_ci, MemoryUsage::DeviceLocal,
+                                                     sparse_alignment);
+            }
+            return memory_allocator.CreateBuffer(
+                buffer_ci, device.IsMoltenVK() ? MemoryUsage::Stream : MemoryUsage::DeviceLocal);
+        },
+        staging_pool, size);
 }
 
 #if defined(__PROSPERO__) // PS5
@@ -154,7 +183,7 @@ Buffer::Buffer(BufferCacheRuntime& runtime, DAddr cpu_addr_, u64 size_bytes_,
                bool sparse_compatible_)
     : VideoCommon::BufferBase(cpu_addr_, size_bytes_), device{&runtime.device},
       scheduler{&runtime.scheduler},
-      buffer{CreateBuffer(*device, runtime.memory_allocator, SizeBytes(),
+      buffer{CreateBuffer(*device, runtime.memory_allocator, runtime.staging_pool, SizeBytes(),
                           runtime.SparseAlignmentFor(sparse_compatible_))},
       tracker{SizeBytes()} {
     sparse_compatible = sparse_compatible_;
