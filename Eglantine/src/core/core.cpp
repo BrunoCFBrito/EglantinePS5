@@ -631,6 +631,14 @@ struct System::Impl {
         ::Eden::ReportStep("shutdown", "Completed cpu_manager.Shutdown()");
 #endif // PS5
         debugger.reset();
+        {
+            // The general channel's event is a kernel object made on first use. Left for ~Impl,
+            // it closed at exit() on a kernel already shut down (SIGSEGV in KAutoObject::Close).
+            // Its queued data stays for the next kernel, which remakes the event.
+            std::scoped_lock lk{general_channel_mutex};
+            general_channel_event.reset();
+            general_channel_context.reset();
+        }
         kernel.Shutdown();
 #if !defined(__PROSPERO__) // not PS5
 #else // PS5
@@ -739,6 +747,9 @@ struct System::Impl {
         if (!general_channel_event) {
             general_channel_context.emplace(system, "GeneralChannel");
             general_channel_event.emplace(*general_channel_context);
+            if (!general_channel.empty()) {
+                general_channel_event->Signal(kernel);
+            }
         }
     }
 };
@@ -1182,9 +1193,10 @@ void System::PushGeneralChannelData(std::vector<u8>&& data) {
 
 bool System::TryPopGeneralChannel(std::vector<u8>& out_data) {
     std::scoped_lock lk{impl->general_channel_mutex};
-    if (!impl->general_channel_event || impl->general_channel.empty()) {
+    if (impl->general_channel.empty()) {
         return false;
     }
+    impl->EnsureGeneralChannelInitialized(*this);
     out_data = std::move(impl->general_channel.back());
     impl->general_channel.pop_back();
     if (impl->general_channel.empty()) {
