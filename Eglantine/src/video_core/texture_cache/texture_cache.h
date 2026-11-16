@@ -35,6 +35,7 @@
 #include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/render_trace.h"
+#include "video_core/rasterizer_download_area.h"
 #include "video_core/texture_cache/conversion.h"
 #include "video_core/texture_cache/host_memory_limit.h"
 #include "video_core/texture_cache/host_mip_limits.h"
@@ -200,14 +201,22 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
     bool evict_old_costly = false;
     u64 ticks_to_destroy = 0;
     size_t num_iterations = 0;
+    // Memory the images queued for a write-back give back when they go (after their swizzle), so
+    // the pass's modes see it already.
+    u64 pending_freed_bytes = 0;
+    u64 pending_own_bytes = 0;
     // What the collector's marks bound: the cache's own image bytes where the PS5 sets the
     // thresholds that way (#823), else the usage the runtime reports. The PS5's usage figure is
     // the console pool's share less its largest free block, so it also holds the guest's memory,
     // Eden's heap and the allocator's holes: against it a mark is only reached by evicting the
     // images the game is using, every frame, and the pool still has no block to give (#739).
     const bool own_marks = own_bytes_thresholds && own_critical_memory != 0;
-    const auto ActiveUsage = [this, own_marks]() -> u64 {
-        return own_marks ? own_image_bytes : total_used_memory;
+    const auto ActiveUsage = [this, own_marks, &pending_freed_bytes,
+                              &pending_own_bytes]() -> u64 {
+        if (own_marks) {
+            return own_image_bytes - (std::min)(own_image_bytes, pending_own_bytes);
+        }
+        return total_used_memory - (std::min)(total_used_memory, pending_freed_bytes);
     };
     const u64 active_expected = own_marks ? own_expected_memory : expected_memory;
     const u64 active_critical = own_marks ? own_critical_memory : critical_memory;
@@ -259,31 +268,31 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         }
         return true;
     };
-    const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode, &CanEvict,
-                          out_of_memory, &ActiveUsage, active_expected,
-                          active_critical](ImageId image_id) {
-        if (num_iterations == 0) {
-            return true;
-        }
-        bool must_download = false;
-        if (!CanEvict(image_id, &must_download)) {
-            return false;
-        }
-        --num_iterations;
+    // Images the GPU wrote are downloaded before the collector drops them. Each used to wait for
+    // the GPU on its own (Finish per image), so a pass with dozens of them drained the GPU dozens
+    // of times. A pass now records the copies, waits once and swizzles them back in the order
+    // they were queued, as DownloadMemory does. Such an image stays registered and tracked until
+    // its data is swizzled back, and only then goes: a guest write to its pages in between waits
+    // on the cache's lock and lands after the swizzle. A batch is capped so the staging memory
+    // held at once stays bounded; its staging buffers are deferred until their swizzle read them.
+    constexpr size_t MaxWriteBackBatchBytes = 64_MiB;
+    using WriteBackMap = decltype(runtime.DownloadStagingBuffer(size_t{}, true));
+    using WriteBackCopies = decltype(FullDownloadCopies(std::declval<const ImageInfo&>()));
+    struct PendingWriteBack {
+        ImageId image_id;
+        WriteBackCopies copies;
+        WriteBackMap map;
+    };
+    boost::container::small_vector<PendingWriteBack, 16> pending_write_backs;
+    size_t pending_write_back_bytes = 0;
+    const auto IsPending = [&](ImageId image_id) {
+        return std::ranges::any_of(pending_write_backs,
+                                   [image_id](const PendingWriteBack& entry) {
+                                       return entry.image_id == image_id;
+                                   });
+    };
+    const auto RemoveImage = [this](ImageId image_id) {
         auto& image = slot_images[image_id];
-        if (must_download) {
-            if (!DownloadInChunks(image)) {
-                auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
-                const auto copies = FullDownloadCopies(image.info);
-                image.DownloadMemory(map, copies);
-                runtime.Finish();
-                SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span, swizzle_data_buffer);
-            }
-            ++gc_download_deletes;
-            ClearStaleImage(image);
-        } else {
-            MarkStale(image); // before UntrackImage (see MarkStale)
-        }
         if (True(image.flags & ImageFlagBits::Tracked)) {
             UntrackImage(image, image_id);
         }
@@ -299,6 +308,93 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
         UnregisterImage(image_id);
         DeleteImage(image_id, image.scale_tick > frame_tick + 5);
+    };
+    const auto FlushWriteBacks = [&] {
+        if (pending_write_backs.empty()) {
+            return;
+        }
+        runtime.Finish();
+        // A guest CPU write into memory the buffer cache holds GPU-written bytes of is stored at
+        // once and reaches this cache only later (OnCacheInvalidations, which waits for this
+        // lock). So each image is written back inside a DownloadLanding over its device range:
+        // writes there collected from then on store their bytes once it has ended, and one
+        // collected before is still pending. An image under a pending one is not written back and
+        // stays cached, as if the collector had not picked it: its bytes would land over the
+        // guest's newer ones. A sparse image's device range is not one range, so its landing
+        // covers everything and any pending write keeps it.
+        const auto LandingFor = [](const Image& image) {
+            return True(image.flags & ImageFlagBits::Sparse)
+                       ? std::pair<DAddr, DAddr>{0, ~DAddr{0}}
+                       : std::pair<DAddr, DAddr>{image.cpu_addr, image.cpu_addr_end};
+        };
+        const auto IsWrittenByCpu = [this](DAddr begin, DAddr end) {
+            bool written = false;
+            if (pending_cpu_writes) {
+                pending_cpu_writes([&](DAddr addr, size_t size) {
+                    written |= addr < end && begin < addr + size;
+                });
+            }
+            return written;
+        };
+        for (PendingWriteBack& entry : pending_write_backs) {
+            Image& image = slot_images[entry.image_id];
+            bool written_by_cpu;
+            {
+                const auto [landing_begin, landing_end] = LandingFor(image);
+                const VideoCore::DownloadLanding landing{
+                    landing_begin, landing_end, VideoCore::DownloadLanding::Source::TextureCache};
+                written_by_cpu = IsWrittenByCpu(landing_begin, landing_end);
+                if (!written_by_cpu) {
+                    SwizzleImage(*gpu_memory, image.gpu_addr, image.info, entry.copies,
+                                 entry.map.mapped_span, swizzle_data_buffer);
+                }
+            }
+            runtime.FreeDeferredStagingBuffer(entry.map);
+            if (written_by_cpu) {
+                continue;
+            }
+            ++gc_download_deletes;
+            ClearStaleImage(image);
+            RemoveImage(entry.image_id);
+        }
+        pending_write_backs.clear();
+        pending_write_back_bytes = 0;
+        pending_freed_bytes = 0;
+        pending_own_bytes = 0;
+    };
+    const auto QueueWriteBack = [&](Image& image, ImageId image_id) {
+        if (pending_write_back_bytes + image.unswizzled_size_bytes > MaxWriteBackBatchBytes) {
+            FlushWriteBacks();
+        }
+        auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes, true);
+        auto copies = FullDownloadCopies(image.info);
+        image.DownloadMemory(map, copies);
+        const u64 scaled_bytes = image.HasScaled() ? GetScaledImageSizeBytes(image) : 0;
+        pending_write_back_bytes += image.unswizzled_size_bytes;
+        pending_freed_bytes += scaled_bytes + ImageMemoryBytes(image);
+        if (own_marks) {
+            pending_own_bytes += scaled_bytes + ImageAllocationBytes(image);
+        }
+        pending_write_backs.push_back({image_id, std::move(copies), std::move(map)});
+    };
+    const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode, &CanEvict,
+                          out_of_memory, &QueueWriteBack, &IsPending, &RemoveImage,
+                          &ActiveUsage, active_expected, active_critical](ImageId image_id) {
+        if (num_iterations == 0) {
+            return true;
+        }
+        bool must_download = false;
+        if (IsPending(image_id) || !CanEvict(image_id, &must_download)) {
+            return false;
+        }
+        --num_iterations;
+        auto& image = slot_images[image_id];
+        if (must_download) {
+            QueueWriteBack(image, image_id);
+        } else {
+            MarkStale(image); // before UntrackImage (see MarkStale)
+            RemoveImage(image_id);
+        }
         if (out_of_memory) {
             return false;
         }
@@ -398,6 +494,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         Configure(true);
         Collect();
     }
+    FlushWriteBacks();
 }
 
 template <class P>
