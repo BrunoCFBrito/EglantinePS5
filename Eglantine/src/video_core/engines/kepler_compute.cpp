@@ -183,7 +183,7 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
             CallMethod(system, address, value, true);
             return true;
         };
-#ifdef ARCHITECTURE_x86_64
+#if defined(ARCHITECTURE_x86_64) && !defined(__PROSPERO__) // PS5: no executable memory for xbyak
         // Compiled macro code, as for 3D macros (macro_turing_jit.h); EDEN_NX2_MME_JIT=0 off.
         static const bool use_jit = [] {
             const char* value = std::getenv("EDEN_NX2_MME_JIT");
@@ -1691,7 +1691,7 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
         }
         return true;
     };
-#ifdef ARCHITECTURE_x86_64
+#if defined(ARCHITECTURE_x86_64) && !defined(__PROSPERO__) // PS5: no executable memory for xbyak
     if (!macro.native_jit) {
         macro.native_jit = std::make_shared<TuringMacroJit>();
     }

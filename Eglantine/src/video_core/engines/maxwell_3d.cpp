@@ -1655,7 +1655,7 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
             }
             return true;
         };
-#ifdef ARCHITECTURE_x86_64
+#if defined(ARCHITECTURE_x86_64) && !defined(__PROSPERO__) // PS5: no executable memory for xbyak
         if (!engine.native_jit) {
             engine.native_jit = std::make_shared<TuringMacroJit>();
         }
