@@ -374,9 +374,19 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         const char* value = std::getenv("EDEN_NX2_TC_OLD_AGE");
         return value != nullptr ? std::strtoull(value, nullptr, 10) : 1800ULL;
     }();
-    if (high_priority_mode && old_age != 0 && frame_tick > old_age) {
+    // While the console's shared pool is critical (not the cache's own bytes: the guest, the
+    // heap and the driver share it), a costly image converts again only to be evicted again:
+    // take the images the frame's draws have not used for a few seconds, not the 30 s the
+    // default keeps. Ocarina of Time's area loads spend ~1.1 GB of that pool in ten seconds
+    // while its converted ASTC images (0.6-0.7 GB) sit under the cache's own critical mark,
+    // where the 1800-frame age means the collector never touches them. EDEN_NX2_TC_OLD_AGE
+    // still sets the age, and 0 still turns the pass off.
+    const u64 costly_age = Eden::Performance::GraphicsMemoryIsCritical()
+                               ? (std::min)(old_age, u64{300})
+                               : old_age;
+    if (high_priority_mode && costly_age != 0 && frame_tick > costly_age) {
         evict_old_costly = true;
-        Collect(old_age);
+        Collect(costly_age);
         evict_old_costly = false;
     }
     Collect();

@@ -198,8 +198,14 @@ void BufferCache<P>::TickFrame() {
         // downloading the GPU-written ones, ~5% of the GPU thread) that were recreated later.
         // Collect when the buffers themselves are large. At 1 GiB it held geometry of scenes
         // long gone: title 1's title screen grew to ~0.9 GB of buffers in ten minutes.
-        if (buffer_bytes >= 256_MiB) {
-            RunGarbageCollector(buffer_bytes >= 768_MiB);
+        // The pool is the guest's and Eden's heap's too, so this cache can sit under its own
+        // marks while the next allocation has no block to take: while it is short, collect every
+        // frame; while it is critical, collect as if the buffers were past their own mark, at 60
+        // unused frames instead of 120. Buffers the frame draws are untouched either way.
+        const bool pool_short = Eden::Performance::GraphicsMemoryIsShort();
+        if (buffer_bytes >= 256_MiB || pool_short) {
+            RunGarbageCollector(buffer_bytes >= 768_MiB ||
+                                Eden::Performance::GraphicsMemoryIsCritical());
         }
     } else if (total_used_memory >= minimum_memory) {
         RunGarbageCollector(total_used_memory >= critical_memory);
