@@ -382,8 +382,11 @@ struct System::Impl {
     SystemResultStatus SetupForApplicationProcess(System& system, Frontend::EmuWindow& emu_window) {
         host1x_core.emplace(system);
         VideoCore::CreateGPU(gpu_core, emu_window, system);
-        if (!gpu_core)
+        if (!gpu_core) {
+            // As Load does: the kernel is up, and destroying it without its shutdown crashes.
+            ShutdownMainProcess();
             return SystemResultStatus::ErrorVideoCore;
+        }
 
         audio_core.emplace(system);
 
