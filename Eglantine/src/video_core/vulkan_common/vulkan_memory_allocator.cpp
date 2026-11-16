@@ -663,6 +663,13 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
         outside_budget.flags &= ~static_cast<VmaAllocationCreateFlags>(VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT);
         created = vmaCreateBufferWithAlignment(allocator, &ci, &outside_budget, min_alignment, &handle,
                                            &allocation, &alloc_info);
+        // As the unaligned path: release guest memory and try again before giving up. The
+        // aligned overload is used for sparse-compatible buffer cache buffers, which can be
+        // large enough to hit the pool's budget on their own.
+        created = RecoverDeviceMemory(created, ci.size, [&] {
+            return vmaCreateBufferWithAlignment(allocator, &ci, &outside_budget, min_alignment,
+                                                &handle, &allocation, &alloc_info);
+        });
         static std::atomic<unsigned long long> refused{0};
         const auto times = refused.fetch_add(1, std::memory_order_relaxed) + 1;
         if ((times & (times - 1)) == 0) { // the 1st, 2nd, 4th, 8th ... time
