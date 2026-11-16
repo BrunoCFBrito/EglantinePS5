@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include "dev_vulkan.h"
 #include "performance.h"
@@ -1041,11 +1042,22 @@ VkFormat Device::GetSupportedFormat(VkFormat wanted_format, VkFormatFeatureFlags
 }
 
 void Device::ReportLoss() const {
+    static std::atomic_flag reported;
+    if (reported.test_and_set()) {
+        // The first thread to see the loss reports it and ends the process.
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::hours{1});
+        }
+    }
     LOG_CRITICAL(Render_Vulkan, "Device loss occurred!");
     ReportDeviceFault();
-
-    // Wait for the log to flush and for Nsight Aftermath to dump the results
-    std::this_thread::sleep_for(std::chrono::seconds{15});
+    if (nsight_aftermath_tracker) {
+        // Give Nsight Aftermath time to write its dump.
+        std::this_thread::sleep_for(std::chrono::seconds{15});
+    }
+    LOG_CRITICAL(Render_Vulkan, "Closing the emulator: the GPU driver lost the Vulkan device");
+    Common::Log::Stop();
+    std::_Exit(EXIT_FAILURE);
 }
 
 void Device::ReportDeviceFault() const {
