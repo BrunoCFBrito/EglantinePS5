@@ -135,6 +135,18 @@ u64 GetStagingCapBytes() {
     }();
     return cap;
 }
+
+// EDEN_STAGING_SKIP: a caller whose work can wait was refused a staging buffer even after the
+// pool's recovery. The 1st, 2nd, 4th, 8th ... skip is logged.
+void LogStagingSkip(const char* where, size_t size, MemoryUsage usage, bool deferred) {
+    static std::atomic<unsigned long long> skips{0};
+    const auto times = skips.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((times & (times - 1)) == 0) {
+        std::fprintf(stderr,
+                     "EDEN_STAGING_SKIP where=%s asked=%zu usage=%u deferred=%d (%llu so far)\n",
+                     where, size, static_cast<unsigned>(usage), int(deferred), times);
+    }
+}
 } // Anonymous namespace
 
 StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& memory_allocator_,
@@ -177,6 +189,16 @@ StagingBufferRef StagingBufferPool::Request(size_t size, MemoryUsage usage, bool
         return GetStreamBuffer(size);
     }
     return GetStagingBuffer(size, usage, deferred);
+}
+
+std::optional<StagingBufferRef> StagingBufferPool::TryRequest(size_t size, MemoryUsage usage,
+                                                              bool deferred, const char* where) {
+    // No stream fast path here: a caller that can wait wants a dedicated buffer it can give
+    // back, not a stream region it would have to keep for a tick.
+    if (std::optional<StagingBufferRef> ref = TryGetReservedBuffer(size, usage, deferred)) {
+        return ref;
+    }
+    return TryCreateStagingBuffer(size, usage, deferred, where);
 }
 
 void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {
@@ -439,7 +461,21 @@ std::optional<StagingBufferRef> StagingBufferPool::TryGetReservedBuffer(size_t s
     return it->Ref();
 }
 
-StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage usage, bool deferred) {
+StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage usage,
+                                                        bool deferred) {
+    std::optional<StagingBufferRef> ref = TryCreateStagingBuffer(size, usage, deferred, nullptr);
+    if (!ref) {
+        LOG_CRITICAL(Render_Vulkan, "No memory for a {} byte staging buffer (usage {})", size,
+                     static_cast<u32>(usage));
+        throw vk::Exception(VK_ERROR_OUT_OF_DEVICE_MEMORY);
+    }
+    return *ref;
+}
+
+std::optional<StagingBufferRef> StagingBufferPool::TryCreateStagingBuffer(size_t size,
+                                                                          MemoryUsage usage,
+                                                                          bool deferred,
+                                                                          const char* where) {
     if (static unsigned rows{}; size >= (64ULL << 20) && rows++ < 96) {
         for (unsigned kind = 0; kind < 3; ++kind) {
             auto& cache = kind == 0 ? device_local_cache : kind == 1 ? upload_cache : download_cache;
@@ -505,33 +541,32 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
     StagingReleased released;
     if (!buffer) {
         // No memory left for it (#262: a 128 MiB upload on an 8 GB laptop with Intel UHD). Free
-        // the idle staging buffers and try again, then wait for the GPU so the ones it was still
-        // reading are idle too. Those handed out in the current tick may feed commands not
-        // recorded yet (the caller's input while it asks for its output): they move to the tick
-        // after Finish, so they are neither freed nor handed out again.
-        released += ReleaseIdleBuffers();
+        // the idle staging buffers and try again, then let ReleaseMemory wait for the GPU and
+        // free the ones it was still reading too. Buffers handed out in the current tick may
+        // feed commands not recorded yet (the caller's input while it asks for its output):
+        // ReleaseMemory moves them past the Finish, so they are neither freed nor handed out.
+        released += ReleaseCompleted();
         buffer = memory_allocator.TryCreateBuffer(buffer_ci, usage);
         if (!buffer) {
-            const u64 current_tick = scheduler.CurrentTick();
-            scheduler.Finish();
-            const u64 next_tick = scheduler.CurrentTick();
-            for (StagingBuffersCache* const cache :
-                 {&device_local_cache, &upload_cache, &download_cache}) {
-                for (StagingBuffers& staging : *cache) {
-                    for (StagingBuffer& entry : staging.entries) {
-                        if (!entry.deferred && entry.tick >= current_tick) {
-                            entry.tick = next_tick;
-                        }
-                    }
-                }
-            }
-            for (u64& sync_tick : sync_ticks) {
-                if (sync_tick >= current_tick) {
-                    sync_tick = next_tick;
-                }
-            }
-            released += ReleaseIdleBuffers();
+            released += ReleaseMemory();
             buffer = memory_allocator.TryCreateBuffer(buffer_ci, usage);
+        }
+        // The caches hold more than the staging pool: the texture cache keeps images it has
+        // already deleted alive for the GPU, and the collector's own readback buffers are
+        // deferred. Ask it for that memory once, then try once more.
+        if (!buffer && reclaim) {
+            const u64 reclaimed = reclaim();
+            if (reclaimed != 0) {
+                static std::atomic<unsigned long long> rows{0};
+                const auto row = rows.fetch_add(1, std::memory_order_relaxed);
+                if (row < 32 || (row & 255) == 0) {
+                    std::fprintf(stderr,
+                                 "EDEN_STAGING_RECLAIM reclaimed=%llu MiB asked=%zu usage=%u\n",
+                                 static_cast<unsigned long long>(reclaimed >> 20), size,
+                                 static_cast<unsigned>(usage));
+                }
+                buffer = memory_allocator.TryCreateBuffer(buffer_ci, usage);
+            }
         }
     }
     if (!buffer) {
@@ -542,29 +577,34 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
         if (logged++ == 0) {
             LogMemoryTrace(device);
         }
-        // The GPU is idle after Finish, so the stream buffer after its last range is free. The
-        // ranges before it may hold data for commands not recorded yet, so it does not wrap.
-        if (usage != MemoryUsage::Upload || deferred || iterator + size >= stream_buffer_size) {
-            LOG_CRITICAL(Render_Vulkan, "No memory for a {} byte staging buffer (usage {})", size,
-                         static_cast<u32>(usage));
-            throw vk::Exception(VK_ERROR_OUT_OF_DEVICE_MEMORY);
+        // The GPU is idle after ReleaseMemory, so the stream buffer after its last range is
+        // free. The ranges before it may hold data for commands not recorded yet, so it does
+        // not wrap. A deferred upload cannot use it (FreeDeferred looks the buffer up in the
+        // upload cache), so only a non-deferred upload is served from the tail.
+        if (usage == MemoryUsage::Upload && !deferred && iterator + size < stream_buffer_size) {
+            if (logged <= 32) {
+                LOG_ERROR(Render_Vulkan,
+                          "No memory for a {} byte upload buffer; using the stream buffer", size);
+            }
+            const size_t offset = iterator;
+            free_iterator = (std::max)(free_iterator, offset + size);
+            iterator = Common::AlignUp(offset + size, MAX_ALIGNMENT);
+            return StagingBufferRef{
+                .buffer = *stream_buffer,
+                .device_address = stream_buffer_address,
+                .offset = static_cast<VkDeviceSize>(offset),
+                .mapped_span = stream_pointer.subspan(offset, size),
+                .usage{},
+                .log2_level{},
+                .index{},
+            };
         }
-        if (logged <= 32) {
-            LOG_ERROR(Render_Vulkan, "No memory for a {} byte upload buffer; using the stream buffer",
-                      size);
+        // A caller whose transfer can wait gets nothing back instead of an exception out of the
+        // GPU thread; Request still throws (the wrapper above).
+        if (where != nullptr) {
+            LogStagingSkip(where, size, usage, deferred);
         }
-        const size_t offset = iterator;
-        free_iterator = (std::max)(free_iterator, offset + size);
-        iterator = Common::AlignUp(offset + size, MAX_ALIGNMENT);
-        return StagingBufferRef{
-            .buffer = *stream_buffer,
-            .device_address = stream_buffer_address,
-            .offset = static_cast<VkDeviceSize>(offset),
-            .mapped_span = stream_pointer.subspan(offset, size),
-            .usage{},
-            .log2_level{},
-            .index{},
-        };
+        return std::nullopt;
     }
     // A large buffer smaller than the power of two: the 1st, 2nd, 4th, 8th ... in the log.
     if (exact && made >= (VkDeviceSize{64} << 20) && made < (VkDeviceSize{1} << log2_size)) {

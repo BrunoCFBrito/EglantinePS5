@@ -1362,6 +1362,11 @@ StagingBufferRef TextureCacheRuntime::DownloadStagingBuffer(size_t size, bool de
     return staging_buffer_pool.Request(size, MemoryUsage::Download, deferred);
 }
 
+std::optional<StagingBufferRef> TextureCacheRuntime::TryDownloadStagingBuffer(
+    size_t size, bool deferred, const char* where) {
+    return staging_buffer_pool.TryRequest(size, MemoryUsage::Download, deferred, where);
+}
+
 void TextureCacheRuntime::FreeDeferredStagingBuffer(StagingBufferRef& ref) {
     staging_buffer_pool.FreeDeferred(ref);
 }

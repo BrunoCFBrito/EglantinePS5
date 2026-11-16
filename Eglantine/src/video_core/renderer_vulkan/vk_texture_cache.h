@@ -91,6 +91,11 @@ public:
 
     StagingBufferRef DownloadStagingBuffer(size_t size, bool deferred = false);
 
+    /// DownloadStagingBuffer, or nothing when the pool still refuses it after its own recovery.
+    /// A readback can be skipped and asked for again; the GPU thread cannot be unwound.
+    std::optional<StagingBufferRef> TryDownloadStagingBuffer(size_t size, bool deferred = false,
+                                                             const char* where = nullptr);
+
     void FreeDeferredStagingBuffer(StagingBufferRef& ref);
 
     void TickFrame();

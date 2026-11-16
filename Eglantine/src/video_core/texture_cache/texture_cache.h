@@ -366,16 +366,31 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         if (pending_write_back_bytes + image.unswizzled_size_bytes > MaxWriteBackBatchBytes) {
             FlushWriteBacks();
         }
-        auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes, true);
+        // The readback buffer can be refused when the collector runs because memory is short.
+        // The pool releases and waits before refusing; if it still refuses, the image stays in
+        // the cache instead of being evicted without its write-back (nothing dereferences a
+        // buffer that was not made).
+        std::optional<WriteBackMap> map;
+        if constexpr (requires(Runtime& r) {
+                          r.TryDownloadStagingBuffer(size_t{}, true, "gc_writeback");
+                      }) {
+            map = runtime.TryDownloadStagingBuffer(image.unswizzled_size_bytes, true,
+                                                   "gc_writeback");
+        } else {
+            map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes, true);
+        }
+        if (!map) {
+            return;
+        }
         auto copies = FullDownloadCopies(image.info);
-        image.DownloadMemory(map, copies);
+        image.DownloadMemory(*map, copies);
         const u64 scaled_bytes = image.HasScaled() ? GetScaledImageSizeBytes(image) : 0;
         pending_write_back_bytes += image.unswizzled_size_bytes;
         pending_freed_bytes += scaled_bytes + ImageMemoryBytes(image);
         if (own_marks) {
             pending_own_bytes += scaled_bytes + ImageAllocationBytes(image);
         }
-        pending_write_backs.push_back({image_id, std::move(copies), std::move(map)});
+        pending_write_backs.push_back({image_id, std::move(copies), std::move(*map)});
     };
     const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode, &CanEvict,
                           out_of_memory, &QueueWriteBack, &IsPending, &RemoveImage,
@@ -591,6 +606,32 @@ template <class P>
 void TextureCache<P>::LogThresholds() const {
     LOG_INFO(HW_GPU, "Texture cache thresholds: expected {} MiB, critical {} MiB, minimum {} MiB",
              expected_memory >> 20, critical_memory >> 20, minimum_memory >> 20);
+}
+
+template <class P>
+u64 TextureCache<P>::ReclaimMemory() {
+    // Called from the staging pool's reclaim hook when the device refuses a buffer, from inside
+    // texture cache work: the collector's lookups and the caller's ids may be in use, so no
+    // image is evicted here. The images already deleted still hold their device memory in the
+    // sentenced rings until the GPU is past them; the wait below makes them safe to destroy.
+    if (reclaiming) {
+        return 0; // Finish() asked the pool for staging again
+    }
+    reclaiming = true;
+    SCOPE_EXIT {
+        reclaiming = false;
+    };
+    reclaim_requested = true;
+    runtime.Finish();
+    u64 bytes = gpu_sentenced_bytes;
+    for (const u64 slot_bytes : sentenced_image_bytes) {
+        bytes += slot_bytes;
+    }
+    gpu_sentenced_images.clear();
+    gpu_sentenced_bytes = 0;
+    sentenced_images.Clear();
+    sentenced_image_bytes.fill(0);
+    return bytes;
 }
 
 template <class P>
@@ -1041,6 +1082,12 @@ void TextureCache<P>::TickFrame() {
         const u32 failed = runtime.FailedImages();
         out_of_memory = failed != seen_failed_images;
         seen_failed_images = failed;
+    }
+    // Graphics memory was refused since the last frame (ReclaimMemory, from the staging pool):
+    // collect once as if well past the critical mark, so unused images give their memory back
+    // before the next allocation needs it.
+    if (std::exchange(reclaim_requested, false)) {
+        total_used_memory = (std::max)(total_used_memory, critical_memory + 1_GiB);
     }
     DeleteSupersededImages();
     if (out_of_memory || total_used_memory > minimum_memory) {
@@ -1784,24 +1831,55 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
         pending.clear();
         pending_bytes = 0;
     };
-    for (const ImageId image_id : images) {
+
+    // The pool's own recovery runs first; a readback it still refuses is skipped, and the image
+    // and the ones after it stay GPU-modified (forced_flushed false) so the next CPU read asks
+    // for them again instead of trusting guest memory.
+    const auto mark_skipped = [this, &images](size_t first) {
+        for (size_t rest = first; rest < images.size(); ++rest) {
+            Image& skipped = slot_images[images[rest]];
+            skipped.flags |= ImageFlagBits::GpuModified;
+            skipped.info.forced_flushed = false;
+        }
+    };
+    const auto download = [this](size_t size, const char* where) -> std::optional<Map> {
+        if constexpr (requires(Runtime& r) {
+                          r.TryDownloadStagingBuffer(size_t{}, false, where);
+                      }) {
+            return runtime.TryDownloadStagingBuffer(size, false, where);
+        } else {
+            return runtime.DownloadStagingBuffer(size);
+        }
+    };
+    for (size_t index = 0; index < images.size(); ++index) {
+        const ImageId image_id = images[index];
         Image& image = slot_images[image_id];
         if (image.unswizzled_size_bytes >= DownloadChunkMinSize) {
             // Written in modification order with the images before it, then one band at a time.
             flush_pending();
-            if (DownloadInChunks(image)) {
+            bool refused = false;
+            if (DownloadInChunks(image, refused)) {
                 ClearStaleImage(image);
                 continue;
+            }
+            if (refused) {
+                mark_skipped(index);
+                return;
             }
         }
         if (!pending.empty() && pending_bytes + image.unswizzled_size_bytes > MaxBatchBytes) {
             flush_pending();
         }
-        auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
+        std::optional<Map> map = download(image.unswizzled_size_bytes, "texture_download");
+        if (!map) {
+            flush_pending();
+            mark_skipped(index);
+            return;
+        }
         auto copies = FullDownloadCopies(image.info);
-        image.DownloadMemory(map, copies);
+        image.DownloadMemory(*map, copies);
         pending_bytes += image.unswizzled_size_bytes;
-        pending.push_back(Pending{image_id, map, std::move(copies)});
+        pending.push_back(Pending{image_id, std::move(*map), std::move(copies)});
     }
     flush_pending();
 }
@@ -2385,16 +2463,42 @@ void TextureCache<P>::CommitAsyncFlushes() {
                                 image.info.layer_stride, image.guest_size_bytes, image.unswizzled_size_bytes);
                 }
             }
-            auto download_map = runtime.DownloadStagingBuffer(total_size_bytes, true);
-            for (const PendingDownload& download_info : download_ids) {
-                if (download_info.is_swizzle) {
-                    Image& image = download_info.GetImage(slot_images);
-                    const auto copies = FullDownloadCopies(image.info);
-                    image.DownloadMemory(download_map, copies);
-                    download_map.offset += Common::AlignUp(image.unswizzled_size_bytes, 64);
-                }
+            // A preemptive readback the pool refuses is dropped, not fatal: the image stays
+            // GPU-modified and forced_flushed goes back to false, so the CPU's next read of it
+            // flushes it for real. Buffer readbacks are kept.
+            std::optional<decltype(runtime.DownloadStagingBuffer(size_t{}, true))> download_map;
+            if constexpr (requires(Runtime& r) {
+                              r.TryDownloadStagingBuffer(size_t{}, true, "async_readback");
+                          }) {
+                download_map = runtime.TryDownloadStagingBuffer(total_size_bytes, true,
+                                                               "async_readback");
+            } else {
+                download_map = runtime.DownloadStagingBuffer(total_size_bytes, true);
             }
-            uncommitted_async_buffers.emplace_back(download_map);
+            if (!download_map) {
+                const auto dropped = std::remove_if(
+                    download_ids.begin(), download_ids.end(),
+                    [this](const PendingDownload& download_info) {
+                        if (!download_info.is_swizzle) {
+                            return false;
+                        }
+                        Image& image = download_info.GetImage(slot_images);
+                        image.info.forced_flushed = false;
+                        return true;
+                    });
+                download_ids.erase(dropped, download_ids.end());
+            } else {
+                for (const PendingDownload& download_info : download_ids) {
+                    if (download_info.is_swizzle) {
+                        Image& image = download_info.GetImage(slot_images);
+                        const auto copies = FullDownloadCopies(image.info);
+                        image.DownloadMemory(*download_map, copies);
+                        download_map->offset +=
+                            Common::AlignUp(image.unswizzled_size_bytes, 64);
+                    }
+                }
+                uncommitted_async_buffers.emplace_back(*download_map);
+            }
         }
 
         async_buffers.emplace_back(std::move(uncommitted_async_buffers));
@@ -2789,7 +2893,8 @@ bool TextureCache<P>::UploadInChunks(Image& image) {
 }
 
 template <class P>
-bool TextureCache<P>::DownloadInChunks(Image& image) {
+bool TextureCache<P>::DownloadInChunks(Image& image, bool& refused) {
+    refused = false;
     // A whole download of a very large image needs a staging buffer of its full size, which the
     // console memory pool can refuse when it has no free block that large. The image comes back in
     // row bands packed into staging buffers of about 32 MiB, and each buffer is written into guest
@@ -2811,20 +2916,35 @@ bool TextureCache<P>::DownloadInChunks(Image& image) {
     std::vector<BufferImageCopy> group;
     size_t group_bytes = 0;
     const auto flush_group = [&] {
-        if (group.empty()) {
+        if (group.empty() || refused) {
             return;
         }
-        auto staging = runtime.DownloadStagingBuffer(group_bytes);
-        image.DownloadMemory(staging, group);
+        std::optional<decltype(runtime.DownloadStagingBuffer(size_t{}))> staging;
+        if constexpr (requires(Runtime& r) {
+                          r.TryDownloadStagingBuffer(size_t{}, false, "texture_download_chunks");
+                      }) {
+            staging = runtime.TryDownloadStagingBuffer(group_bytes, false,
+                                                       "texture_download_chunks");
+        } else {
+            staging = runtime.DownloadStagingBuffer(group_bytes);
+        }
+        if (!staging) {
+            refused = true;
+            return;
+        }
+        image.DownloadMemory(*staging, group);
         runtime.Finish();
         for (const BufferImageCopy& copy : group) {
-            SwizzleImageBand(*gpu_memory, image.gpu_addr, image.info, copy, staging.mapped_span,
-                             swizzle_data_buffer);
+            SwizzleImageBand(*gpu_memory, image.gpu_addr, image.info, copy,
+                             staging->mapped_span, swizzle_data_buffer);
         }
         group.clear();
         group_bytes = 0;
     };
     for (BufferImageCopy band : bands) {
+        if (refused) {
+            break;
+        }
         if (!group.empty() && group_bytes + band.buffer_size > band_bytes) {
             flush_group();
         }
@@ -2833,7 +2953,7 @@ bool TextureCache<P>::DownloadInChunks(Image& image) {
         group.push_back(band);
     }
     flush_group();
-    return true;
+    return !refused;
 }
 
 template <class P>

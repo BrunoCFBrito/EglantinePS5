@@ -600,6 +600,14 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
       fence_manager(*this, gpu, texture_cache, buffer_cache, query_cache, device, scheduler),
       frame_dump(device, memory_allocator, scheduler) {
     scheduler.SetQueryCache(query_cache);
+    // The staging pool's last resort when the device refuses a buffer: the texture cache may
+    // still hold device memory in images it has already deleted. try_lock: the refused thread
+    // already holds the cache's recursive mutex when it was refused in texture cache work;
+    // otherwise another thread holds it and nothing is reclaimed.
+    staging_pool.reclaim = [this]() -> u64 {
+        std::unique_lock lock{texture_cache.mutex, std::try_to_lock};
+        return lock.owns_lock() ? texture_cache.ReclaimMemory() : 0;
+    };
     buffer_cache.SetPendingCpuWrites(
         [this](const std::function<void(DAddr, size_t)>& callback) {
             gpu.ForEachPendingCpuWrite(callback);
@@ -614,6 +622,7 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
 }
 
 RasterizerVulkan::~RasterizerVulkan() {
+    staging_pool.reclaim = nullptr;
     VideoCommon::GpuSplit::Get().SetIdleHook(nullptr, nullptr);
     scheduler.WaitWorker();
     scheduler.Finish();

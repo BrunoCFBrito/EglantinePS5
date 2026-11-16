@@ -7,6 +7,8 @@
 #pragma once
 
 #include <climits>
+#include <functional>
+#include <optional>
 #include <vector>
 
 #include "common/common_types.h"
@@ -49,6 +51,12 @@ public:
     ~StagingBufferPool();
 
     StagingBufferRef Request(size_t size, MemoryUsage usage, bool deferred = false);
+    /// Request, or nothing when the device still refuses it after the pool's own recovery. A
+    /// caller whose work can wait (a readback, a cache write-back) uses this instead of Request,
+    /// which throws out of the GPU thread. `where` names it in EDEN_STAGING_SKIP.
+    std::optional<StagingBufferRef> TryRequest(size_t size, MemoryUsage usage,
+                                               bool deferred = false, const char* where = nullptr);
+
     void FreeDeferred(StagingBufferRef& ref);
 
     /// Keeps `ref` in the pool until the GPU is past `tick`. A transfer that reads the buffer in a
@@ -67,6 +75,11 @@ public:
     /// Out of device memory: waits for the GPU, then frees every staging buffer it is done with
     /// except those handed out since the last submit. Returns what went.
     StagingReleased ReleaseMemory();
+
+    /// Runs when memory is refused even after ReleaseMemory: frees what the caches hold and can
+    /// let go (RasterizerVulkan sets it to the texture cache's ReclaimMemory). Returns the bytes
+    /// it gave back; 0 when it could not run.
+    std::function<u64()> reclaim;
 
     /// Bytes of the cached staging buffers of a kind, idle or in use (EDEN_NX2_MEM_TRACE).
     [[nodiscard]] u64 CachedBytes(MemoryUsage usage);
@@ -119,6 +132,9 @@ private:
                                                          bool deferred);
 
     StagingBufferRef CreateStagingBuffer(size_t size, MemoryUsage usage, bool deferred);
+
+    std::optional<StagingBufferRef> TryCreateStagingBuffer(size_t size, MemoryUsage usage,
+                                                           bool deferred, const char* where);
 
     StagingBuffersCache& GetCache(MemoryUsage usage);
 

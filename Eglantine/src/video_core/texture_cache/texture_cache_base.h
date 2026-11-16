@@ -179,6 +179,8 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 logged_critical_memory{}; ///< The critical threshold of the last thresholds line logged
     u32 seen_pressure_events{};   ///< Allocator pressure events already answered
     u32 seen_failed_images{};     ///< Images the allocator could not make, already collected for
+    bool reclaim_requested{};     ///< The staging pool was refused: collect aggressively next frame
+    bool reclaiming{};            ///< ReclaimMemory is running; a nested allocation must not re-enter
     u64 pressure_margin{};        ///< Extra room under the budget after images did not fit
     u64 pressure_quiet_frames{};  ///< Frames since the last such image
     u64 slack_margin{};           ///< Extra room for allocator block space the driver counts as used
@@ -217,7 +219,9 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     bool UploadInChunks(Image& image);
 
     /// Splits large 2D image downloads into row bands, avoiding multi-hundred MiB staging buffers.
-    bool DownloadInChunks(Image& image);
+    /// `refused`: graphics memory refused a band's staging buffer (the image stays GPU-modified
+    /// for a later read); false when the image does not qualify for banding at all.
+    bool DownloadInChunks(Image& image, bool& refused);
 
     /// Splits large converted 2D image uploads into row bands, unswizzled and converted per band.
     bool UploadConvertedInChunks(Image& image);
@@ -286,6 +290,12 @@ public:
 
     /// Notify the cache that a new frame has been queued
     void TickFrame();
+
+    /// Graphics memory was refused: waits for the GPU, then destroys the images already deleted
+    /// (their device memory was waiting for the GPU) and makes the next collector pass
+    /// aggressive. The staging pool calls it through RasterizerVulkan when an allocation fails.
+    /// Caller holds `mutex`. Returns the bytes the destroyed images held.
+    u64 ReclaimMemory();
 
     /// Where the guest CPU writes into GPU-written memory that were collected but not applied yet
     /// come from (as BufferCache::SetPendingCpuWrites): the collector's write-backs must not write
