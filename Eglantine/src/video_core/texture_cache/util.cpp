@@ -1734,6 +1734,16 @@ void SwizzleImageBand(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const
         copy.buffer_row_length * bytes_per_block, gpu_memory.UsesNativeTiling(), first_offset);
 }
 
+bool ScaledImageFits(const ImageInfo& info, const Settings::ResolutionScalingInfo& resolution,
+                     u32 max_extent) noexcept {
+    const auto [samples_x, samples_y] = SamplesLog2(info.num_samples);
+    const u32 width = resolution.ScaleUp(info.size.width) >> samples_x;
+    const u32 height =
+        (info.type == ImageType::e2D ? resolution.ScaleUp(info.size.height) : info.size.height) >>
+        samples_y;
+    return width <= max_extent && height <= max_extent;
+}
+
 bool IsBlockLinearSizeCompatible(const ImageInfo& lhs, const ImageInfo& rhs, u32 lhs_level,
                                  u32 rhs_level, bool strict_size) noexcept {
     ASSERT(lhs.type != ImageType::Linear);
