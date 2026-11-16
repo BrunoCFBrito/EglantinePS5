@@ -3025,7 +3025,9 @@ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
             }
         }
     }
-    {
+    // Pages no image was ever registered on hold no image or stale page to update, so the
+    // texture cache's lock (held by the back through each draw) is not waited for there.
+    if (texture_cache.page_filter.Any(addr, size)) {
         if (!::Eden::Performance::GuestCacheLockOrDefer(texture_cache.mutex)) {
             ::Eden::Performance::DeferWrite(addr, size, ::Eden::Performance::cpu_write_core);
             return false;
