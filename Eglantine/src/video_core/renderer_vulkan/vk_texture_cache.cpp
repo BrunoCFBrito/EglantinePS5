@@ -3054,12 +3054,56 @@ void TextureCacheRuntime::TickFrame() {
     });
 }
 
+namespace {
+/// EDEN_PS5_MAX_DEPTH_DIM: a square, single-sample, single-level depth target at or above this
+/// width is made at the resolution-scaled size instead of its guest size when a downscale setup
+/// is active. The cache keeps no guest-size copy of it, so Ocarina of Time's 12288x12288 D16 sun
+/// shadow map (288 MiB) becomes 6144x6144 (72 MiB) at 0.5x. Off when unset; PS5 builds only.
+[[nodiscard]] bool HostScaleLargeDepth(const ImageInfo& info) {
+#if defined(__PROSPERO__)
+    static const u32 max_depth_dim = [] {
+        const char* const value = std::getenv("EDEN_PS5_MAX_DEPTH_DIM");
+        return value != nullptr ? static_cast<u32>(std::strtoull(value, nullptr, 10)) : 0U;
+    }();
+    if (max_depth_dim == 0) {
+        return false;
+    }
+    const auto& resolution = Settings::values.resolution_info;
+    if (!resolution.active || !resolution.downscale || !info.rescaleable ||
+        !info.downscaleable || info.type != ImageType::e2D || info.num_samples != 1 ||
+        info.resources.levels != 1 || info.resources.layers != 1 ||
+        info.size.width != info.size.height || info.size.width < max_depth_dim ||
+        info.format < VideoCore::Surface::PixelFormat::MaxColorFormat) {
+        return false;
+    }
+    return resolution.ScaleUp(info.size.width) < info.size.width &&
+           resolution.ScaleUp(info.size.height) < info.size.height;
+#else
+    (void)info;
+    return false;
+#endif
+}
+
+/// The host image's shape: the trimmed guest shape, or its resolution-scaled size when
+/// HostScaleLargeDepth takes it.
+[[nodiscard]] ImageInfo HostImageInfo(const Device& device, const ImageInfo& info,
+                                      u32& host_level_offset) {
+    ImageInfo host_info = TrimmedHostInfo(device, info, host_level_offset);
+    if (HostScaleLargeDepth(info)) {
+        const auto& resolution = Settings::values.resolution_info;
+        host_info.size.width = resolution.ScaleUp(info.size.width);
+        host_info.size.height = resolution.ScaleUp(info.size.height);
+    }
+    return host_info;
+}
+} // namespace
+
 Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu_addr_,
              VAddr cpu_addr_)
     : VideoCommon::ImageBase(info_, gpu_addr_, cpu_addr_), scheduler{&runtime_.scheduler},
       runtime{&runtime_},
       original_image(MakeImage(runtime_.device, runtime_.memory_allocator,
-                               TrimmedHostInfo(runtime_.device, info, host_level_offset),
+                               HostImageInfo(runtime_.device, info, host_level_offset),
                                IsHugeAstcArray(runtime_.device, info) ||
                                        IsUnevenMipRgba8Astc(runtime_.device, info)
                                    ? std::span<const VkFormat>{HugeAstcViewFormats}
@@ -3074,6 +3118,13 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
                                    SparseTilesModeOf(runtime_.device) == SparseTilesMode::Aliased,
                                true)),
       aspect_mask(ImageAspectMask(info.format)) {
+    if (HostScaleLargeDepth(info)) {
+        flags |= ImageFlagBits::Rescaled | ImageFlagBits::HostScaled;
+        const auto& resolution = Settings::values.resolution_info;
+        LOG_INFO(Render_Vulkan, "PS5 depth target {}x{} made at {}x{} (EDEN_PS5_MAX_DEPTH_DIM)",
+                 info.size.width, info.size.height, resolution.ScaleUp(info.size.width),
+                 resolution.ScaleUp(info.size.height));
+    }
     if (OutOfMemory()) {
         return;
     }
@@ -3205,6 +3256,10 @@ void Image::AllocateComputeUnswizzleBuffer(u32 max_slices) {
 
 void Image::UploadMemory(VkBuffer buffer, VkDeviceSize offset,
                          std::span<const VideoCommon::BufferImageCopy> copies) {
+    if (True(flags & ImageFlagBits::HostScaled)) {
+        // No guest-size image to upload into; the GPU fills this scratch target.
+        return;
+    }
     boost::container::small_vector<VideoCommon::BufferImageCopy, 16> host_copies;
     if (HostMipLevels() < static_cast<u32>(info.resources.levels)) {
         VideoCommon::AppendHostMipEntries(
@@ -3329,6 +3384,10 @@ void Image::DownloadMemory(VkBuffer buffer, size_t offset,
 
 void Image::DownloadMemory(std::span<VkBuffer> buffers_span, std::span<size_t> offsets_span,
                             std::span<const VideoCommon::BufferImageCopy> copies) {
+    if (True(flags & ImageFlagBits::HostScaled)) {
+        // There is no guest-size copy: the guest bytes under this scratch target stay as they were.
+        return;
+    }
     boost::container::small_vector<VideoCommon::BufferImageCopy, 16> host_copies;
     if (HostMipLevels() < static_cast<u32>(info.resources.levels)) {
         VideoCommon::AppendHostMipEntries(
@@ -4275,6 +4334,10 @@ bool Image::ScaleUp(bool ignore) {
 bool Image::ScaleDown(bool ignore) {
     const auto& resolution = runtime->resolution;
     if (!resolution.active) {
+        return false;
+    }
+    if (True(flags & ImageFlagBits::HostScaled)) {
+        // There is no guest-size copy to fall back to.
         return false;
     }
     if (False(flags & ImageFlagBits::Rescaled)) {

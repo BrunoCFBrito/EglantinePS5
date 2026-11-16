@@ -61,6 +61,9 @@ enum class ImageFlagBits : u32 {
     /// device memory when the guest memory under it can hold data (Image::BindTiles), and only
     /// the parts written are uploaded.
     SparseTiles = 1 << 23,
+    /// The host image is allocated at the resolution-scaled size instead of the guest size; no
+    /// guest-size copy exists (PS5 large square depth targets). Never uploaded or downloaded.
+    HostScaled = 1 << 24,
 };
 DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
 

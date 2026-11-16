@@ -1378,8 +1378,12 @@ bool TextureCache<P>::RescaleRenderTargets() {
         // square, so it still scales.
         if (can_rescale && tmp_depth_image != CORRUPT_ID &&
             std::ranges::all_of(tmp_color_images, [](ImageId id) { return id == CORRUPT_ID; })) {
-            const Extent3D& size = slot_images[tmp_depth_image].info.size;
-            can_rescale = size.width != size.height;
+            const ImageBase& depth_image = slot_images[tmp_depth_image];
+            const Extent3D& size = depth_image.info.size;
+            // A host-scaled depth target has no guest-size allocation: its framebuffer and
+            // viewport must stay at the scaled size the image was made with.
+            can_rescale = size.width != size.height ||
+                          True(depth_image.flags & ImageFlagBits::HostScaled);
         }
 
         if (can_rescale) {
@@ -1615,6 +1619,10 @@ void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
 
 template <class P>
 bool TextureCache<P>::IsDownloadable(const ImageBase& image) const noexcept {
+    if (True(image.flags & ImageFlagBits::HostScaled)) {
+        // The guest-size image was never allocated for this scratch target.
+        return false;
+    }
     if (!image.IsSafeGpuCopy() || True(image.flags & (ImageFlagBits::Unbacked | ImageFlagBits::TrimmedLevels))) {
         return false;
     }
@@ -1863,6 +1871,12 @@ bool TextureCache<P>::BlitImage(const Tegra::Engines::Fermi2D::Surface& dst,
     }
     const auto result = GetBlitImages(dst, src, copy);
     if (!result) {
+        return false;
+    }
+    if (True(slot_images[result->dst_id].flags & ImageFlagBits::HostScaled) ||
+        True(slot_images[result->src_id].flags & ImageFlagBits::HostScaled)) {
+        // A host-scaled scratch target has no guest-size copy; reject the blit before it
+        // realizes a parked clear.
         return false;
     }
     runtime.FlushDeferredClear();
@@ -2519,6 +2533,12 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
     // Images uploaded by layer stay tracked while some of their layers are dirty.
     if (False(image.flags & ImageFlagBits::Tracked)) {
         TrackImage(image, image_id);
+    }
+
+    if (True(image.flags & ImageFlagBits::HostScaled)) {
+        // No guest-size allocation exists for this scratch target: the GPU fills it.
+        runtime.TransitionImageLayout(image);
+        return;
     }
 
     // Made where a dropped GPU-written image left stale bytes (MarkStale): nothing to upload.
@@ -3766,6 +3786,11 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             join_ignore_textures.insert(overlap_id);
             return;
         }
+        if (True(overlap.flags & ImageFlagBits::HostScaled)) {
+            // A host-scaled scratch target has no guest-size copy: never alias or copy it.
+            join_overlaps_found.insert(overlap_id);
+            return;
+        }
         const bool overlap_is_linear = overlap.info.type == ImageType::Linear;
         if (this_is_linear != overlap_is_linear) {
             return;
@@ -4909,6 +4934,10 @@ template <class P>
 void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
     boost::container::small_vector<const AliasedImage*, 8> aliased_images;
     Image& image = slot_images[image_id];
+    if (True(image.flags & ImageFlagBits::HostScaled)) {
+        image.newest_alias_tick = image.modification_tick;
+        return;
+    }
     // Nothing aliased was modified after this image: skip walking its (possibly long) alias list
     // for every draw that samples it (~7% of the GPU back thread in DK Bananza's open areas).
     if (image.newest_alias_tick <= image.modification_tick) {
@@ -4923,6 +4952,9 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
     for (const AliasedImage& aliased : image.aliased_images) {
         ImageBase& aliased_image = slot_images[aliased.id];
         if (image.modification_tick < aliased_image.modification_tick) {
+            if (True(aliased_image.flags & ImageFlagBits::HostScaled)) {
+                continue;
+            }
             most_recent_tick = (std::max)(most_recent_tick, aliased_image.modification_tick);
             aliased_images.push_back(&aliased);
             any_rescaled |= True(aliased_image.flags & ImageFlagBits::Rescaled);
@@ -5045,6 +5077,11 @@ void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<Imag
     Image& src = slot_images[src_id];
     if (True(dst.flags & ImageFlagBits::UnwrittenSparse) ||
         True(src.flags & ImageFlagBits::UnwrittenSparse)) {
+        return;
+    }
+    if (True(dst.flags & ImageFlagBits::HostScaled) ||
+        True(src.flags & ImageFlagBits::HostScaled)) {
+        // No guest-size copy to copy from or into.
         return;
     }
     if (dst.info.astc_opaque != src.info.astc_opaque) {
