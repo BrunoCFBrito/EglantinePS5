@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <tuple>
+#include <utility>
 #include <set>
 #include <span>
 #include <fstream>
@@ -365,10 +366,10 @@ void RasterizerVulkan::ReadMeshEmulationProbe() {
              probe.frame, probe.groups, triangles, degenerate, outside, bad_index, sample);
 }
 
-const RasterizerVulkan::MeshArena& RasterizerVulkan::AcquireMeshArena() {
+const RasterizerVulkan::MeshArena* RasterizerVulkan::AcquireMeshArena() {
     const u64 tick{scheduler.CurrentTick()};
     if (mesh_arena_current < mesh_arenas.size() && mesh_arenas[mesh_arena_current].tick == tick) {
-        return mesh_arenas[mesh_arena_current];
+        return &mesh_arenas[mesh_arena_current];
     }
     // A finished submission's counter holds the words its draws asked for, including those
     // that did not fit: grow later arenas to hold them.
@@ -394,38 +395,84 @@ const RasterizerVulkan::MeshArena& RasterizerVulkan::AcquireMeshArena() {
     });
     auto it{std::ranges::find_if(mesh_arenas, [](const MeshArena& arena) { return arena.counted; })};
     if (it == mesh_arenas.end()) {
-        const auto make_buffer = [&](u64 size, VkBufferUsageFlags usage, MemoryUsage memory) {
-            return memory_allocator.CreateBuffer(
-                VkBufferCreateInfo{
-                    .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-                    .pNext = nullptr,
-                    .flags = 0,
-                    .size = size,
-                    .usage = usage,
-                    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-                    .queueFamilyIndexCount = 0,
-                    .pQueueFamilyIndices = nullptr,
-                },
-                memory);
+        // This is a temporary the draw needs before it can be recorded: it must not end the
+        // process when the device is full. Try without throwing, release the staging buffers the
+        // GPU is done with, then wait for the GPU once and retry. The caller stages the draw on
+        // its own when this still fails.
+        const auto make_buffer = [&](u64 size, VkBufferUsageFlags usage,
+                                     MemoryUsage memory) -> vk::Buffer {
+            const VkBufferCreateInfo create_info{
+                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .size = size,
+                .usage = usage,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                .queueFamilyIndexCount = 0,
+                .pQueueFamilyIndices = nullptr,
+            };
+            vk::Buffer buffer{memory_allocator.TryCreateBuffer(create_info, memory)};
+            u64 released{};
+            // Only the scheduler's owner may wait for the GPU; another thread leaves the
+            // recovery to the owner and stages the draw instead.
+            if (!buffer && VideoCommon::GpuSplit::OwnsScheduler()) {
+                released = staging_pool.ReleaseCompleted().bytes;
+                buffer = memory_allocator.TryCreateBuffer(create_info, memory);
+                // Waiting for the GPU is the expensive part: task draws come in bursts, so a
+                // burst that keeps failing waits at most twice a second here. The per-draw
+                // staging fallback has its own release and wait.
+                const u64 now_ns{
+                    static_cast<u64>(std::chrono::steady_clock::now().time_since_epoch().count())};
+                if (!buffer && now_ns - mesh_arena_recovery_ns >= 500'000'000ULL) {
+                    mesh_arena_recovery_ns = now_ns;
+                    released += staging_pool.ReleaseMemory().bytes;
+                    buffer = memory_allocator.TryCreateBuffer(create_info, memory);
+                }
+            }
+            if (!buffer) {
+                static std::atomic<u32> logged{};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+                    std::fprintf(stderr,
+                                 "EDEN_COPY_OOM where=mesh_arena size=%lluMiB usage=%u "
+                                 "released=%lluMiB giving_up=1\n",
+                                 static_cast<unsigned long long>(size >> 20),
+                                 static_cast<u32>(memory),
+                                 static_cast<unsigned long long>(released >> 20));
+                }
+            } else if (released != 0) {
+                LOG_WARNING(Render_Vulkan,
+                            "Mesh emulation: released {} MiB of staging to make a {} MiB arena",
+                            released >> 20, size >> 20);
+            }
+            return buffer;
         };
-        it = mesh_arenas.insert(
-            mesh_arenas.end(),
-            MeshArena{
-                .buffer = make_buffer(mesh_arena_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                                      MemoryUsage::DeviceLocal),
-                .counter = make_buffer(sizeof(u32), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                                       MemoryUsage::Download),
-                .size = mesh_arena_size,
-            });
+        vk::Buffer arena_buffer{make_buffer(mesh_arena_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                            MemoryUsage::DeviceLocal)};
+        if (!arena_buffer) {
+            return nullptr;
+        }
+        vk::Buffer counter_buffer{make_buffer(sizeof(u32), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                              MemoryUsage::Download)};
+        if (!counter_buffer) {
+            return nullptr;
+        }
+        mesh_arenas.push_back(MeshArena{
+            .buffer = std::move(arena_buffer),
+            .counter = std::move(counter_buffer),
+            .size = mesh_arena_size,
+        });
+        it = mesh_arenas.end() - 1;
     }
     // The GPU is done with this arena, and this submission's commands have not been sent yet.
+    // A recovery above ended the previous tick and started a new one: the draws this arena is
+    // handed to are recorded in the current tick, not in the one this call started with.
     const u32 zero{};
     std::memcpy(it->counter.Mapped().data(), &zero, sizeof(zero));
     it->counter.Flush();
-    it->tick = tick;
+    it->tick = scheduler.CurrentTick();
     it->counted = false;
     mesh_arena_current = static_cast<size_t>(std::distance(mesh_arenas.begin(), it));
-    return *it;
+    return &*it;
 }
 
 RasterizerVulkan::MeshOutputAllocation RasterizerVulkan::AllocateMeshOutput(u64 bytes) {
@@ -1099,21 +1146,88 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         const u64 block_bytes{pipeline->MeshEmulationBlockBytes()};
         StagingBufferRef output{};
         u64 bytes{};
+        // The output arena and its counter this draw writes through: either the submission's
+        // arena, or, when the device has no room for one, a staging buffer of this draw's own.
+        VkBuffer arena_buffer{VK_NULL_HANDLE};
+        VkDeviceSize arena_offset{};
+        VkBuffer arena_counter{VK_NULL_HANDLE};
+        VkDeviceSize arena_counter_offset{};
         if (has_task) {
-            const MeshArena& arena{AcquireMeshArena()};
-            mesh_arena_used = true;
-            bytes = arena.size;
-            pipeline->SetMeshEmulationOutput(*arena.buffer, 0, bytes, groups);
+            const MeshArena* arena{AcquireMeshArena()};
+            if (arena != nullptr) {
+                mesh_arena_used = true;
+                arena_buffer = *arena->buffer;
+                bytes = arena->size;
+                arena_counter = *arena->counter;
+            } else {
+                // No room for an arena. Stage this draw's output on its own: the draw still
+                // completes, only the per-submission share of the arena is lost. The staging
+                // pool degrades before it fails, and a draw that cannot be staged is skipped.
+                try {
+                    const StagingBufferRef arena_output{
+                        staging_pool.Request(mesh_arena_size, MemoryUsage::DeviceLocal, true)};
+                    mesh_draw_buffers.push_back(arena_output);
+                    const StagingBufferRef counter{
+                        staging_pool.Request(sizeof(u32), MemoryUsage::Download, true)};
+                    mesh_draw_buffers.push_back(counter);
+                    if (counter.mapped_span.size() >= sizeof(u32)) {
+                        const u32 zero{};
+                        std::memcpy(counter.mapped_span.data(), &zero, sizeof(zero));
+                    }
+                    arena_buffer = arena_output.buffer;
+                    arena_offset = arena_output.offset;
+                    bytes = mesh_arena_size;
+                    arena_counter = counter.buffer;
+                    arena_counter_offset = counter.offset;
+                    static std::atomic<u32> logged{};
+                    if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+                        LOG_WARNING(Render_Vulkan,
+                                    "Mesh emulation arena out of memory; staging this draw's "
+                                    "{} MiB output",
+                                    bytes >> 20);
+                    }
+                } catch (const vk::Exception& error) {
+                    if (error.GetResult() != VK_ERROR_OUT_OF_DEVICE_MEMORY &&
+                        error.GetResult() != VK_ERROR_OUT_OF_HOST_MEMORY) {
+                        throw;
+                    }
+                    static std::atomic<u32> logged{};
+                    if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+                        std::fprintf(stderr,
+                                     "EDEN_COPY_OOM where=mesh_arena_fallback size=%lluMiB "
+                                     "giving_up=1\n",
+                                     static_cast<unsigned long long>(mesh_arena_size >> 20));
+                    }
+                    report_failure("mesh emulation out of memory");
+                    return;
+                }
+            }
+            pipeline->SetMeshEmulationOutput(arena_buffer, arena_offset, bytes, groups);
         } else {
             bytes = (std::max)(u64{groups} * block_bytes, u64{4});
-            if (probe_draw) {
-                output = staging_pool.Request(bytes, MemoryUsage::Download, true);
-                mesh_draw_buffers.push_back(output);
-                pipeline->SetMeshEmulationOutput(output.buffer, output.offset, bytes, groups);
-            } else {
-                const MeshOutputAllocation allocation{AllocateMeshOutput(bytes)};
-                pipeline->SetMeshEmulationOutput(allocation.buffer, allocation.offset,
-                                                 allocation.size, groups);
+            try {
+                if (probe_draw) {
+                    output = staging_pool.Request(bytes, MemoryUsage::Download, true);
+                    mesh_draw_buffers.push_back(output);
+                    pipeline->SetMeshEmulationOutput(output.buffer, output.offset, bytes, groups);
+                } else {
+                    const MeshOutputAllocation allocation{AllocateMeshOutput(bytes)};
+                    pipeline->SetMeshEmulationOutput(allocation.buffer, allocation.offset,
+                                                     allocation.size, groups);
+                }
+            } catch (const vk::Exception& error) {
+                if (error.GetResult() != VK_ERROR_OUT_OF_DEVICE_MEMORY &&
+                    error.GetResult() != VK_ERROR_OUT_OF_HOST_MEMORY) {
+                    throw;
+                }
+                static std::atomic<u32> logged{};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+                    std::fprintf(stderr,
+                                 "EDEN_COPY_OOM where=mesh_output size=%lluMiB giving_up=1\n",
+                                 static_cast<unsigned long long>(bytes >> 20));
+                }
+                report_failure("mesh emulation output out of memory");
+                return;
             }
         }
         mesh_emulation_indirect = {};
@@ -1132,21 +1246,46 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         if (has_task && groups != 0) {
             const bool task_probe{probe && !mesh_task_probe.pending &&
                                   render_trace_frame % 60 == 0};
-            const auto request = [&](u64 size, MemoryUsage usage = MemoryUsage::DeviceLocal) {
+            // The per-draw staging buffers are temporaries too: the staging pool releases and
+            // retries before it fails, and a draw that cannot be staged is skipped.
+            using MeshRequest =
+                std::optional<std::pair<GraphicsPipeline::MeshEmulationBuffer, std::span<u8>>>;
+            const auto request = [&](u64 size,
+                                     MemoryUsage usage = MemoryUsage::DeviceLocal) -> MeshRequest {
                 size = (std::max)(size, u64{16});
-                const StagingBufferRef ref{staging_pool.Request(size, usage, true)};
-                mesh_draw_buffers.push_back(ref);
-                return std::make_pair(GraphicsPipeline::MeshEmulationBuffer{ref.buffer, ref.offset,
-                                                                            size},
-                                      ref.mapped_span.subspan(
-                                          (std::min)(ref.offset, u64{ref.mapped_span.size()})));
+                try {
+                    const StagingBufferRef ref{staging_pool.Request(size, usage, true)};
+                    mesh_draw_buffers.push_back(ref);
+                    return std::make_pair(
+                        GraphicsPipeline::MeshEmulationBuffer{ref.buffer, ref.offset, size},
+                        ref.mapped_span.subspan(
+                            (std::min)(ref.offset, u64{ref.mapped_span.size()})));
+                } catch (const vk::Exception& error) {
+                    if (error.GetResult() != VK_ERROR_OUT_OF_DEVICE_MEMORY &&
+                        error.GetResult() != VK_ERROR_OUT_OF_HOST_MEMORY) {
+                        throw;
+                    }
+                    return std::nullopt;
+                }
             };
-            const auto payload{
-                request(u64{groups} * pipeline->MeshEmulationPayloadStride() * 4).first};
-            const auto offsets{request(u64{groups} * 4).first};
+            const auto payload_request{
+                request(u64{groups} * pipeline->MeshEmulationPayloadStride() * 4)};
+            const auto offsets_request{request(u64{groups} * 4)};
             constexpr u64 args_bytes{Shader::Backend::SPIRV::MESH_EMULATION_ARGS_WORDS * 4};
-            const auto [args, args_span] =
-                request(args_bytes, task_probe ? MemoryUsage::Download : MemoryUsage::DeviceLocal);
+            const auto args_request{
+                request(args_bytes, task_probe ? MemoryUsage::Download : MemoryUsage::DeviceLocal)};
+            if (!payload_request || !offsets_request || !args_request) {
+                static std::atomic<u32> logged{};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+                    std::fprintf(stderr, "EDEN_COPY_OOM where=mesh_task_buffers giving_up=1\n");
+                }
+                report_failure("mesh emulation task buffers out of memory");
+                return;
+            }
+            const auto& payload{payload_request->first};
+            const auto& offsets{offsets_request->first};
+            const auto& args{args_request->first};
+            const std::span<u8> args_span{args_request->second};
             const u32 capacity_words{static_cast<u32>(
                 (std::min)(bytes / 4, u64{(std::numeric_limits<u32>::max)()}))};
             if (task_probe && args_span.size() >= args_bytes) {
@@ -1158,9 +1297,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
                     .pending = true,
                 };
             }
-            const MeshArena& arena{mesh_arenas[mesh_arena_current]};
             pipeline->SetMeshEmulationTaskBuffers(
-                payload, offsets, args, {*arena.counter, 0, sizeof(u32)}, capacity_words);
+                payload, offsets, args, {arena_counter, arena_counter_offset, sizeof(u32)},
+                capacity_words);
             mesh_emulation_indirect = {args.buffer, args.offset};
         }
         if (probe_draw && output.mapped_span.size() >= output.offset + bytes) {
@@ -1899,7 +2038,7 @@ void RasterizerVulkan::CaptureIndirectTrace() {
         return;
     }
     if (!slot->readback) {
-        slot->readback = memory_allocator.CreateBuffer(
+        slot->readback = memory_allocator.TryCreateBuffer(
             VkBufferCreateInfo{
                 .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
                 .size = 68,
@@ -1907,6 +2046,14 @@ void RasterizerVulkan::CaptureIndirectTrace() {
                 .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
             },
             MemoryUsage::Download);
+        if (!slot->readback) {
+            // Indirect tracing is diagnostics: drop the capture, do not end the draw over it.
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+                std::fprintf(stderr, "EDEN_COPY_OOM where=indirect_trace giving_up=1\n");
+            }
+            return;
+        }
     }
     slot->frame = trace_frame;
     slot->address = params.indirect_start_address;

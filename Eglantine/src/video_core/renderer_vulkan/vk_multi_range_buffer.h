@@ -20,6 +20,7 @@ using SparseBuffer = vk::Handle<VkBuffer, VkDevice, vk::DeviceDispatch>;
 
 class Device;
 class Scheduler;
+class StagingBufferPool;
 
 struct MultiRangeSource {
     VkBuffer handle{};
@@ -49,6 +50,7 @@ public:
     YUZU_NON_COPYABLE(MultiRangeBufferCache);
 
     [[nodiscard]] MultiRangeRef Get(const Device& device, Scheduler& scheduler,
+                                    StagingBufferPool& staging_pool,
                                     MemoryAllocator& memory_allocator, u64 key,
                                     std::span<const MultiRangeSource> sources,
                                     VkDeviceSize total);

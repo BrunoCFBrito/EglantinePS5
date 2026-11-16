@@ -9,7 +9,9 @@ root = Path(__file__).resolve().parents[1]
 cache = Path((root / '.local/headless-cache').read_text().strip())
 source = eglantine_source('src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp')
 start = source.index('StagingReleased StagingBufferPool::ReleaseCompleted() {')
-end = source.index('\nvoid StagingBufferPool::TickFrame()', start)
+# The body ends at the next pool member: ReleaseMemory when present, else TickFrame.
+end = min(i for i in (source.find('\nStagingReleased StagingBufferPool::ReleaseMemory()', start),
+                      source.find('\nvoid StagingBufferPool::TickFrame()', start)) if i != -1)
 body = source[start:end]
 code = r'''
 #include <array>

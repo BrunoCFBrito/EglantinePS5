@@ -383,12 +383,15 @@ private:
     std::vector<MeshArena> mesh_arenas;
     size_t mesh_arena_current{~size_t{}};
     u64 mesh_arena_size{64ULL << 20};
-    /// The current submission's arena, after its counter is reset.
-    const MeshArena& AcquireMeshArena();
+    /// When the arena's staging recovery last waited for the GPU, so a draw storm does not.
+    u64 mesh_arena_recovery_ns{};
+    /// The current submission's arena, after its counter is reset. Null when the device is out
+    /// of memory for one: the draw then stages its output itself, or is skipped when that fails.
+    const MeshArena* AcquireMeshArena();
 
     /// Mesh-emulation staging buffers stay reserved until the draw's commands have been recorded.
     /// Configure may submit before it records the dispatch that uses them.
-    boost::container::static_vector<StagingBufferRef, 4> mesh_draw_buffers;
+    boost::container::static_vector<StagingBufferRef, 8> mesh_draw_buffers;
     bool mesh_arena_used{};
 
     /// Mesh-only emulation knows its output size on the CPU. Suballocate those outputs from one

@@ -64,6 +64,10 @@ public:
     /// Lets go of every kept buffer the GPU is done with, and returns what went.
     StagingReleased ReleaseCompleted();
 
+    /// Out of device memory: waits for the GPU, then frees every staging buffer it is done with
+    /// except those handed out since the last submit. Returns what went.
+    StagingReleased ReleaseMemory();
+
     /// Bytes of the cached staging buffers of a kind, idle or in use (EDEN_NX2_MEM_TRACE).
     [[nodiscard]] u64 CachedBytes(MemoryUsage usage);
 

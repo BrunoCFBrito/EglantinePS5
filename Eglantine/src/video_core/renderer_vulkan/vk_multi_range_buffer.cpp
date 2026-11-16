@@ -3,14 +3,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include "dev_vulkan.h"
 #include "diagnostics.h"
 #include <mutex>
 #include <utility>
 
+#include "video_core/gpu_split.h"
 #include "video_core/renderer_vulkan/vk_multi_range_buffer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 
 namespace Vulkan {
@@ -225,6 +228,7 @@ void MultiRangeBufferCache::TickFrame(Scheduler& scheduler) {
 }
 
 MultiRangeRef MultiRangeBufferCache::Get(const Device& device, Scheduler& scheduler,
+                                         StagingBufferPool& staging_pool,
                                          MemoryAllocator& memory_allocator, u64 key,
                                          std::span<const MultiRangeSource> sources,
                                          VkDeviceSize total) {
@@ -290,7 +294,29 @@ MultiRangeRef MultiRangeBufferCache::Get(const Device& device, Scheduler& schedu
             .queueFamilyIndexCount = 0,
             .pQueueFamilyIndices = nullptr,
         };
-        entry.gathered = memory_allocator.CreateBuffer(gather_ci, MemoryUsage::DeviceLocal);
+        // A gather buffer is a temporary the draw needs before it can be recorded: on a full
+        // device, release the staging buffers the GPU is done with and wait for it once, then
+        // retry. Without one the binding falls back to its single buffer instead.
+        entry.gathered = memory_allocator.TryCreateBuffer(gather_ci, MemoryUsage::DeviceLocal);
+        if (!entry.gathered && VideoCommon::GpuSplit::OwnsScheduler()) {
+            staging_pool.ReleaseCompleted();
+            entry.gathered = memory_allocator.TryCreateBuffer(gather_ci, MemoryUsage::DeviceLocal);
+            if (!entry.gathered) {
+                staging_pool.ReleaseMemory();
+                DrainRetired(scheduler);
+                entry.gathered =
+                    memory_allocator.TryCreateBuffer(gather_ci, MemoryUsage::DeviceLocal);
+            }
+        }
+        if (!entry.gathered) {
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+                std::fprintf(stderr,
+                             "EDEN_COPY_OOM where=multi_range size=%lluMiB giving_up=1\n",
+                             static_cast<unsigned long long>(total >> 20));
+            }
+            return MultiRangeRef{};
+        }
         entry.dirty = true;
     }
     if (device.IsBufferDeviceAddressSupported()) {

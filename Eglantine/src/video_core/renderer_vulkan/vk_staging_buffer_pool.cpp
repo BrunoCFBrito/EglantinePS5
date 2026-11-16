@@ -230,6 +230,31 @@ StagingReleased StagingBufferPool::ReleaseCompleted() {
     return released;
 }
 
+StagingReleased StagingBufferPool::ReleaseMemory() {
+    // Waits for the GPU so the buffers it was still reading are idle too. Those handed out in
+    // the current tick may feed commands not recorded yet (the caller's input while it asks for
+    // its output): they move to the tick after Finish, so they are neither freed nor handed out
+    // again.
+    const u64 current_tick = scheduler.CurrentTick();
+    scheduler.Finish();
+    const u64 next_tick = scheduler.CurrentTick();
+    for (StagingBuffersCache* const cache : {&device_local_cache, &upload_cache, &download_cache}) {
+        for (StagingBuffers& staging : *cache) {
+            for (StagingBuffer& entry : staging.entries) {
+                if (!entry.deferred && entry.tick >= current_tick) {
+                    entry.tick = next_tick;
+                }
+            }
+        }
+    }
+    for (u64& sync_tick : sync_ticks) {
+        if (sync_tick >= current_tick) {
+            sync_tick = next_tick;
+        }
+    }
+    return ReleaseIdleBuffers();
+}
+
 void StagingBufferPool::TickFrame() {
     current_delete_level = (current_delete_level + 1) % NUM_LEVELS;
 

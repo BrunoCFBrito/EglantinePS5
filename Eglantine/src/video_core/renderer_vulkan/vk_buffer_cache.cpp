@@ -728,8 +728,9 @@ bool BufferCacheRuntime::BindMultiRangeStorageBuffer(u64 key, bool is_written) {
     if (multi_range_sources.empty() || multi_range_total == 0) {
         return false;
     }
-    const MultiRangeRef ref = multi_range_buffers.Get(device, scheduler, memory_allocator, key,
-                                                     multi_range_sources, multi_range_total);
+    const MultiRangeRef ref = multi_range_buffers.Get(device, scheduler, staging_pool,
+                                                      memory_allocator, key, multi_range_sources,
+                                                      multi_range_total);
     if (ref.handle == VK_NULL_HANDLE) {
         return false;
     }
