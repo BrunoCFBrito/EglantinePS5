@@ -179,6 +179,17 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 logged_critical_memory{}; ///< The critical threshold of the last thresholds line logged
     u32 seen_pressure_events{};   ///< Allocator pressure events already answered
     u32 seen_failed_images{};     ///< Images the allocator could not make, already collected for
+    /// Emergency collection while the shared pool is critical (EmergencyTextureCollection): the
+    /// state of the current run and the churn counters its hysteresis compares.
+    bool emergency_running{};      ///< An emergency run is in progress
+    u64 emergency_off_until{};     ///< Frame until which emergency collection stays off
+    u64 emergency_check_frame{};   ///< Frame of the last churn check
+    u64 emergency_check_usage{};   ///< The cache's usage at that check
+    u64 emergency_deletes{};       ///< Collector deletes since it
+    u64 emergency_created{};       ///< Images created since it
+    u64 emergency_last_deletes{};  ///< The counters at the previous frame (for the deltas)
+    u64 emergency_last_created{};
+    u64 emergency_log_frame{};     ///< Frame of the last EDEN_TC_EMERGENCY line (60-frame limit)
     bool reclaim_requested{};     ///< The staging pool was refused: collect aggressively next frame
     bool reclaiming{};            ///< ReclaimMemory is running; a nested allocation must not re-enter
     u64 pressure_margin{};        ///< Extra room under the budget after images did not fit
@@ -508,6 +519,10 @@ private:
 
     /// Runs the Garbage Collector.
     void RunGarbageCollector(bool out_of_memory);
+
+    /// Whether the emergency collection is on this pass: the shared pool is critical and the last
+    /// run did not turn into eviction churn. Logs the state changes as EDEN_TC_EMERGENCY.
+    bool EmergencyTextureCollection(u64 usage, u64 expected, u64 critical);
 
     /// Deletes images whose memory went entirely to newer images (see ClassifySuperseded).
     void DeleteSupersededImages();

@@ -208,6 +208,101 @@ void TextureCache<P>::DeleteSupersededImages() {
 }
 
 template <class P>
+bool TextureCache<P>::EmergencyTextureCollection(u64 usage, u64 expected, u64 critical) {
+    // Texture cache emergency mode (guest-growth-ours.md 7.3): while the console's shared pool is
+    // critical, the guest, Eden's heap and the driver are together nearly out of it, so the
+    // aggressive pass starts at the cache's first mark instead of its critical one, and costly
+    // images (converted ASTC) go after 120 frames instead of 300 (RunGarbageCollector). The pool
+    // can be critical while this cache sits under its own marks: Ocarina of Time's crash run held
+    // 1,394 MiB of images under a 1,700 MiB mark with 1 MiB free in the pool, and the converted
+    // ASTC of the area it was loading was never touched.
+    //
+    // Hysteresis (#739): when the live set is larger than the lowered mark, the pass only deletes
+    // images the game makes again at once. After 120 frames in emergency it looks at what the run
+    // did: if the collector deleted at least 4 images a frame and at least half of everything the
+    // cache created, while the usage did not fall by 64 MiB, the evictions only feed re-creations,
+    // so emergency goes off for 1800 frames (30 s at 60 fps) and the ordinary marks collect.
+    // EDEN_NX2_TC_EMERGENCY=0 turns the whole mode off.
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_TC_EMERGENCY");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (!enabled) {
+        return false;
+    }
+    // At most one line a second (60 frames): the pool's free block can cross its critical mark
+    // back and forth, and a line per frame would drown the log.
+    const auto Log = [this](const char* state, u64 usage, u64 expected, u64 critical, u64 deletes,
+                            u64 created, u64 frames) {
+        if (emergency_log_frame != 0 && frame_tick < emergency_log_frame + 60) {
+            return;
+        }
+        emergency_log_frame = (std::max)(frame_tick, u64{1});
+        std::fprintf(stderr,
+                     "EDEN_TC_EMERGENCY %s: usage %llu MiB, expected %llu MiB, critical %llu MiB; "
+                     "%llu collector deletes, %llu creations in %llu frames\n",
+                     state, static_cast<unsigned long long>(usage >> 20),
+                     static_cast<unsigned long long>(expected >> 20),
+                     static_cast<unsigned long long>(critical >> 20),
+                     static_cast<unsigned long long>(deletes),
+                     static_cast<unsigned long long>(created),
+                     static_cast<unsigned long long>(frames));
+    };
+    const u64 deletes = gc_deletes + gc_costly_deletes;
+    const u64 created = images_created;
+    // The statistics counters reset every 600 frames (EDEN_NX2_TC_LOG): count deltas, and count
+    // nothing where a reset shows as a smaller counter.
+    const u64 new_deletes =
+        deletes >= emergency_last_deletes ? deletes - emergency_last_deletes : 0;
+    const u64 new_created =
+        created >= emergency_last_created ? created - emergency_last_created : 0;
+    emergency_last_deletes = deletes;
+    emergency_last_created = created;
+    if (!Eden::Performance::GraphicsMemoryIsCritical()) {
+        if (emergency_running) {
+            Log("off (pool no longer critical)", usage, expected, critical, emergency_deletes,
+                emergency_created, frame_tick - emergency_check_frame);
+            emergency_running = false;
+        }
+        emergency_check_frame = 0;
+        emergency_deletes = emergency_created = 0;
+        return false;
+    }
+    if (frame_tick < emergency_off_until) {
+        return false;
+    }
+    if (!emergency_running) {
+        emergency_running = true;
+        emergency_check_frame = frame_tick;
+        emergency_check_usage = usage;
+        emergency_deletes = emergency_created = 0;
+        Log("on (pool critical)", usage, expected, critical, 0, 0, 0);
+        return true;
+    }
+    emergency_deletes += new_deletes;
+    emergency_created += new_created;
+    if (frame_tick >= emergency_check_frame + 120) {
+        const u64 frames = frame_tick - emergency_check_frame;
+        const bool churn = emergency_deletes >= frames * 4 &&
+                           emergency_deletes * 2 >= emergency_created;
+        // No progress: the usage did not fall by 64 MiB since the last check.
+        if (churn && usage + 64_MiB >= emergency_check_usage) {
+            emergency_off_until = frame_tick + 1800;
+            Log("off for 1800 frames, the evictions only feed re-creations", usage, expected,
+                critical, emergency_deletes, emergency_created, frames);
+            emergency_running = false;
+            emergency_check_frame = 0;
+            emergency_deletes = emergency_created = 0;
+            return false;
+        }
+        emergency_check_frame = frame_tick;
+        emergency_check_usage = usage;
+        emergency_deletes = emergency_created = 0;
+    }
+    return true;
+}
+
+template <class P>
 void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
     const StutterTrace::SiteScope site{StutterTrace::Site::TextureCollect};
     bool high_priority_mode = false;
@@ -234,6 +329,14 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
     };
     const u64 active_expected = own_marks ? own_expected_memory : expected_memory;
     const u64 active_critical = own_marks ? own_critical_memory : critical_memory;
+    // Emergency mode while the shared pool is critical: the aggressive pass starts at the cache's
+    // first mark, so the images of an area load the ordinary marks leave in place can go. It backs
+    // off when the deletions only feed re-creations (EmergencyTextureCollection).
+    const bool emergency_mode =
+        EmergencyTextureCollection(ActiveUsage(), active_expected, active_critical);
+    const u64 collect_critical = emergency_mode && active_expected != 0
+                                     ? (std::min)(active_critical, active_expected)
+                                     : active_critical;
     // The pool is short while the cache's own bytes are under their mark: keep taking images
     // nothing has used for a while, but not the game's live set (freeing that only clears room
     // for the next frame's allocations and it is uploaded again, which is the #739 thrash).
@@ -241,7 +344,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
     const auto Configure = [&](bool allow_aggressive) {
         high_priority_mode = out_of_memory || pool_short || ActiveUsage() >= active_expected;
         aggressive_mode =
-            allow_aggressive && (out_of_memory || ActiveUsage() >= active_critical);
+            allow_aggressive && (out_of_memory || ActiveUsage() >= collect_critical);
         ticks_to_destroy = aggressive_mode ? 10ULL : high_priority_mode ? 25ULL : 50ULL;
         // EDEN_NX2_TC_MIN_AGE=<frames>: never evict images used more recently (thrash tests).
         static const u64 min_age = [] {
@@ -256,8 +359,8 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         // replaces an older one (bad overlaps). The cache grew ~15 images a frame, 4 GiB in two
         // seconds, until the device heap was full and the driver crashed on the next image.
         // So delete more the further past it, and sooner after an image's last use.
-        if (aggressive_mode && ActiveUsage() > active_critical) {
-            const u64 over = ActiveUsage() - active_critical;
+        if (aggressive_mode && ActiveUsage() > collect_critical) {
+            const u64 over = ActiveUsage() - collect_critical;
             num_iterations += static_cast<size_t>((std::min)(over / 2_MiB, u64{1024}));
             if (over >= 1_GiB) {
                 ticks_to_destroy = (std::max)(min_age, u64{3});
@@ -408,7 +511,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
     };
     const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode, &CanEvict,
                           out_of_memory, &QueueWriteBack, &IsPending, &RemoveImage,
-                          &ActiveUsage, active_expected, active_critical](ImageId image_id) {
+                          &ActiveUsage, active_expected, collect_critical](ImageId image_id) {
         if (num_iterations == 0) {
             return true;
         }
@@ -427,7 +530,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         if (out_of_memory) {
             return false;
         }
-        if (aggressive_mode && ActiveUsage() < active_critical) {
+        if (aggressive_mode && ActiveUsage() < collect_critical) {
             num_iterations >>= 2;
             aggressive_mode = false;
         } else if (high_priority_mode && ActiveUsage() < active_expected) {
@@ -504,11 +607,15 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
     // take the images the frame's draws have not used for a few seconds, not the 30 s the
     // default keeps. Ocarina of Time's area loads spend ~1.1 GB of that pool in ten seconds
     // while its converted ASTC images (0.6-0.7 GB) sit under the cache's own critical mark,
-    // where the 1800-frame age means the collector never touches them. EDEN_NX2_TC_OLD_AGE
-    // still sets the age, and 0 still turns the pass off.
-    const u64 costly_age = Eden::Performance::GraphicsMemoryIsCritical()
-                               ? (std::min)(old_age, u64{300})
-                               : old_age;
+    // where the 1800-frame age means the collector never touches them. In emergency mode the age
+    // is 120 frames, so the first marks reach them; backed off for churn, it is the 300 frames
+    // this pass always used while critical. EDEN_NX2_TC_OLD_AGE still sets the age, and 0 still
+    // turns the pass off.
+    const u64 costly_age = emergency_mode
+                               ? (std::min)(old_age, u64{120})
+                               : Eden::Performance::GraphicsMemoryIsCritical()
+                                     ? (std::min)(old_age, u64{300})
+                                     : old_age;
     if (high_priority_mode && costly_age != 0 && frame_tick > costly_age) {
         evict_old_costly = true;
         Collect(costly_age);
@@ -516,9 +623,10 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
     }
     Collect();
     // A hard pass only when the marks the collector follows say so: on the PS5 the pool being
-    // short keeps high priority on, but it is not a reason to evict the live set again.
-    const bool over_mark = own_marks ? ActiveUsage() >= active_critical
-                                     : total_used_memory >= critical_memory;
+    // short keeps high priority on, but it is not a reason to evict the live set again. In
+    // emergency mode the mark it says so at is the cache's first one.
+    const bool over_mark = own_marks ? ActiveUsage() >= collect_critical
+                                     : total_used_memory >= collect_critical;
     if (out_of_memory || over_mark) {
         Configure(true);
         Collect();
