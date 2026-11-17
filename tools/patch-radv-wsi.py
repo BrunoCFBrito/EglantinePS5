@@ -15,15 +15,98 @@ def replace(old, new):
     text = text.replace(old, new)
 
 replace('   bool opened;\n', '   unsigned owners;\n   bool closing, stop;\n   bool opened;\n')
-# A set of framebuffers per output size: each remembers the memory to give back.
+# A set registers the number of buffers its swapchain uses, not the five a
+# swapchain may ask for: Eden asks for three, so two 32 MiB framebuffers a size
+# stay in the pool the guest shares (64 MiB at 4K, 20 MiB at 1080p).
+replace('/* Buffers in each size\'s set. */\n#define VIDEOOUT_BUFFERS 5',
+        '/* The most buffers a swapchain may ask for; a set registers the count its own\n'
+        ' * swapchain uses (Eden asks for three), so VideoOut holds only those. */\n#define VIDEOOUT_BUFFERS 5')
+replace(''' * names the buffer of whichever set it is in. Three sets use buffers 0-14:
+ * VideoOut refused a fourth set's buffers 15-19 (0x80290001), and presents
+ * after that refusal flickered, so no size is added without making room. A swapchain takes the first of''',
+        ''' * names the buffer of whichever set it is in. A set registers only the
+ * buffers its swapchain uses and the next set starts after them, so the three
+ * sizes use buffers 0-8: VideoOut refused a fourth set at buffers 15-19
+ * (0x80290001), and presents after that refusal flickered, so no size is added
+ * without making room. A swapchain takes the first of''')
+# A set of framebuffers per output size: each remembers the memory to give back,
+# and the buffer indices it was registered as.
+replace('''   /* A set of buffers for each size a swapchain has used, in the order they
+    * were registered; set i's buffers are indices i * VIDEOOUT_BUFFERS on. */''',
+        '''   /* A set of buffers for each size a swapchain has used, in the order they
+    * were registered; a set's buffers are the indices first .. first + count - 1. */''')
 replace('      uint8_t *buffers;\n   } sets[VIDEOOUT_SIZES];',
-        '      uint8_t *buffers;\n      int64_t physical;\n      size_t bytes;\n   } sets[VIDEOOUT_SIZES];')
+        '      uint8_t *buffers;\n      int64_t physical;\n      size_t bytes;\n'
+        '      /* The buffer indices the set\'s count buffers are registered as. */\n'
+        '      uint32_t first, count;\n   } sets[VIDEOOUT_SIZES];')
+replace('   uint32_t set_count;\n',
+        '   uint32_t set_count;\n   /* The first VideoOut buffer index no set uses. */\n   uint32_t next_buffer;\n')
 replace('static int\nsceVideoOutSetFlipRate', 'static int\nsceVideoOutClose(int32_t handle)\n{\n   return 0;\n}\n\nstatic int\nsceVideoOutSetFlipRate')
 replace('   uint8_t *buffers = NULL;\n#if defined(__PROSPERO__)\n   int64_t physical = -1;',
         '   uint8_t *buffers = NULL;\n   int64_t physical = -1;\n#if defined(__PROSPERO__)')
-replace('   out->sets[index] = (struct wsi_videoout_set){.size = size, .buffers = buffers};',
-        '   out->sets[index] = (struct wsi_videoout_set){.size = size, .buffers = buffers, .physical = physical,\n'
-        '                                                .bytes = bytes};')
+# A set is registered with the number of buffers its swapchain uses; a later
+# swapchain of the same size that wants more is refused rather than handed
+# indices VideoOut does not know.
+replace('''static VkResult
+videoout_register_locked(const struct wsi_videoout_size *size, const struct wsi_videoout_set **set_out)
+{
+   struct wsi_videoout_output *out = &videoout_output;
+   for (uint32_t i = 0; i < out->set_count; i++) {
+      if (out->sets[i].size == size) {
+         *set_out = &out->sets[i];
+         return VK_SUCCESS;
+      }
+   }
+   if (!videoout_open_locked())
+      return VK_ERROR_INITIALIZATION_FAILED;
+
+   const uint32_t index = out->set_count;
+   const size_t bytes = VIDEOOUT_BUFFERS * size->buffer_bytes;''',
+        '''static VkResult
+videoout_register_locked(const struct wsi_videoout_size *size, uint32_t buffer_count,
+                         const struct wsi_videoout_set **set_out)
+{
+   struct wsi_videoout_output *out = &videoout_output;
+   for (uint32_t i = 0; i < out->set_count; i++) {
+      if (out->sets[i].size == size) {
+         /* A set keeps the buffers of the count it was registered with. */
+         if (buffer_count > out->sets[i].count) {
+            fprintf(stderr, "wsi/videoout: the %ux%u set has %u buffers; a swapchain asking for %u is refused\\n",
+                    size->extent.width, size->extent.height, out->sets[i].count, buffer_count);
+            return VK_ERROR_INITIALIZATION_FAILED;
+         }
+         *set_out = &out->sets[i];
+         return VK_SUCCESS;
+      }
+   }
+   if (!videoout_open_locked())
+      return VK_ERROR_INITIALIZATION_FAILED;
+   if (out->next_buffer + buffer_count > ARRAY_SIZE(out->buffer)) {
+      fprintf(stderr, "wsi/videoout: no VideoOut buffer index left for a set of %u\\n", buffer_count);
+      return VK_ERROR_INITIALIZATION_FAILED;
+   }
+
+   const uint32_t index = out->set_count;
+   const uint32_t first = out->next_buffer;
+   const size_t bytes = buffer_count * size->buffer_bytes;''')
+replace('''   struct ps5_video_out_buffer registered[VIDEOOUT_BUFFERS];
+   for (uint32_t i = 0; i < VIDEOOUT_BUFFERS; i++)''',
+        '''   struct ps5_video_out_buffer registered[VIDEOOUT_BUFFERS];
+   for (uint32_t i = 0; i < buffer_count; i++)''')
+replace('''      result = sceVideoOutRegisterBuffers2(out->handle, (int32_t)index, (int32_t)(index * VIDEOOUT_BUFFERS),
+                                           registered, VIDEOOUT_BUFFERS, attribute, 0, NULL);''',
+        '''      result = sceVideoOutRegisterBuffers2(out->handle, (int32_t)index, (int32_t)first, registered,
+                                           (int32_t)buffer_count, attribute, 0, NULL);''')
+replace('''   fprintf(stderr, "wsi/videoout: %ux%u framebuffers registered as set %u, buffers %u-%u\\n", size->extent.width,
+           size->extent.height, index, index * VIDEOOUT_BUFFERS, index * VIDEOOUT_BUFFERS + VIDEOOUT_BUFFERS - 1);
+   out->sets[index] = (struct wsi_videoout_set){.size = size, .buffers = buffers};
+   out->set_count = index + 1;''',
+        '''   fprintf(stderr, "wsi/videoout: %ux%u framebuffers registered as set %u, buffers %u-%u\\n",
+           size->extent.width, size->extent.height, index, first, first + buffer_count - 1);
+   out->sets[index] = (struct wsi_videoout_set){.size = size, .buffers = buffers, .physical = physical,
+                                                .bytes = bytes, .first = first, .count = buffer_count};
+   out->set_count = index + 1;
+   out->next_buffer = first + buffer_count;''')
 replace('      while (out->queue_count == 0)\n         cnd_wait(&out->changed, &out->lock);',
         '      while (out->queue_count == 0 && !out->stop)\n         cnd_wait(&out->changed, &out->lock);\n      if (out->queue_count == 0 && out->stop) {\n         mtx_unlock(&out->lock);\n         return 0;\n      }')
 replace('VkResult\nwsi_display_init_wsi',
@@ -53,6 +136,36 @@ replace('''                    (double)period / 1e6);
             fprintf(stderr, "wsi/videoout: 119.88 Hz output, a vblank every %.3f ms\\n", (double)period / 1e6);
          }
       } else {''')
+# The swapchain's image count is known before the set is registered, so the set
+# gets exactly that many VideoOut buffers. chain->first is the set's own first
+# buffer index, and the on-screen scan covers every registered slot.
+replace('''   const struct wsi_videoout_set *set = NULL;
+   mtx_lock(&out->lock);
+   VkResult result = videoout_register_locked(mode->size, &set);
+   if (result == VK_SUCCESS && out->current && out->current != (struct wsi_videoout_swapchain *)
+                                                 wsi_swapchain_from_handle(pCreateInfo->oldSwapchain))
+      result = VK_ERROR_NATIVE_WINDOW_IN_USE_KHR;
+   mtx_unlock(&out->lock);
+   if (result != VK_SUCCESS)
+      return result;
+
+   const uint32_t num_images = MAX2(pCreateInfo->minImageCount, 3);''',
+        '''   /* The images the swapchain will have, and so the buffers the set registers: Eden asks
+    * for minImageCount + 1 (three), and two of the five 32 MiB framebuffers a size stay in
+    * the pool the guest shares. */
+   const uint32_t num_images = MAX2(pCreateInfo->minImageCount, 3);
+   const struct wsi_videoout_set *set = NULL;
+   mtx_lock(&out->lock);
+   VkResult result = videoout_register_locked(mode->size, num_images, &set);
+   if (result == VK_SUCCESS && out->current && out->current != (struct wsi_videoout_swapchain *)
+                                                 wsi_swapchain_from_handle(pCreateInfo->oldSwapchain))
+      result = VK_ERROR_NATIVE_WINDOW_IN_USE_KHR;
+   mtx_unlock(&out->lock);
+   if (result != VK_SUCCESS)
+      return result;''')
+replace('   chain->first = (uint32_t)(set - out->sets) * VIDEOOUT_BUFFERS;', '   chain->first = set->first;')
+replace('   for (uint32_t i = 0; i < out->set_count * VIDEOOUT_BUFFERS; i++)',
+        '   for (uint32_t i = 0; i < ARRAY_SIZE(out->buffer); i++)')
 replace('   wsi->base.get_support =', '   videoout_ref();\n\n   wsi->base.get_support =')
 replace('   if (wsi)\n      vk_free(alloc, wsi);',
         '   if (wsi) {\n      videoout_unref();\n      vk_free(alloc, wsi);\n      wsi_device->wsi[VK_ICD_WSI_PLATFORM_DISPLAY] = NULL;\n   }')

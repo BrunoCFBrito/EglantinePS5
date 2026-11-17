@@ -61,6 +61,7 @@ videoout_unref(void)
       }
       memset(out->sets, 0, sizeof(out->sets));
       out->set_count = 0;
+      out->next_buffer = 0;
       out->handle = -1;
       out->opened = false;
       out->high_frame_rate = false;
