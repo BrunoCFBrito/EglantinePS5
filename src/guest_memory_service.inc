@@ -414,19 +414,34 @@ bool ZstdUnpack(const void* from, std::size_t bytes, void* to) noexcept {
 }
 #endif
 
-// The packed store: packed data lives in 2 MiB blocks of direct memory of its own, filled one after
-// another, outside Eden's heap. Packing then takes no heap memory, so it can run where the heap
-// itself found no memory (eden_memory_recover_try), and leaves no slack in the heap. A block whose
-// data all went back is given back by the scanner (StoreReclaim). When the pool has no block for
-// it, the slot being packed gives its own. Taken and filled under pack_mutex; StoreRelease (the
-// fault handler) only counts.
+// The packed store: packed data lives in 2 MiB blocks of direct memory of its own, outside Eden's
+// heap. Packing then takes no heap memory, so it can run where the heap itself found no memory
+// (eden_memory_recover_try), and leaves no slack in the heap. A block is cut into 64 KiB units and
+// a new pack takes the first run of free units that fits in any block already mapped, so the hole
+// an unpacked slot leaves is filled by the next pack instead of a new block being taken: at the
+// 2026-11-17 crash the store held 2,296 MiB for 1,483 MiB of data because it only ever appended.
+// A block whose data all went back is given back by the scanner (StoreReclaim), and a nearly empty
+// one is emptied into the others while the pool is short (StoreCompact). When the pool has no
+// block for the store, the slot being packed gives its own. Placement runs under pack_mutex;
+// StoreRelease (the fault handler) only takes the unit lock.
 constexpr std::size_t StoreBlock = SparseSlot, StoreBlocks = 2048; // up to 4 GiB of packed data
+constexpr std::size_t StoreUnit = std::size_t{64} << 10, StoreUnits = StoreBlock / StoreUnit;
 std::uintptr_t store_base = 0;
 std::int64_t store_physical[StoreBlocks];
-std::uint32_t store_used[StoreBlocks];
-std::atomic<std::uint32_t> store_live[StoreBlocks];
-std::size_t store_current = StoreBlocks;
-std::atomic<std::size_t> store_held{0};
+std::uint32_t store_map[StoreBlocks];              // one bit a 64 KiB unit: in use
+std::atomic<std::uint32_t> store_live[StoreBlocks]; // bytes of pack data live in the block
+std::atomic<std::size_t> store_held{0};             // bytes of blocks mapped (the store's pool cost)
+std::atomic<std::uint64_t> store_compacted{0};      // bytes of blocks given back by StoreCompact
+std::atomic_flag store_map_lock = ATOMIC_FLAG_INIT;
+std::size_t packed_slots_count = 0;                 // slots the packed table covers (PackPass)
+
+// The units a pack of `size` bytes took at `first`, as a bit mask. A pack is always smaller than
+// a block, so the run never wraps.
+std::uint32_t StoreUnitRun(std::size_t first, std::size_t units) noexcept {
+    return units >= StoreUnits - first ? ~std::uint32_t{0} << first
+                                       : ((std::uint32_t{1} << units) - 1) << first;
+}
+void StoreRelease(void* data, std::uint32_t size) noexcept; // below, so compaction can return a place
 
 #ifdef PS5_NATIVE
 bool StoreStart() noexcept {
@@ -437,15 +452,32 @@ bool StoreStart() noexcept {
     for (std::size_t i = 0; i < StoreBlocks; ++i) store_physical[i] = -1;
     return true;
 }
-// Room for `size` bytes (pack_mutex held). *donate: a block the caller gives up if the pool has
-// none (-1 afterwards when it was taken).
-void* StoreAlloc(std::size_t size, std::int64_t* donate) noexcept {
-    if (store_current < StoreBlocks && store_used[store_current] + size <= StoreBlock) {
-        void* at = reinterpret_cast<void*>(store_base + store_current * StoreBlock + store_used[store_current]);
-        store_used[store_current] += static_cast<std::uint32_t>(size);
-        store_live[store_current].fetch_add(static_cast<std::uint32_t>(size), std::memory_order_relaxed);
-        return at;
+// The first run of free units for `size` bytes in a block already mapped other than `skip` (pack_mutex
+// held): its address, the units marked and counted. Null when every block's free space is too
+// small or told to skip. A pack that ends here returns to the store with StoreRelease.
+void* StorePlace(std::size_t size, std::size_t skip) noexcept {
+    const std::size_t units = (size + StoreUnit - 1) / StoreUnit;
+    if (units == 0 || units > StoreUnits) return nullptr;
+    void* at = nullptr;
+    Spin(store_map_lock);
+    for (std::size_t index = 0; index < StoreBlocks && at == nullptr; ++index) {
+        if (index == skip || store_physical[index] < 0 || store_map[index] == ~std::uint32_t{0}) continue;
+        for (std::size_t first = 0; first + units <= StoreUnits; ++first) {
+            const std::uint32_t run = StoreUnitRun(first, units);
+            if (store_map[index] & run) continue;
+            store_map[index] |= run;
+            store_live[index].fetch_add(static_cast<std::uint32_t>(size), std::memory_order_relaxed);
+            at = reinterpret_cast<void*>(store_base + index * StoreBlock + first * StoreUnit);
+            break;
+        }
     }
+    store_map_lock.clear(std::memory_order_release);
+    return at;
+}
+// Room for `size` bytes (pack_mutex held): a hole in a block already mapped first, then a fresh
+// block. *donate: a block the caller gives up if the pool has none (-1 afterwards when taken).
+void* StoreAlloc(std::size_t size, std::int64_t* donate) noexcept {
+    if (void* const at = StorePlace(size, StoreBlocks)) return at;
     std::size_t index = 0;
     while (index < StoreBlocks && store_physical[index] >= 0) ++index;
     if (index == StoreBlocks) return nullptr;
@@ -460,29 +492,124 @@ void* StoreAlloc(std::size_t size, std::int64_t* donate) noexcept {
         return nullptr;
     }
     store_physical[index] = physical;
-    store_used[index] = static_cast<std::uint32_t>(size);
-    store_live[index].store(static_cast<std::uint32_t>(size), std::memory_order_relaxed);
-    store_current = index;
-    store_held.fetch_add(StoreBlock, std::memory_order_relaxed);
-    return reinterpret_cast<void*>(store_base + index * StoreBlock);
+    void* at = nullptr;
+    const std::size_t units = (size + StoreUnit - 1) / StoreUnit;
+    if (units != 0 && units <= StoreUnits) {
+        Spin(store_map_lock);
+        store_map[index] = StoreUnitRun(0, units);
+        store_map_lock.clear(std::memory_order_release);
+        store_live[index].store(static_cast<std::uint32_t>(size), std::memory_order_relaxed);
+        at = reinterpret_cast<void*>(store_base + index * StoreBlock);
+        store_held.fetch_add(StoreBlock, std::memory_order_relaxed);
+    }
+    if (at == nullptr) { // not a pack's size: nothing is placed, the block goes back
+        if (!MapSlot(store_base + index * StoreBlock, PROT_NONE, zero_block)) std::abort();
+        if (sceKernelReleaseDirectMemory(physical, StoreBlock) != 0) std::abort();
+        store_physical[index] = -1;
+    }
+    return at;
 }
-// Blocks whose data all went back (pack_mutex held).
+// Blocks whose data all went back (pack_mutex held). The units are cleared too, so a block taken
+// again starts empty.
 void StoreReclaim() noexcept {
     // Nothing before the store has started: its tables are not set up (zero is not "no block"),
     // and mapping at store_base 0 would land on the app's own code (the self-test's range goes
     // back through here at start).
     if (store_base == 0) return;
     for (std::size_t i = 0; i < StoreBlocks; ++i) {
-        if (store_physical[i] < 0 || i == store_current || store_live[i].load(std::memory_order_acquire) != 0) continue;
+        if (store_physical[i] < 0 || store_live[i].load(std::memory_order_acquire) != 0) continue;
         if (!MapSlot(store_base + i * StoreBlock, PROT_NONE, zero_block)) continue;
         if (sceKernelReleaseDirectMemory(store_physical[i], StoreBlock) != 0) std::abort();
         store_physical[i] = -1;
+        store_map[i] = 0; // no pack of the released block can be live: every release cleared its units first
         store_held.fetch_sub(StoreBlock, std::memory_order_relaxed);
     }
 }
+// One block holding little live data is emptied into the others while the pool is short: a place is
+// reserved for every pack in it first (nothing moves unless all of them have one), then each slot's
+// table entry changes under its lock and the old space goes back. The emptied block is given back
+// by the StoreReclaim that follows. pack_mutex held; true when any pack moved.
+constexpr std::uint32_t StoreCompactBelow = StoreBlock / 4; // 512 KiB of live data at most
+constexpr std::size_t StoreCompactMoves = 64;
+bool StoreCompact(SparseRange& range) noexcept {
+    PackedSlot* const table = packed_slots.load(std::memory_order_acquire);
+    if (table == nullptr || packed_slots_count == 0) return false;
+    std::size_t best = StoreBlocks;
+    std::uint32_t best_live = StoreCompactBelow;
+    for (std::size_t i = 0; i < StoreBlocks; ++i) {
+        const std::uint32_t live = store_live[i].load(std::memory_order_acquire);
+        if (store_physical[i] >= 0 && live != 0 && live < best_live) {
+            best = i;
+            best_live = live;
+        }
+    }
+    if (best == StoreBlocks) return false;
+    struct Move {
+        std::size_t slot;
+        void* from;
+        void* to;
+        std::uint32_t stored;
+    } moves[StoreCompactMoves];
+    std::size_t count = 0;
+    bool planned = true;
+    for (std::size_t slot = 0; slot < packed_slots_count && planned; ++slot) {
+        const PackedSlot entry = table[slot];
+        if (entry.data == nullptr ||
+            (reinterpret_cast<std::uintptr_t>(entry.data) - store_base) / StoreBlock != best)
+            continue;
+        if (count == StoreCompactMoves) {
+            planned = false;
+            break;
+        }
+        void* const to = StorePlace(PackedStoredBytes(entry.size), best);
+        if (to == nullptr) {
+            planned = false;
+            break;
+        }
+        moves[count++] = {slot, entry.data, to, entry.size};
+    }
+    if (!planned || count == 0) {
+        for (std::size_t i = 0; i < count; ++i) StoreRelease(moves[i].to, PackedStoredBytes(moves[i].stored));
+        return false;
+    }
+    // Every pack has a place: move it, the slot locked so a fault cannot unpack from under the copy.
+    std::size_t moved = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        const Move& move = moves[i];
+        // Never wait for a slot: a write fault holds one's lock while it waits for a block (up to
+        // 2 s), and this runs on the scanner.
+        if (!TryLockSlot(range, move.slot)) {
+            StoreRelease(move.to, PackedStoredBytes(move.stored));
+            continue;
+        }
+        const std::uint8_t state = SlotState(range, move.slot);
+        if (state == SlotPacked && table[move.slot].data == move.from && table[move.slot].size == move.stored) {
+            std::memcpy(move.to, move.from, PackedStoredBytes(move.stored));
+            table[move.slot] = {move.to, move.stored};
+            StoreRelease(move.from, PackedStoredBytes(move.stored));
+            ++moved;
+        } else {
+            StoreRelease(move.to, PackedStoredBytes(move.stored)); // the pack changed meanwhile: its place goes back
+        }
+        UnlockSlot(range, move.slot, state);
+    }
+    return moved != 0;
+}
 #endif
+// A pack's bytes went back (the slot is locked and leaves the Packed state): its units are free for
+// the next pack. Called from fault handlers: nothing allocates, only the unit lock is taken. The
+// units are cleared before the block's live count falls, so a StoreReclaim that sees a block empty
+// knows no release of it is still in flight (a stale release must not clear a new pack's units).
 void StoreRelease(void* data, std::uint32_t size) noexcept {
     const std::size_t index = (reinterpret_cast<std::uintptr_t>(data) - store_base) / StoreBlock;
+    if (index >= StoreBlocks) return;
+    const std::size_t units = (size + StoreUnit - 1) / StoreUnit;
+    if (units != 0) {
+        const std::size_t first = ((reinterpret_cast<std::uintptr_t>(data) - store_base) % StoreBlock) / StoreUnit;
+        Spin(store_map_lock);
+        store_map[index] &= ~StoreUnitRun(first, units);
+        store_map_lock.clear(std::memory_order_release);
+    }
     store_live[index].fetch_sub(size, std::memory_order_release);
 }
 // Forgets a Packed slot's data (the slot is locked and leaves the Packed state).
@@ -2060,6 +2187,7 @@ void PackPass(SparseRange& range, std::size_t slots, std::vector<std::size_t>& c
                 for (std::size_t i = 0; i < slots; ++i) pack_kept[i] = -1;
         }
         packed_slots.store(table, std::memory_order_release);
+        packed_slots_count = slots;
         pack_times.assign(slots, 0);
         recover_order.reserve(slots);
         std::size_t scratch = static_cast<std::size_t>(LZ4_compressBound(static_cast<int>(SparseSlot)));
@@ -2069,6 +2197,17 @@ void PackPass(SparseRange& range, std::size_t slots, std::vector<std::size_t>& c
         pack_scratch.resize(scratch);
     }
     if (pack_refused.load(std::memory_order_relaxed) || !PoolShortForPacking()) return;
+#ifdef PS5_NATIVE
+    // A nearly empty block is emptied into the others rather than kept mapped while the pool is
+    // short; the copy pays only while the store wastes at least 32 MiB on holes.
+    const std::size_t held_before = store_held.load(std::memory_order_relaxed);
+    if (held_before > static_cast<std::size_t>(packed_bytes.load(std::memory_order_relaxed)) + (std::size_t{32} << 20) &&
+        StoreCompact(range)) {
+        StoreReclaim();
+        const std::size_t held_after = store_held.load(std::memory_order_relaxed);
+        if (held_after < held_before) store_compacted.fetch_add(held_before - held_after, std::memory_order_relaxed);
+    }
+#endif
     // Device memory nothing is bound to goes back before any guest memory is packed.
     if (&eden_radv_private_radv_ps5_eden_trim != nullptr) (void)eden_radv_private_radv_ps5_eden_trim(std::uint64_t{512} << 20);
     // Coldest first, each needing ColdSeconds << (times packed) unwritten.
@@ -2247,13 +2386,13 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
             fine_kept += FineKept(range, slot);
         }
     }
-    char line[640];
+    char line[800];
     const int length = std::snprintf(line, sizeof(line),
         "EDEN_CRAM %s held=%zuMiB own=%zu shared=%zu zero=%zu faults=%llu promotions=%llu copies=%llu waits=%llu "
         "returns_clear=%llu returns_free=%llu returns_scan=%llu dedup=%llu reserve_used=%llu failures=%llu "
         "passes=%llu scan_ms=%llu fine=%zu fine_held=%zuMiB fined=%llu unfined=%llu fine_failures=%llu "
         "reserve=%zuMiB host_transferred=%lluMiB freed_parts=%llu freed_parts_cleared=%lluMiB "
-        "scan_skipped=%llu full_scans=%llu\n",
+        "scan_skipped=%llu full_scans=%llu store_held=%zuMiB store_live=%zuMiB store_compacted=%lluMiB\n",
         when, guest_committed.load(std::memory_order_relaxed) >> 20, own, shared, slots - own - shared - fine,
         (unsigned long long)counters.faults.load(), (unsigned long long)counters.promotions.load(),
         (unsigned long long)counters.copies.load(), (unsigned long long)counters.waits.load(),
@@ -2266,7 +2405,10 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
         reserve_count.load(std::memory_order_relaxed) * (SparseSlot >> 20),
         (unsigned long long)counters.host_reserve_used.load() * (SparseSlot >> 20),
         (unsigned long long)freed_part_calls.load(), (unsigned long long)(freed_part_bytes.load() >> 20),
-        (unsigned long long)scan_skips.load(), (unsigned long long)scan_full_passes.load());
+        (unsigned long long)scan_skips.load(), (unsigned long long)scan_full_passes.load(),
+        store_held.load(std::memory_order_relaxed) >> 20,
+        static_cast<std::size_t>(packed_bytes.load(std::memory_order_relaxed) >> 20),
+        static_cast<unsigned long long>(store_compacted.load(std::memory_order_relaxed) >> 20));
     if (length > 0) Report(line);
     // Who wrote the slots that were promoted: the largest places (offsets in the app's image).
     struct Top { const WriterSite* site; std::uint64_t count; } top[10]{};
@@ -2928,9 +3070,9 @@ void ReleaseServiceBlocks(SparseRange& range) noexcept {
         range.owned[slot].store(false, std::memory_order_relaxed);
     }
     if (&range == guest_range.load(std::memory_order_acquire) || service_range.load(std::memory_order_acquire) == nullptr) {
-        store_current = StoreBlocks; // every packed slot was forgotten above: all blocks go back
-        StoreReclaim();
+        StoreReclaim(); // every packed slot was forgotten above: blocks with no data go back
         delete[] packed_slots.exchange(nullptr, std::memory_order_acq_rel);
+        packed_slots_count = 0;
         cold_hash.clear();
         cold_since.clear();
         pack_times.clear();
