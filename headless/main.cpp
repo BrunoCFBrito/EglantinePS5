@@ -25,6 +25,7 @@
 #include <cstring>
 #include <sys/stat.h>
 extern "C" size_t eden_heap_last_failure(unsigned*, size_t*);
+extern "C" void eden_heap_set_large(size_t kib);
 #endif
 #ifdef EDEN_DEV_VULKAN
 #include "sdk_audit.h"
@@ -548,6 +549,13 @@ int main(int argc, char** argv) {
                 std::printf("EDEN_ENV %s\n", entry.c_str());
             }
         }
+#ifdef PS5_NATIVE
+        // EDEN_HEAP_LARGE_KIB (heap_arenas.inc): from here on, blocks that large get memory of their own.
+        if (const char* const kib = std::getenv("EDEN_HEAP_LARGE_KIB")) {
+            eden_heap_set_large(static_cast<size_t>(std::strtoull(kib, nullptr, 10)));
+            std::printf("EDEN_HEAP_LARGE_KIB %s\n", kib);
+        }
+#endif
         // The console's defaults for the core's switches (env.txt above wins). Without a fastmem
         // arena every guest read of a GPU-tracked page is a call; a Switch 2 title's reads of
         // pages with nothing to flush answer on the guest core instead of waiting for the GPU

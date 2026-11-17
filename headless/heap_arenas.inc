@@ -12,6 +12,9 @@
  * Large blocks. A request of 32 MiB or more gets memory of its own, outside the range, and gives
  * it back when it is freed: a game file read whole, or a buffer that doubles as it grows, would
  * otherwise leave the heap larger for good and its pieces full of holes no other large block fits.
+ * EDEN_HEAP_LARGE_KIB=n lowers that size to n KiB (256 to 32768): Ocarina of Time's heap held
+ * 1952 MiB for about 1070 MiB in use, its requests freeing into pieces that went back only once
+ * nothing was left in them.
  *
  * Arenas. One Sony mspace serialised every allocation in the process. Its lock collapses
  * under contention: a malloc/free pair costs 225 ns alone but 33/67/138 us with
@@ -185,13 +188,28 @@ static atomic_flag eden_heap_grow_lock = ATOMIC_FLAG_INIT;
 
 /* Requests of this size or more get memory of their own (eden_heap_pages), freed with them. */
 #define EDEN_HEAP_LARGE_REQUEST ((size_t)32 << 20)
-#define EDEN_HEAP_LARGE_BLOCKS 256u
+/* 8192 (was 256): with requests from 256 KiB on (EDEN_HEAP_LARGE_KIB) waveydude's 1024 entries were
+ * all taken at the Castle Town gate (issue 21), and later requests went back into the pieces. */
+#define EDEN_HEAP_LARGE_BLOCKS 8192u
 /* The large blocks alive: address 0 marks a free entry, 1 one being filled in. */
 static struct {
   _Atomic uintptr_t address;
   size_t size;
   int split; /* its memory in pieces (eden_heap_split_pages) */
 } eden_heap_large[EDEN_HEAP_LARGE_BLOCKS];
+/* EDEN_HEAP_LARGE_KIB=n (256 to 32768; without it 32 MiB, as before; waveydude, issue 21): requests
+ * of n KiB or more get memory of their own, given back the moment they are freed, instead of a
+ * place in a piece that goes back only once nothing is left in it. Ocarina of Time on the PS5
+ * ended with the heap holding 1952 MiB for about 1070 MiB in use. The price is a mapping and a
+ * release for each such block. Set from main once env.txt is read (eden_heap_set_large). */
+static atomic_size_t eden_heap_large_from = EDEN_HEAP_LARGE_REQUEST;
+void eden_heap_set_large(size_t kib) {
+  if (kib < 256u)
+    kib = 256u;
+  if (kib > 32768u)
+    kib = 32768u;
+  atomic_store_explicit(&eden_heap_large_from, kib << 10, memory_order_relaxed);
+}
 static atomic_uint eden_heap_large_count;
 static atomic_size_t eden_heap_large_bytes;
 
@@ -1514,7 +1532,7 @@ void eden_heap_sites_report(void) {
 
 static void *eden_heap_allocate(size_t count, size_t size, int zero) {
   const size_t bytes = count * size;
-  if (bytes >= EDEN_HEAP_LARGE_REQUEST && eden_heap_grows) {
+  if (bytes >= atomic_load_explicit(&eden_heap_large_from, memory_order_relaxed) && eden_heap_grows) {
     /* Memory of its own (it arrives zeroed). With every entry taken, or no memory left to take,
      * the heap's spaces: a piece committed earlier may still have the room. */
     void *block = eden_heap_large_allocate(bytes);
@@ -1663,7 +1681,8 @@ int __wrap_posix_memalign(void **address, size_t alignment, size_t size) {
   if (result != 0) {
     /* A large block's own memory starts on a page; the heap's spaces align anything. */
     void *block = NULL;
-    if (alignment <= 4096 && size >= EDEN_HEAP_LARGE_REQUEST && eden_heap_grows)
+    if (alignment <= 4096 &&
+        size >= atomic_load_explicit(&eden_heap_large_from, memory_order_relaxed) && eden_heap_grows)
       block = eden_heap_large_allocate(size);
     if (block == NULL)
       block = eden_heap_main(EDEN_HEAP_ALIGNED, alignment, size);
