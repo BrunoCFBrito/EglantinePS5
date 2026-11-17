@@ -319,7 +319,10 @@ void Spin(std::atomic_flag& flag) noexcept {
     while (flag.test_and_set(std::memory_order_acquire)) sched_yield();
 }
 
-// ---- Packed slots: an Own slot unwritten for a while, LZ4-compressed while the pool is short ----
+// ---- Packed slots: an Own slot unwritten for a while, compressed while the pool is short ----
+// LZ4 first (fast to unpack); a slot LZ4 packs little is tried with zstd level 1 (EDEN_SWAP_ZSTD,
+// on the console when zstd.h is there), which packs Ocarina's stubbornly-compressing memory tight
+// enough to keep it in memory instead of the swap file.
 // The slot maps the zero block with no access and its block goes back; the next access of any
 // kind faults, and the fault handler gives it a block and unpacks it there (UnpackSlot). Packed
 // data lives in the heap. A buffer the fault handler is done with is freed by the scanner (no
@@ -364,6 +367,52 @@ std::atomic_flag unpackers_lock = ATOMIC_FLAG_INIT;
 void CountUnpacker(std::size_t slot) noexcept;
 std::atomic<std::uint64_t> pack_keep_compared{0}, pack_keep_differed{0};
 std::atomic<std::uint64_t> packed_count{0}, packed_bytes{0}, packs{0}, unpacks{0}, pack_skips{0};
+// A packed slot's size: the top bit says zstd packed it (LZ4 otherwise). Both pack below 2 MiB
+// (PackMaxRatio), so the bit is free.
+constexpr std::uint32_t PackedZstdBit = 0x80000000u;
+std::uint32_t PackedStoredBytes(std::uint32_t stored) noexcept { return stored & ~PackedZstdBit; }
+#ifdef EDEN_SWAP_ZSTD
+// One packing context, used under pack_mutex as the LZ4 buffer is; unpacking runs in fault
+// handlers on any thread, so it takes one of a few contexts made in static memory at the start
+// (no allocation in a fault). EDEN_GUEST_SWAP_ZSTD=0 turns it off.
+ZSTD_CCtx* zstd_pack = nullptr;
+constexpr unsigned ZstdUnpackers = 8;
+constexpr std::size_t ZstdUnpackerBytes = std::size_t{256} << 10;
+alignas(64) unsigned char zstd_unpacker_memory[ZstdUnpackers][ZstdUnpackerBytes];
+ZSTD_DCtx* zstd_unpackers[ZstdUnpackers]{};
+std::atomic_flag zstd_unpacker_busy[ZstdUnpackers] = {};
+std::atomic<bool> zstd_ready{false};
+std::atomic<std::uint64_t> packed_zstd{0};
+
+// Once, where allocating is fine (the service's start).
+void ZstdStart() noexcept {
+    const char* off = std::getenv("EDEN_GUEST_SWAP_ZSTD");
+    if ((off != nullptr && off[0] == '0') || zstd_ready.load(std::memory_order_relaxed)) return;
+    if (ZSTD_estimateDCtxSize() > ZstdUnpackerBytes) return;
+    for (unsigned i = 0; i < ZstdUnpackers; ++i) {
+        zstd_unpackers[i] = ZSTD_initStaticDCtx(zstd_unpacker_memory[i], ZstdUnpackerBytes);
+        if (zstd_unpackers[i] == nullptr) return;
+    }
+    zstd_pack = ZSTD_createCCtx();
+    if (zstd_pack == nullptr) return;
+    zstd_ready.store(true, std::memory_order_release);
+}
+
+// zstd-packed bytes back into 2 MiB; false if they do not come back whole. Waits for a context:
+// the eight are only taken for the milliseconds an unpack takes.
+bool ZstdUnpack(const void* from, std::size_t bytes, void* to) noexcept {
+    if (!zstd_ready.load(std::memory_order_acquire)) return false;
+    for (;;) {
+        for (unsigned i = 0; i < ZstdUnpackers; ++i) {
+            if (zstd_unpacker_busy[i].test_and_set(std::memory_order_acquire)) continue;
+            const std::size_t got = ZSTD_decompressDCtx(zstd_unpackers[i], to, SparseSlot, from, bytes);
+            zstd_unpacker_busy[i].clear(std::memory_order_release);
+            return !ZSTD_isError(got) && got == SparseSlot;
+        }
+        sched_yield();
+    }
+}
+#endif
 
 // The packed store: packed data lives in 2 MiB blocks of direct memory of its own, filled one after
 // another, outside Eden's heap. Packing then takes no heap memory, so it can run where the heap
@@ -441,8 +490,8 @@ void ForgetPacked(std::size_t slot) noexcept {
     PackedSlot* const table = packed_slots.load(std::memory_order_acquire);
     if (table == nullptr || table[slot].data == nullptr) return;
     packed_count.fetch_sub(1, std::memory_order_relaxed);
-    packed_bytes.fetch_sub(table[slot].size, std::memory_order_relaxed);
-    StoreRelease(table[slot].data, table[slot].size);
+    packed_bytes.fetch_sub(PackedStoredBytes(table[slot].size), std::memory_order_relaxed);
+    StoreRelease(table[slot].data, PackedStoredBytes(table[slot].size));
     table[slot] = {};
 }
 
@@ -799,10 +848,21 @@ bool UnpackSlot(SparseRange& range, std::size_t slot) noexcept {
         (void)sceKernelReleaseDirectMemory(physical, SparseSlot);
         return false;
     }
-    const int out = LZ4_decompress_safe(static_cast<const char*>(table[slot].data),
-                                        reinterpret_cast<char*>(view),
-                                        static_cast<int>(table[slot].size), static_cast<int>(SparseSlot));
-    if (out != static_cast<int>(SparseSlot)) std::abort(); // the guest's data is gone: never carry on
+    const std::uint32_t stored = table[slot].size;
+    const std::uint32_t bytes = PackedStoredBytes(stored);
+    bool unpacked = false;
+#ifdef EDEN_SWAP_ZSTD
+    if (stored & PackedZstdBit) {
+        unpacked = ZstdUnpack(table[slot].data, bytes, reinterpret_cast<void*>(view));
+    } else
+#endif
+    {
+        const int out = LZ4_decompress_safe(static_cast<const char*>(table[slot].data),
+                                            reinterpret_cast<char*>(view), static_cast<int>(bytes),
+                                            static_cast<int>(SparseSlot));
+        unpacked = out == static_cast<int>(SparseSlot);
+    }
+    if (!unpacked) std::abort(); // the guest's data is gone: never carry on
     if (pack_kept != nullptr && pack_kept[slot] >= 0) {
         const std::uintptr_t kept_view = MapCpuView(pack_kept[slot], SparseSlot, PROT_READ);
         if (kept_view != 0) {
@@ -1671,6 +1731,9 @@ std::size_t PackBelowLargest() noexcept {
     return bytes;
 }
 constexpr double PackMaxRatio = 0.6;
+// zstd is slower to unpack than LZ4, so it is kept for slots LZ4 packs too little; it is taken when
+// it gives back at least this many pages (256 KiB), which is what the fork's PackOut asked.
+constexpr std::size_t PackMinGainPages = 16;
 std::vector<std::uint8_t> pack_times; // per slot: how often it was packed or tried (scanner, recovery)
 std::atomic<bool> pack_refused{false};
 std::mutex pack_mutex; // the scanner's cold pass and packing, and eden_memory_recover
@@ -1725,9 +1788,27 @@ bool PackSlot(SparseRange& range, std::size_t slot) noexcept {
     }
     const std::uintptr_t at = SlotAddress(range, slot);
     Fence(at);
-    const int size = LZ4_compress_default(reinterpret_cast<const char*>(at), pack_scratch.data(),
-                                          static_cast<int>(SparseSlot), static_cast<int>(pack_scratch.size()));
-    if (size <= 0 || size > static_cast<int>(SparseSlot * PackMaxRatio) || !StoreStart()) {
+    int size = LZ4_compress_default(reinterpret_cast<const char*>(at), pack_scratch.data(),
+                                    static_cast<int>(SparseSlot), static_cast<int>(pack_scratch.size()));
+    bool zstd = false;
+#ifdef EDEN_SWAP_ZSTD
+    // LZ4 packs too little to be worth keeping this slot in memory: zstd level 1 packs Ocarina's
+    // poorly-compressing slots tighter before they are sent whole to the file.
+    if ((size <= 0 || size > static_cast<int>(SparseSlot * PackMaxRatio)) &&
+        zstd_ready.load(std::memory_order_acquire)) {
+        const std::size_t packed = ZSTD_compressCCtx(zstd_pack, pack_scratch.data(), pack_scratch.size(),
+                                                     reinterpret_cast<const void*>(at), SparseSlot, 1);
+        if (!ZSTD_isError(packed) && packed > 0 && packed <= SparseSlot - PackMinGainPages * FinePage) {
+            size = static_cast<int>(packed);
+            zstd = true;
+            packed_zstd.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+#endif
+    // LZ4 must pack to PackMaxRatio; zstd only has to give back PackMinGainPages.
+    const std::size_t max_size =
+        zstd ? SparseSlot - PackMinGainPages * FinePage : static_cast<std::size_t>(SparseSlot * PackMaxRatio);
+    if (size <= 0 || static_cast<std::size_t>(size) > max_size || !StoreStart()) {
         Unfence(at);
         UnlockSlot(range, slot, SlotOwn);
         pack_skips.fetch_add(1, std::memory_order_relaxed);
@@ -1763,7 +1844,7 @@ bool PackSlot(SparseRange& range, std::size_t slot) noexcept {
     }
     range.physical[slot] = -1;
     guest_committed.fetch_sub(SparseSlot, std::memory_order_relaxed);
-    table[slot] = {data, static_cast<std::uint32_t>(size)};
+    table[slot] = {data, static_cast<std::uint32_t>(size) | (zstd ? PackedZstdBit : 0)};
     packed_count.fetch_add(1, std::memory_order_relaxed);
     packed_bytes.fetch_add(static_cast<std::uint64_t>(size), std::memory_order_relaxed);
     packs.fetch_add(1, std::memory_order_relaxed);
@@ -1981,7 +2062,11 @@ void PackPass(SparseRange& range, std::size_t slots, std::vector<std::size_t>& c
         packed_slots.store(table, std::memory_order_release);
         pack_times.assign(slots, 0);
         recover_order.reserve(slots);
-        pack_scratch.resize(static_cast<std::size_t>(LZ4_compressBound(static_cast<int>(SparseSlot))));
+        std::size_t scratch = static_cast<std::size_t>(LZ4_compressBound(static_cast<int>(SparseSlot)));
+#ifdef EDEN_SWAP_ZSTD
+        scratch = std::max(scratch, ZSTD_compressBound(SparseSlot));
+#endif
+        pack_scratch.resize(scratch);
     }
     if (pack_refused.load(std::memory_order_relaxed) || !PoolShortForPacking()) return;
     // Device memory nothing is bound to goes back before any guest memory is packed.
@@ -2218,7 +2303,7 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
         char pack_line[400];
         const int pack_length = std::snprintf(pack_line, sizeof(pack_line),
             "EDEN_CRAM_PACK %s packed=%lluMiB stored=%lluMiB packs=%llu unpacks=%llu skips=%llu unpack_keep=%lluMiB"
-            " kept_compared=%llu kept_differed=%llu zero_block_dirty=%llu gpu_skips=%llu gpu_marked=%llu\n", when,
+            " kept_compared=%llu kept_differed=%llu zero_block_dirty=%llu gpu_skips=%llu gpu_marked=%llu zstd=%llu\n", when,
             (unsigned long long)(packed_count.load(std::memory_order_relaxed) * (SparseSlot >> 20)),
             (unsigned long long)(packed_bytes.load(std::memory_order_relaxed) >> 20),
             (unsigned long long)packs.load(std::memory_order_relaxed), (unsigned long long)unpacks.load(std::memory_order_relaxed),
@@ -2227,7 +2312,12 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
             (unsigned long long)pack_keep_differed.load(std::memory_order_relaxed),
             (unsigned long long)zero_block_dirty.load(std::memory_order_relaxed),
             (unsigned long long)pack_gpu_skips.load(std::memory_order_relaxed),
-            (unsigned long long)pack_gpu_marked.load(std::memory_order_relaxed));
+            (unsigned long long)pack_gpu_marked.load(std::memory_order_relaxed),
+#ifdef EDEN_SWAP_ZSTD
+            (unsigned long long)packed_zstd.load(std::memory_order_relaxed));
+#else
+            0ull);
+#endif
         if (pack_length > 0) Report(pack_line);
         ReportUnpackers();
     }
@@ -2712,6 +2802,10 @@ void ServiceStart(SparseRange& range) noexcept {
     range.promote = true;
 #ifdef PS5_NATIVE
     FillReserve(ReserveAtStart);
+#ifdef EDEN_SWAP_ZSTD
+    // The contexts are made now, where allocating is fine: a fault handler only takes them.
+    if (PackEnabled()) ZstdStart();
+#endif
 #endif
     service_range.store(&range, std::memory_order_release);
     Eden::Fastmem::guest_write_fault.store(&HandleGuestWriteFault, std::memory_order_release);

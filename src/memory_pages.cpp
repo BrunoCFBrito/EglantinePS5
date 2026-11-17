@@ -36,6 +36,17 @@ extern "C" {
 namespace Common::Compression {
 [[gnu::weak]] std::vector<std::uint8_t> CompressDataLZ4(const std::uint8_t* source, std::size_t source_size);
 }
+// zstd (level 1) for a cold slot that LZ4 packs too little to be worth keeping in memory: about a
+// third of Ocarina's cold slots, whose bytes otherwise go whole to the swap file and come back at
+// up to 2.7 s each (bxymartin/EglantinePS5 1de1b2c, 2026-11-15). Console only: the host checks
+// build this file alone and do not link zstd.
+#ifdef PS5_NATIVE
+#if __has_include(<zstd.h>)
+#define ZSTD_STATIC_LINKING_ONLY // static decompression contexts for the fault handlers
+#include <zstd.h>
+#define EDEN_SWAP_ZSTD 1
+#endif
+#endif
 
 #ifdef PS5_NATIVE
 // Keep CPU heaps/tables and JIT views out of RADV's high-word-2 GPU window.
