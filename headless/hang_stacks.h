@@ -49,6 +49,12 @@ inline bool Enabled() {
 }
 
 inline void Beat() { heartbeat.fetch_add(1, std::memory_order_relaxed); }
+// EDEN_HANG_STACKS_FRAME_MS=<ms> (with EDEN_HANG_STACKS=1): also sample during slow frames. While no
+// frame has been shown for that long, every 100 ms the threads whose name contains
+// EDEN_HANG_STACKS_THREAD (default GPU) get the same stack line, headed EDEN_SLOW_FRAME; 600
+// samples at most. headless/graphics.cpp calls FrameBeat for every frame shown.
+inline std::atomic<unsigned long long> frames{0};
+inline void FrameBeat() { frames.fetch_add(1, std::memory_order_relaxed); }
 
 inline void OnSignal(int, siginfo_t*, void* context) {
     const pthread_t self = pthread_self();
@@ -72,13 +78,17 @@ inline void OnSignal(int, siginfo_t*, void* context) {
     }
 }
 
-inline void Report(double seconds) {
+inline void Report(double seconds, const char* only = nullptr) {
     const auto code = reinterpret_cast<std::uintptr_t>(__eden_text_start);
     const auto code_end = __eden_text_end ? reinterpret_cast<std::uintptr_t>(__eden_text_end) : ~std::uintptr_t{0};
     const unsigned count = slot_count.load(std::memory_order_acquire);
-    std::fprintf(stderr, "EDEN_HANG no heartbeat for %.0f s; stacks of %u named threads follow\n", seconds, count);
+    if (only == nullptr)
+        std::fprintf(stderr, "EDEN_HANG no heartbeat for %.0f s; stacks of %u named threads follow\n", seconds, count);
+    else
+        std::fprintf(stderr, "EDEN_SLOW_FRAME no frame for %.0f ms\n", seconds * 1000.0);
     for (unsigned i = 0; i < count; ++i) {
         Slot& slot = slots[i];
+        if (only != nullptr && std::strstr(slot.name, only) == nullptr) continue;
         slot.taken.store(false, std::memory_order_relaxed);
         const bool signalled = pthread_kill(slot.thread, SIGUSR1) == 0;
         for (int wait = 0; signalled && wait < 50 && !slot.taken.load(std::memory_order_acquire); ++wait)
@@ -127,6 +137,27 @@ inline void Watch() {
     }
 }
 
+inline void WatchFrames(unsigned frame_ms, const char* only) {
+    unsigned long long last = frames.load(std::memory_order_relaxed);
+    auto changed = std::chrono::steady_clock::now();
+    auto sampled = changed;
+    unsigned samples = 0;
+    while (samples < 600) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        const unsigned long long now_frames = frames.load(std::memory_order_relaxed);
+        const auto now = std::chrono::steady_clock::now();
+        if (now_frames != last || now_frames == 0) {
+            last = now_frames;
+            changed = now;
+            continue;
+        }
+        const double seconds = std::chrono::duration<double>(now - changed).count();
+        if (seconds * 1000.0 < frame_ms || now - sampled < std::chrono::milliseconds(100)) continue;
+        Report(seconds, only);
+        sampled = std::chrono::steady_clock::now();
+        ++samples;
+    }
+}
 // Every thread that names itself.
 inline void Note(const char* name) {
     if (!Enabled()) return;
@@ -138,6 +169,14 @@ inline void Note(const char* name) {
         sigemptyset(&action.sa_mask);
         sigaction(SIGUSR1, &action, nullptr);
         std::thread(Watch).detach();
+        if (const char* value = std::getenv("EDEN_HANG_STACKS_FRAME_MS")) {
+            const unsigned frame_ms = static_cast<unsigned>(std::strtoul(value, nullptr, 10));
+            static const char* const only = [] {
+                const char* thread = std::getenv("EDEN_HANG_STACKS_THREAD");
+                return thread != nullptr && thread[0] != '\0' ? thread : "GPU";
+            }();
+            if (frame_ms != 0) std::thread(WatchFrames, frame_ms, only).detach();
+        }
     });
     const unsigned index = slot_count.load(std::memory_order_relaxed);
     if (index >= sizeof(slots) / sizeof(slots[0])) return;

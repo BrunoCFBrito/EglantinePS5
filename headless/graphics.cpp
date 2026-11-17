@@ -18,6 +18,7 @@
 #include <cstring>
 #include <time.h>
 #include "hud.h"
+#include "hang_stacks.h"
 #include "../Eglantine/src/common/eden_stall.h"
 #include "network/network.h"
 #include "loading_scene_glsl.h"
@@ -726,6 +727,7 @@ void GraphicsWindow::OnFrameDisplayed() {
         vulkan_loading = false;
         // EDEN_FPS every 5 s in stderr.log: frames shown, their rate, the slowest frame and the
         // emulation speed, so a run's frame rate can be read from the logs (the HUD is not logged).
+        Eden::HangStacks::FrameBeat();  // EDEN_HANG_STACKS_FRAME_MS (hang_stacks.h)
         static double fps_start = now, fps_prior = now, fps_worst = 0;
         static unsigned fps_frames = 0;
         fps_worst = (std::max)(fps_worst, now - fps_prior);
