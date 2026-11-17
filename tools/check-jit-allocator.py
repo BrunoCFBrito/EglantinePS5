@@ -209,6 +209,9 @@ with tempfile.TemporaryDirectory() as temp:
             '-I'+str(scratch/'native-local/headless/include'),
             '-I'+str(scratch/'source/.cache/cpm/xbyak/v7.40.1'),str(cpp),
             *(['-DEDEN_JIT_ALIAS_NATIVE=1','-DPS5_NATIVE=1','-Wl,--wrap=mprotect'] if native_mock else []),
-            str(root/'src/memory_pages.cpp'),'-o',str(exe)],check=True)
+            str(root/'src/memory_pages.cpp'),'-o',str(exe),
+            # The guest memory service packs with zstd too where LZ4 cannot
+            # (src/guest_memory_service.inc, EDEN_SWAP_ZSTD).
+            *(['-lzstd'] if Path('/usr/include/zstd.h').exists() else [])],check=True)
         subprocess.run([str(exe)],check=True, cwd=temp)
 print('Production JIT aliases: 512/64/64/16 MiB, overflow, RX write/RW execute faults, live rewrite, a cache that takes its memory as it fills, a full flush giving steps back and taking them again, both-view release and native API partial-failure cleanup PASS (host backend/mocked native APIs)')
