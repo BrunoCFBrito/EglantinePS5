@@ -277,6 +277,7 @@ struct eden_heap_thread {
   unsigned long long spills, spill_cycles, shared_frees, shared_free_cycles;
   void *bins[EDEN_TCACHE_BINS];
   unsigned char counts[EDEN_TCACHE_BINS];
+  unsigned char waiting; /* in eden_heap_wait_for_memory: a request made meanwhile fails at once */
   char name[16]; /* research/heap-memory: the thread's name when it made its second arena */
 };
 #define EDEN_HEAP_THREADS 512u
@@ -759,6 +760,58 @@ static int eden_heap_grow(size_t bytes, unsigned seen) {
   return grown;
 }
 
+/* PS5 port (src/guest_memory_service.inc): cold guest memory packed, and the heap's empty arenas
+ * and spaces given back, now; never waits. Bytes given back. */
+extern size_t eden_memory_recover_try(size_t bytes) __attribute__((weak));
+
+/* How long a request the heap cannot grow for waits for memory before it fails
+ * (EDEN_HEAP_OOM_WAIT_MS, 2000 by default, 0: not at all). */
+static unsigned eden_heap_wait_rounds(void) {
+  static atomic_int rounds = -1;
+  int value = atomic_load_explicit(&rounds, memory_order_relaxed);
+  if (value < 0) {
+    const char *text = getenv("EDEN_HEAP_OOM_WAIT_MS");
+    const long ms = text != NULL ? strtol(text, NULL, 10) : 2000;
+    value = ms <= 0 ? 0 : (int)((ms + 15) / 16);
+    atomic_store_explicit(&rounds, value, memory_order_relaxed);
+  }
+  return (unsigned)value;
+}
+
+/* The heap could not grow for `bytes` (Ocarina at an area's load: the pool shared with the GPU
+ * empty for a moment while shaders compile and textures upload). Instead of the request failing
+ * (std::bad_alloc, the session ends), cold guest memory goes out and the thread waits 16 ms, for at
+ * most EDEN_HEAP_OOM_WAIT_MS; 1: try again, 0: fail now. Not on a thread with no record yet
+ * (start-up), nor for a request made while this thread waits (recovery's own). */
+static int eden_heap_wait_for_memory(size_t bytes, unsigned *rounds) {
+  const unsigned why = atomic_load_explicit(&eden_heap_grow_why, memory_order_relaxed);
+  if (why != EDEN_HEAP_WHY_NO_MEMORY && why != EDEN_HEAP_WHY_AT_LIMIT)
+    return 0;
+  if (*rounds >= eden_heap_wait_rounds())
+    return 0;
+  /* The record only if the thread has one: making one may allocate. */
+  struct eden_heap_thread *self =
+      eden_heap_arena_key_valid ? pthread_getspecific(eden_heap_arena_key) : NULL;
+  if (self == NULL || self->waiting)
+    return 0;
+  self->waiting = 1;
+  if (*rounds == 0) {
+    static atomic_uint reported;
+    if (atomic_fetch_add_explicit(&reported, 1, memory_order_relaxed) < 32) {
+      char line[128];
+      snprintf(line, sizeof(line), "EDEN_HEAP waiting for memory: %zu KiB (%s)\n", bytes >> 10,
+               why == EDEN_HEAP_WHY_AT_LIMIT ? "at limit" : "no memory");
+      sceKernelDebugOutText(0, line);
+    }
+  }
+  if (eden_memory_recover_try != NULL)
+    (void)eden_memory_recover_try(bytes + ((size_t)64 << 20));
+  sceKernelUsleep(16000);
+  self->waiting = 0;
+  ++*rounds;
+  return 1;
+}
+
 /* Empty arenas beyond the first EDEN_HEAP_ARENA_KEEP (8) found go back to their spaces: an arena
  * whose live count is 0 is retired, and destroyed if no thread is inside it and it is still empty
  * (a free lowers the count inside the arena, so either it is seen inside or it has finished). Its
@@ -874,6 +927,7 @@ static void *eden_heap_space_use(unsigned slot, int kind, size_t a, size_t b) {
 
 static void *eden_heap_main(int kind, size_t a, size_t b) {
   const size_t bytes = kind == EDEN_HEAP_MALLOC ? a : kind == EDEN_HEAP_CALLOC ? a * b : a + b;
+  unsigned waited = 0;
   for (;;) {
     const unsigned generation = atomic_load_explicit(&eden_heap_space_generation, memory_order_acquire);
     const unsigned count = atomic_load_explicit(&eden_heap_space_count, memory_order_acquire);
@@ -888,8 +942,24 @@ static void *eden_heap_main(int kind, size_t a, size_t b) {
         return address;
       }
     }
-    if (bytes == 0 || !eden_heap_grow(bytes, generation))
+    if (bytes == 0)
       return NULL;
+    if (!eden_heap_grow(bytes, generation)) {
+      if (eden_heap_wait_for_memory(bytes, &waited)) {
+        /* A large request asks for its block of its own again too: memory made since may be
+         * there, while the spaces cannot grow (at their limit, recovering memory never helped
+         * them). */
+        const size_t large = kind == EDEN_HEAP_ALIGNED ? b : bytes;
+        if ((kind != EDEN_HEAP_ALIGNED || a <= 4096) && eden_heap_grows &&
+            large >= atomic_load_explicit(&eden_heap_large_from, memory_order_relaxed)) {
+          void *block = eden_heap_large_allocate(large);
+          if (block != NULL)
+            return block;
+        }
+        continue;
+      }
+      return NULL;
+    }
   }
 }
 

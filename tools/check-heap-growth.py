@@ -259,6 +259,19 @@ void *eden_heap_split_pages(size_t size) {
     return address;
 }
 void eden_heap_split_pages_free(void *address, size_t size) { munmap(address, size); atomic_fetch_sub(&split_blocks, 1); }
+// The guest memory service's recovery (src/guest_memory_service.inc), which the heap holds weakly:
+// the stand-in gives room back as packing cold guest memory does, when armed. A later call from a
+// worker thread only counts, so the sanitizers see no race on the stand-in's settings. Defined
+// weakly too, so the heap's weak declaration and this one agree.
+static atomic_int recover_calls, recover_armed;
+__attribute__((weak)) size_t eden_memory_recover_try(size_t bytes) {
+    (void)bytes;
+    atomic_fetch_add(&recover_calls, 1);
+    if (!atomic_exchange(&recover_armed, 0)) return 0;
+    commit_limit = (size_t)-1;
+    refuse_pages = refuse_split = 0;
+    return (size_t)32 << 20;
+}
 '''
 
 TEST = r'''
@@ -405,6 +418,8 @@ static void *worker(void *argument) {
 }
 
 int main(int argc, char **argv) {
+    // The heap's wait for memory (eden_heap_wait_for_memory): two 16 ms rounds here, not 125.
+    setenv("EDEN_HEAP_OOM_WAIT_MS", "32", 1);
     refuse_range = argc > 1 && strcmp(argv[1], "whole") == 0;
     const size_t piece = EDEN_HEAP_PIECE_SIZE, heap = (size_t)6144 << 20, whole = (size_t)3072 << 20;
     void *first = __wrap_malloc(100);
@@ -422,6 +437,26 @@ int main(int argc, char **argv) {
         assert(eden_heap_grow((size_t)16 << 20, atomic_load(&eden_heap_space_generation)));
         assert(!eden_heap_grow((size_t)80 << 20, atomic_load(&eden_heap_space_generation)));
         commit_limit = (size_t)-1;
+    }
+    if (!refuse_range) {
+        // A request the heap cannot grow for waits for memory instead of failing at once
+        // (eden_heap_wait_for_memory): recovery gives room back, and a large request then asks
+        // for its block of its own again instead of settling for the spaces.
+        refuse_pages = refuse_split = 1;   // no block of its own at first ...
+        commit_limit = 0;                  // ... and no room for another piece
+        atomic_store(&recover_armed, 1);
+        const int recover_before = atomic_load(&recover_calls);
+        unsigned char *waited = __wrap_malloc((size_t)200 << 20);
+        unsigned waited_blocks = 0;
+        assert(waited != NULL && atomic_load(&recover_calls) > recover_before);   // it waited, then fit
+        atomic_store(&recover_armed, 0);
+        assert(eden_heap_large_held(&waited_blocks) == ((size_t)200 << 20) && waited_blocks == 1);
+        fill(waited, (size_t)200 << 20, 21);
+        verify(waited, (size_t)200 << 20, 21);
+        __wrap_free(waited);
+        assert(eden_heap_large_held(&waited_blocks) == 0 && waited_blocks == 0);
+        commit_limit = (size_t)-1;
+        refuse_pages = refuse_split = 0;
     }
     // A packed arena's tail remains parent-owned, including for free/realloc routing.
     for (unsigned slot = 0; slot < EDEN_HEAP_SLOTS; ++slot) {
@@ -654,5 +689,5 @@ with tempfile.TemporaryDirectory(prefix='eden-heap-') as work:
 print('Heap by pieces: growth on demand, owners by address, requests larger than a piece, the 6 GiB limit, '
       'the 3 GiB whole-heap fallback, threads keeping more than an arena in arenas of their own (used again by '
       'the next threads), empty spaces given back while six threads take and free blocks and taken again in the '
-      'same range, a large block in pieces of memory when the pool has no one piece for it, and eight threads '
-      'under the thread sanitizer PASS')
+      'same range, a large block in pieces of memory when the pool has no one piece for it, a request that waits '
+      'for memory made and then takes a block of its own, and eight threads under the thread sanitizer PASS')
