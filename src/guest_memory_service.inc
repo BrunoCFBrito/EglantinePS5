@@ -2477,7 +2477,9 @@ void SwapReport(SparseRange& range) noexcept {
     }
     const auto& c = swap_counters;
     const std::uint64_t outs = c.out.load(), ins = c.in.load();
-    const std::size_t places_used = swap_next_place - swap_free_count;
+    // Places in use are the slots that are Out: the free-list counters are the swapper's, not read
+    // from this thread.
+    const std::size_t places_used = out;
     char line[640];
     const int length = std::snprintf(line, sizeof(line),
         "EDEN_SWAP mode=%d file=%s armed=%zuMiB out=%zuMiB in_file=%zuMiB places=%zu/%u "
