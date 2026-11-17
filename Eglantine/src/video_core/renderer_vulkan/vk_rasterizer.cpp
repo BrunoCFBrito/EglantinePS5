@@ -12,6 +12,8 @@
 #include "diagnostics.h"
 #include <filesystem>
 #include <array>
+#include <atomic>
+#include <ctime>
 #include <bit>
 #include <chrono>
 #include <cmath>
@@ -980,6 +982,67 @@ void SyncProbe(Scheduler& scheduler, const char* kind, const void* pipeline) {
     ::Eden::Report("sync", text);
     scheduler.Finish();
 }
+
+// EDEN_SLOW_DRAW_MS=<ms>: a draw that takes longer prints the wall and thread CPU time between
+// checkpoints through Draw and PrepareDraw (EDEN_SLOW_DRAW lines in stderr.log). Wall time well
+// above CPU time means the thread waited or was not scheduled; the checkpoint after the gap says
+// where. The first 400 such draws are printed.
+class SlowDraw {
+public:
+    static unsigned ThresholdMs() {
+        static const unsigned ms = [] {
+            const char* const value = std::getenv("EDEN_SLOW_DRAW_MS");
+            return value != nullptr ? static_cast<unsigned>(std::strtoul(value, nullptr, 10)) : 0u;
+        }();
+        return ms;
+    }
+    SlowDraw() {
+        if (ThresholdMs() == 0 || current != nullptr) return;
+        current = this;
+        Mark("start");
+    }
+    ~SlowDraw() {
+        if (current != this) return;
+        Mark("end");
+        current = nullptr;
+        const long long wall = marks[count - 1].wall - marks[0].wall;
+        if (wall < static_cast<long long>(ThresholdMs()) * 1'000'000) return;
+        static std::atomic<unsigned> printed{0};
+        if (printed.fetch_add(1, std::memory_order_relaxed) >= 400) return;
+        char line[1024];
+        int used = std::snprintf(line, sizeof(line), "EDEN_SLOW_DRAW wall=%.1fms cpu=%.1fms |",
+                                 wall / 1e6, (marks[count - 1].cpu - marks[0].cpu) / 1e6);
+        for (unsigned i = 1; i < count && used > 0 && used < static_cast<int>(sizeof(line)); ++i)
+            used += std::snprintf(line + used, sizeof(line) - used, " %s +%.1f/%.1f", marks[i].what,
+                                  (marks[i].wall - marks[i - 1].wall) / 1e6,
+                                  (marks[i].cpu - marks[i - 1].cpu) / 1e6);
+        std::fprintf(stderr, "%s\n", line);
+    }
+    SlowDraw(const SlowDraw&) = delete;
+    SlowDraw& operator=(const SlowDraw&) = delete;
+    static void At(const char* what) {
+        if (current != nullptr) current->Mark(what);
+    }
+
+private:
+    struct Point {
+        const char* what;
+        long long wall;
+        long long cpu;
+    };
+    static long long Clock(clockid_t clock) {
+        timespec now{};
+        if (clock_gettime(clock, &now) != 0) return 0;
+        return static_cast<long long>(now.tv_sec) * 1'000'000'000 + now.tv_nsec;
+    }
+    void Mark(const char* what) {
+        if (count == marks.size()) return;
+        marks[count++] = {what, Clock(CLOCK_MONOTONIC), Clock(CLOCK_THREAD_CPUTIME_ID)};
+    }
+    static inline thread_local SlowDraw* current = nullptr;
+    std::array<Point, 24> marks{};
+    unsigned count = 0;
+};
 } // namespace
 
 template <typename Func>
@@ -989,9 +1052,12 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         ++trace_draws;
     }
 
+    SlowDraw::At("prepare");
     SCOPE_EXIT {
+        SlowDraw::At("before tick work");
         VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::TickWork};
         gpu.TickWork();
+        SlowDraw::At("tick work");
     };
     SCOPE_EXIT {
         ReleaseMeshEmulationBuffers();
@@ -1027,7 +1093,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     {
         Profile::Scope scope{Profile::Zone::FlushWork};
         FlushWork();
+        SlowDraw::At("flush work");
         gpu_memory->FlushCaching();
+        SlowDraw::At("flush caching");
     }
     ::Eden::Performance::Mark(::Eden::Performance::draw_flush, phase);
     if (frame_dump.Capturing()) {
@@ -1054,6 +1122,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         return pipeline_cache.CurrentGraphicsPipeline();
     }()};
     ::Eden::Performance::Mark(::Eden::Performance::draw_pipeline, phase);
+    SlowDraw::At("pipeline");
     const bool verify_views = verify_pipeline != nullptr && verify_pipeline == pipeline;
     if (verify_pipeline != nullptr) {
         ++fast_draw_stats.verified;
@@ -1355,13 +1424,16 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         mesh_emulation_groups = groups;
         mesh_emulation_vertices_per_group = pipeline->MeshEmulationVerticesPerGroup();
     }
+    SlowDraw::At("mesh setup");
     {
         Profile::Scope scope{Profile::Zone::YieldToGuests};
         ::Eden::Performance::YieldToGuests();  // a guest thread asleep on a cache lock goes first
     }
     std::optional<Profile::Scope> lock_scope{std::in_place, Profile::Zone::CacheLock};
+    SlowDraw::At("yield");
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
     lock_scope.reset();
+    SlowDraw::At("cache lock");
     prepared_pipeline = pipeline;
     probe_pipeline = pipeline;
     SCOPE_EXIT {
@@ -1459,12 +1531,14 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         }
     }
 
+    SlowDraw::At("configure");
     {
         Profile::Scope scope{Profile::Zone::DynamicState};
         UpdateOcarinaJitter();
         UpdateDynamicStates(pipeline);
     }
 
+    SlowDraw::At("dynamic state");
     {
         Profile::Scope scope{Profile::Zone::DrawQueries};
         query_cache.NotifySegment(true);
@@ -1476,8 +1550,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         Profile::Scope scope{Profile::Zone::DrawRecord};
         scheduler.TraceGraphicsPipeline(pipeline->ShaderHashes());
         trace_draw_hashes = {pipeline->ShaderHashes()[1], pipeline->ShaderHashes()[5]};
+        SlowDraw::At("queries");
         draw_func();
     }
+    SlowDraw::At("record");
     Profile::Scope tail_scope{Profile::Zone::DrawTail};
     submitted = true;
     buffer_cache.NoteWorkRecorded(false);
@@ -1649,6 +1725,7 @@ void TraceWindowTarget(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::Memory
 
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
+    const SlowDraw slow_draw;
     {
         // A draw's first and count can come from memory a skipped (rejected) compute program
         // should have written. Past 16M vertices they are garbage: building the quad index
@@ -1883,6 +1960,7 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                 is_indexed ? "vkCmdDrawIndexed" : "vkCmdDraw", params, VK_SUCCESS);
         }
     });
+    SlowDraw::At("prepared");
     SyncProbe(scheduler, "draw", probe_pipeline);
 }
 
