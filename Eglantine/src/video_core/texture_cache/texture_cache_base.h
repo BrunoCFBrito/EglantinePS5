@@ -193,6 +193,19 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 emergency_last_deletes{};  ///< The counters at the previous frame (for the deltas)
     u64 emergency_last_created{};
     u64 emergency_log_frame{};     ///< Frame of the last EDEN_TC_EMERGENCY line (60-frame limit)
+    /// The long-unused pass while the shared pool alone is critical and this cache is under its
+    /// own marks (LongUnusedCollection): the state of the current run and the churn counters its
+    /// hysteresis compares, as the emergency mode's above.
+    bool long_unused_running{};       ///< A long-unused run is in progress
+    u64 long_unused_off_until{};      ///< Frame until which it stays off after churn
+    u64 long_unused_pressed_frames{}; ///< Frames on end the pool has been critical under the marks
+    u64 long_unused_check_frame{};    ///< Frame of the last churn check
+    u64 long_unused_check_usage{};    ///< The cache's usage at that check
+    u64 long_unused_deletes{};        ///< Collector deletes since it
+    u64 long_unused_created{};        ///< Images created since it
+    u64 long_unused_last_deletes{};   ///< The counters at the previous frame (for the deltas)
+    u64 long_unused_last_created{};
+    u64 long_unused_log_frame{};      ///< Frame of the last EDEN_TC_LONG_UNUSED line (60-frame limit)
     /// ShrinkOversized's state: when it may look next, whether it is still finding images, and
     /// the totals its EDEN_TC_SHRINK line prints.
     u64 oversized_next_pass{};
@@ -539,6 +552,12 @@ private:
     /// Whether the emergency collection is on this pass: the shared pool is critical and the last
     /// run did not turn into eviction churn. Logs the state changes as EDEN_TC_EMERGENCY.
     bool EmergencyTextureCollection(u64 usage, u64 expected, u64 critical);
+
+    /// Whether the long-unused pass runs this frame: the shared pool is critical, this cache is
+    /// under its own first mark, and the last run did not turn into eviction churn. Collects
+    /// nothing itself; RunGarbageCollector takes images older than EDEN_NX2_TC_SHORT_AGE while it
+    /// holds. Logs the state changes as EDEN_TC_LONG_UNUSED.
+    bool LongUnusedCollection(bool own_marks, bool out_of_memory, u64 usage, u64 expected);
 
     /// Deletes images whose memory went entirely to newer images (see ClassifySuperseded).
     void DeleteSupersededImages();
