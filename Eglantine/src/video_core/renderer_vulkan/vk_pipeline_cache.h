@@ -312,9 +312,22 @@ private:
     GraphicsPipelineCacheKey graphics_key{};
     GraphicsPipeline* current_pipeline{};
 
+    /// Why an eviction pass ran. The pool's pressure sets the age and the prebuilt budget, and a
+    /// pass the pool prompted is capped: it runs on the GPU thread in the middle of a frame.
+    enum class EvictionPass {
+        Scheduled, ///< The 600-frame check
+        Critical,  ///< The pool is critical and the last prompted pass is past its cooldown
+    };
     /// Destroys graphics pipelines unused for a while, once the GPU is done with them.
-    void EvictUnusedPipelines();
+    void EvictUnusedPipelines(EvictionPass pass);
+    /// The pool's pressure, sampled once a frame on the GPU thread (the probe behind it is
+    /// throttled to 100 ms and takes paths of the GPU thread's): the eviction rules above read
+    /// them, and the rest of the file may from any thread.
+    std::atomic<bool> pool_short{false};
+    std::atomic<bool> pool_critical{false};
     u64 frame_count{};
+    /// The first frame a critical eviction pass may run again (see TickFrame)
+    u64 evict_critical_next_frame{};
     /// Wait budget of native draws for unbuilt pipelines left in this frame, in microseconds
     /// (native_async_draws = Bounded). Only touched on the GPU thread; reset in TickFrame.
     s64 native_wait_budget_us{8000};
