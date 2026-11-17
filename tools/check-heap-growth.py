@@ -298,6 +298,20 @@ static void verify(const unsigned char *block, size_t size, unsigned seed) {
     for (size_t i = 0; i < size; i = (i == 4095 && size > 8192) ? size - 4096 : i + 1)
         if (block[i] != (unsigned char)(seed + i * 131u)) { fprintf(stderr, "pattern damaged at %p+%zu\n", (void *)block, i); abort(); }
 }
+// Every arena's blocks find it by address, and everything past its payload does not: the slot tail,
+// and the rest of a shader compile thread's 1 MiB arena slot, belong to the parent spaces.
+static void check_arena_slots(void) {
+    for (unsigned slot = 0; slot < EDEN_HEAP_SLOTS; ++slot) {
+        void *arena = atomic_load(&eden_heap_slots[slot]);
+        if (arena == NULL) continue;
+        const uintptr_t begin = (((uintptr_t)ps5_heap_base >> EDEN_HEAP_ARENA_SHIFT) + slot) << EDEN_HEAP_ARENA_SHIFT;
+        const unsigned payload = atomic_load(&eden_heap_slot_payload[slot]);
+        assert(payload == EDEN_HEAP_ARENA_PAYLOAD || payload == EDEN_HEAP_ARENA_SMALL_PAYLOAD);
+        assert(eden_heap_arena_owner((void *)(begin + payload - 1)) == arena);
+        assert(eden_heap_arena_owner((void *)(begin + payload)) == NULL);
+        assert(eden_heap_arena_owner((void *)(begin + EDEN_HEAP_ARENA_SIZE - 1)) == NULL);
+    }
+}
 struct held { unsigned char *block; size_t size; unsigned seed; };
 static unsigned long long spills_now(void) {
     unsigned long long spills = 0;
@@ -324,6 +338,19 @@ static void keep_and_free(int threads, unsigned char *(*kept)[KEPT]) {
     // Freed by another thread, as the GPU thread frees what the builders made.
     for (int t = 0; t < threads; ++t)
         for (int i = 0; i < KEPT; ++i) { verify(kept[t][i], KEPT_SIZE, (unsigned)i); __wrap_free(kept[t][i]); }
+}
+// A thread whose name says it compiles shaders (EDEN_HEAP_ARENA_SMALL): its arenas are 1 MiB, and
+// its small blocks still find their own arena (check_arena_slots).
+static void *shader_keeper(void *argument) {
+    assert(pthread_setname_np(pthread_self(), (const char *)argument) == 0);
+    unsigned char *kept[KEPT];
+    for (int i = 0; i < KEPT; ++i) {
+        kept[i] = __wrap_malloc(KEPT_SIZE);
+        assert(kept[i] != NULL);
+        fill(kept[i], KEPT_SIZE, (unsigned)i + 77);
+    }
+    for (int i = 0; i < KEPT; ++i) { verify(kept[i], KEPT_SIZE, (unsigned)i + 77); __wrap_free(kept[i]); }
+    return NULL;
 }
 
 // Threads that take and free blocks of the heap's spaces while another gives back the spaces that
@@ -459,13 +486,35 @@ int main(int argc, char **argv) {
         refuse_pages = refuse_split = 0;
     }
     // A packed arena's tail remains parent-owned, including for free/realloc routing.
-    for (unsigned slot = 0; slot < EDEN_HEAP_SLOTS; ++slot) {
-        void *arena = atomic_load(&eden_heap_slots[slot]);
-        if (arena == NULL) continue;
-        const uintptr_t begin = (((uintptr_t)ps5_heap_base >> EDEN_HEAP_ARENA_SHIFT) + slot) << EDEN_HEAP_ARENA_SHIFT;
-        assert(eden_heap_arena_owner((void *)(begin + EDEN_HEAP_ARENA_PAYLOAD - 1)) == arena);
-        assert(eden_heap_arena_owner((void *)(begin + EDEN_HEAP_ARENA_PAYLOAD)) == NULL);
-        assert(eden_heap_arena_owner((void *)(begin + EDEN_HEAP_ARENA_SIZE - 1)) == NULL);
+    check_arena_slots();
+    // Shader compile threads get 1 MiB arenas (EDEN_HEAP_ARENA_SMALL): 13.6 MiB of small blocks each
+    // needs several, and they are still found by address past the full-size payload boundary.
+    {
+        const unsigned before = eden_heap_arenas_created();
+        pthread_t shaders[2];
+        assert(pthread_create(&shaders[0], NULL, shader_keeper, (void *)"VkShaderCpu") == 0);
+        assert(pthread_create(&shaders[1], NULL, shader_keeper, (void *)"VkShaderDriver") == 0);
+        for (int i = 0; i < 2; ++i) pthread_join(shaders[i], NULL);
+        if (eden_heap_arenas_created() < before + 2) {
+            fprintf(stderr, "shader keepers: arenas %u -> %u\n", before, eden_heap_arenas_created());
+            abort();
+        }
+        unsigned small = 0;
+        for (unsigned slot = 0; slot < EDEN_HEAP_SLOTS; ++slot)
+            if (atomic_load(&eden_heap_slots[slot]) != NULL &&
+                atomic_load(&eden_heap_slot_payload[slot]) == EDEN_HEAP_ARENA_SMALL_PAYLOAD)
+                ++small;
+        if (small == 0) {
+            fprintf(stderr, "the shader keepers' arenas are not 1 MiB\n");
+            abort();
+        }
+        check_arena_slots();
+        // Freed: the 1 MiB arenas hold nothing (the next trim gives them back or keeps them empty).
+        for (unsigned slot = 0; slot < EDEN_HEAP_SLOTS; ++slot)
+            if (atomic_load(&eden_heap_slots[slot]) != NULL &&
+                atomic_load(&eden_heap_slot_payload[slot]) == EDEN_HEAP_ARENA_SMALL_PAYLOAD)
+                assert(atomic_load(&eden_heap_slot_live[slot]) == 0);
+        (void)eden_heap_trim();
     }
     // Empty arenas are given back (eden_heap_trim) while the workers take, free and resize small
     // blocks in them: an arena destroyed with a thread inside, or with a block in use, faults,
