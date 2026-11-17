@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <cstdlib>
 #include <memory>
 #include <type_traits>
 #include <utility>
@@ -38,6 +39,17 @@ public:
         if (root.used_objects == root.num_objects) {
             // Root chunk has been filled, squash allocations into it
             const size_t total_objects{root.num_objects + new_chunk_size * (chunks.size() - 1)};
+            // A pool whose squashed chunk would pass the cap returns its memory instead of
+            // keeping its largest shader's worth for good, in every main, spare, worker and stage
+            // pool (Fable 5.2 ranked this first for the ~1.2 GB of process heap above the game's
+            // needs; BC-250 at 64 MiB: cold-compile peak 5.6 -> 3.7 GB, worst freeze 13 -> 6.9 s).
+            // Free() needs one chunk of the pool's own to start again, so this is compile time
+            // spent only on shaders whose IR passes the cap.
+            if (const size_t cap{CapBytes()};
+                cap != 0 && total_objects * sizeof(Storage) > cap) {
+                Free();
+                return;
+            }
             chunks.clear();
             chunks.emplace_back(total_objects);
         } else {
@@ -49,6 +61,24 @@ public:
     }
 
 private:
+    /// The most memory one pool may keep between shaders, from EDEN_NX2_IR_POOL_CAP_MIB (0 or
+    /// unset keeps everything). PS5 defaults it to 64 MiB: ReleaseContents otherwise retains the
+    /// largest shader a pool ever translated, and the BC-250 (same APU as the console) measured
+    /// the cold-compile heap peak drop by 1.9 GB with this cap. Every pool reads the setting once.
+    static size_t CapBytes() {
+        static const size_t cap = [] {
+            if (const char* const text = std::getenv("EDEN_NX2_IR_POOL_CAP_MIB")) {
+                return static_cast<size_t>(std::strtoull(text, nullptr, 10)) << 20;
+            }
+#if defined(__PROSPERO__) // PS5
+            return size_t{64} << 20;
+#else
+            return size_t{0};
+#endif
+        }();
+        return cap;
+    }
+
     struct NonTrivialDummy {
         NonTrivialDummy() noexcept {}
     };
