@@ -26,6 +26,7 @@
 #include <sys/stat.h>
 extern "C" size_t eden_heap_last_failure(unsigned*, size_t*);
 extern "C" void eden_heap_set_large(size_t kib);
+extern "C" void eden_heap_reserve_emergency(void);
 #endif
 #ifdef EDEN_DEV_VULKAN
 #include "sdk_audit.h"
@@ -337,6 +338,7 @@ int main(int argc, char** argv) {
         static Eden::LogFlusher log_flusher;
         if (!log_flusher.Start(Eden::LoadPreferences().immediate_logs)) return 2;
         Eden::Crash::Install(Eden::LogsDir(), Eden::kAppVersion, last_crash.restarted);
+        eden_heap_reserve_emergency(); // memory for the last try and the crash report (heap_arenas.inc)
         Eden::BootTrace::Ready(Eden::LogsDir(), Eden::FilesystemAccess());
         Eden::BootTrace::Line("logs and crash handler ready (%s)", Eden::LogsDir().c_str());
         for (const char* folder : {"/app0", Eden::kMountedAppDir, Eden::kInstallDir, "/mnt/sandbox/PPSA98515_000/app0"})

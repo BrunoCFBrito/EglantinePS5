@@ -836,6 +836,40 @@ static unsigned eden_heap_wait_rounds(void) {
   return (unsigned)value;
 }
 
+/* Memory kept back for the end (EDEN_HEAP_EMERGENCY_MIB, 32 by default, 0: none): a large block
+ * taken at start-up and never used. When a request has waited its full time for memory, the block
+ * goes back to the pool and the request tries once more; if it fails anyway, the crash report has
+ * memory to be written with (Ocarina, 2026-11-15: the app ended at a failed allocation with no
+ * report at all). Once. Ported from bxymartin/EglantinePS5 edae12e. */
+static _Atomic(void *) eden_heap_emergency;
+
+void eden_heap_reserve_emergency(void) {
+  if (!ps5_heap_ready() || atomic_load_explicit(&eden_heap_emergency, memory_order_relaxed) != NULL)
+    return;
+  const char *text = getenv("EDEN_HEAP_EMERGENCY_MIB");
+  const long mib = text != NULL ? strtol(text, NULL, 10) : 32;
+  if (mib <= 0)
+    return;
+  void *block = eden_heap_large_allocate((size_t)mib << 20);
+  if (block != NULL)
+    atomic_store_explicit(&eden_heap_emergency, block, memory_order_release);
+}
+
+static int eden_heap_release_emergency(void) {
+  void *block = atomic_exchange_explicit(&eden_heap_emergency, NULL, memory_order_acq_rel);
+  if (block == NULL)
+    return 0;
+  const int entry = eden_heap_large_find(block);
+  if (entry < 0)
+    return 0;
+  const size_t bytes = eden_heap_large[entry].size;
+  eden_heap_large_free(entry);
+  char line[96];
+  snprintf(line, sizeof(line), "EDEN_HEAP emergency memory given back: %zu MiB\n", bytes >> 20);
+  sceKernelDebugOutText(0, line);
+  return 1;
+}
+
 /* The heap could not grow for `bytes` (Ocarina at an area's load: the pool shared with the GPU
  * empty for a moment while shaders compile and textures upload). Instead of the request failing
  * (std::bad_alloc, the session ends), cold guest memory goes out and the thread waits 16 ms, for at
@@ -846,7 +880,7 @@ static int eden_heap_wait_for_memory(size_t bytes, unsigned *rounds) {
   if (why != EDEN_HEAP_WHY_NO_MEMORY && why != EDEN_HEAP_WHY_AT_LIMIT)
     return 0;
   if (*rounds >= eden_heap_wait_rounds())
-    return 0;
+    return eden_heap_release_emergency(); /* one more try with the memory kept back, then none */
   /* The record only if the thread has one: making one may allocate. */
   struct eden_heap_thread *self =
       eden_heap_arena_key_valid ? pthread_getspecific(eden_heap_arena_key) : NULL;
