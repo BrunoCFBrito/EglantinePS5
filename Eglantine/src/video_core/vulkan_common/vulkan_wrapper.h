@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include "performance.h"
 #include <exception>
@@ -695,6 +696,13 @@ public:
         return *dld;
     }
 };
+
+/// Called with an image about to be destroyed; returns true when it keeps the image and its
+/// memory for reuse instead (the memory allocator's image recycling), false to destroy it as
+/// usual. The allocator installs it while recycling is on (EDEN_NX2_IMAGE_RECYCLE_MIB).
+using ImageRecycler = bool (*)(VmaAllocator allocator, VkImage image,
+                               VmaAllocation allocation) noexcept;
+inline std::atomic<ImageRecycler> g_image_recycler{nullptr};
 
 class Image {
 public:

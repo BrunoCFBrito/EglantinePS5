@@ -531,6 +531,15 @@ void Image::SetObjectNameEXT(const char* name) const {
 
 void Image::Release() const noexcept {
     if (handle) {
+        // A freed image with memory of its own is kept for reuse instead of destroyed (the memory
+        // allocator's image recycling): a new image with the same create info is handed back in
+        // its place. Its contents are undefined, as a new image's are.
+        if (allocation != nullptr) {
+            const ImageRecycler recycler = g_image_recycler.load(std::memory_order_acquire);
+            if (recycler != nullptr && recycler(allocator, handle, allocation)) {
+                return;
+            }
+        }
         vmaDestroyImage(allocator, handle, allocation);
     }
 }

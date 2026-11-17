@@ -10,9 +10,12 @@
 #include <cstdio>
 #include <array>
 #include <bit>
+#include <deque>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -227,6 +230,261 @@ void MemoryCommit::Release() {
 }
 
 namespace {
+// Image recycling (EDEN_NX2_IMAGE_RECYCLE_MIB, default 256, 0: off; EDEN_NX2_IMAGE_RECYCLE_MS,
+// default 1000). Games render into transient targets at a different address every frame (Ocarina:
+// a 960x540 RGBA16F colour target and a 256x256 depth one, up to 45 a second, 2026-11-16), so the
+// texture cache deletes last frame's images as superseded and makes new ones. Each new one took
+// fresh device memory and freeing it left the blocks 0.4-1.1 GB empty. A freed image with memory
+// of its own (VMA dedicates one when it is larger than half a block: 4 MiB with the 8 MiB blocks
+// the console uses) of 4 MiB and more is kept instead of destroyed and handed back as it is to
+// the next request with an identical create info. A new image's contents are undefined and every
+// first use transitions it from VK_IMAGE_LAYOUT_UNDEFINED, so a recycled one behaves the same.
+// Kept for EDEN_NX2_IMAGE_RECYCLE_MS at most and EDEN_NX2_IMAGE_RECYCLE_MIB in all, and never
+// while the pool is critical: the kept images go back to the driver then (the game's memory is
+// worth more than a reuse), and nothing new is kept. Ported from lethevimlet/lichii-bc250
+// 65c6b7790f, with the critical rule from bxymartin/PokeDinner b9e00405.
+struct ImageRecyclePool {
+    struct Key {
+        std::vector<u32> words;
+        bool operator==(const Key&) const = default;
+    };
+    struct Entry {
+        Key key;
+        VkImage image{};
+        VmaAllocation allocation{};
+        u64 size{};
+        s64 since{}; ///< steady clock, nanoseconds, when the image was kept
+    };
+    std::mutex mutex;
+    std::atomic<u64> cap{};   ///< bytes the kept images may hold in all (0: recycling off)
+    u64 held{};               ///< bytes the kept images hold now
+    VmaAllocator allocator{}; ///< the allocator the kept images belong to
+    std::unordered_map<VkImage, std::pair<Key, u64>> candidates; ///< Recyclable images in use
+    std::deque<Entry> free;                                      ///< Nobody uses them, oldest first
+    u64 hits{}, kept{}, evicted{};
+    std::chrono::steady_clock::time_point last_report{};
+};
+ImageRecyclePool g_image_pool;
+constexpr u64 MinRecycledImageBytes = 4ull << 20;
+
+s64 RecycleKeepNs() {
+    static const s64 ns = [] {
+        const char* value = std::getenv("EDEN_NX2_IMAGE_RECYCLE_MS");
+        const unsigned long long ms =
+            value != nullptr ? std::strtoull(value, nullptr, 10) : 1000ull;
+        return static_cast<s64>(ms) * 1'000'000;
+    }();
+    return ns;
+}
+
+s64 RecycleNowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+/// The create info as words, or nullopt when it carries anything but a view format list. The
+/// initial layout must be UNDEFINED: a recycled image was left in whatever layout its last owner
+/// put it in, and only then may its contents be discarded and used as a new image's are.
+std::optional<ImageRecyclePool::Key> RecycleKey(const VkImageCreateInfo& ci) {
+    if (ci.tiling != VK_IMAGE_TILING_OPTIMAL ||
+        (ci.flags & (VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT |
+                     VK_IMAGE_CREATE_SPARSE_ALIASED_BIT)) != 0 ||
+        ci.sharingMode != VK_SHARING_MODE_EXCLUSIVE || ci.queueFamilyIndexCount != 0 ||
+        ci.initialLayout != VK_IMAGE_LAYOUT_UNDEFINED) {
+        return std::nullopt;
+    }
+    ImageRecyclePool::Key key;
+    key.words = {static_cast<u32>(ci.flags),        static_cast<u32>(ci.imageType),
+                 static_cast<u32>(ci.format),       ci.extent.width,
+                 ci.extent.height,                  ci.extent.depth,
+                 ci.mipLevels,                      ci.arrayLayers,
+                 static_cast<u32>(ci.samples),      ci.usage,
+                 static_cast<u32>(ci.initialLayout)};
+    for (auto* next = static_cast<const VkBaseInStructure*>(ci.pNext); next != nullptr;
+         next = next->pNext) {
+        if (next->sType != VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO) {
+            return std::nullopt;
+        }
+        const auto* list = reinterpret_cast<const VkImageFormatListCreateInfo*>(next);
+        key.words.push_back(0xF0F0F0F0u);
+        for (u32 i = 0; i < list->viewFormatCount; ++i) {
+            key.words.push_back(static_cast<u32>(list->pViewFormats[i]));
+        }
+    }
+    return key;
+}
+
+void DestroyRecycled(VmaAllocator allocator, std::vector<ImageRecyclePool::Entry>& entries) {
+    for (const auto& entry : entries) {
+        vmaDestroyImage(allocator, entry.image, entry.allocation);
+    }
+    entries.clear();
+}
+
+/// pool.mutex held: every kept image goes into `destroy`, which the caller destroys outside the
+/// lock. Returns the bytes they held.
+u64 MoveAllRecycledLocked(std::vector<ImageRecyclePool::Entry>& destroy) {
+    auto& pool = g_image_pool;
+    u64 bytes = 0;
+    while (!pool.free.empty()) {
+        bytes += pool.free.front().size;
+        destroy.push_back(std::move(pool.free.front()));
+        pool.free.pop_front();
+    }
+    pool.held = 0;
+    return bytes;
+}
+
+/// pool.mutex held: the kept images past their time and the oldest above the cap go into
+/// `destroy`; the bin is ordered by when images were kept, so both are at its front.
+void ExpireRecycledLocked(std::vector<ImageRecyclePool::Entry>& destroy) {
+    auto& pool = g_image_pool;
+    const s64 now = RecycleNowNs();
+    const s64 keep = RecycleKeepNs();
+    const u64 cap = pool.cap.load(std::memory_order_relaxed);
+    while (!pool.free.empty() &&
+           (pool.held > cap || now - pool.free.front().since > keep)) {
+        pool.held -= pool.free.front().size;
+        destroy.push_back(std::move(pool.free.front()));
+        pool.free.pop_front();
+        ++pool.evicted;
+    }
+}
+
+/// pool.mutex held: one line per 30 s on what the recycler keeps and has done.
+void ReportRecycleLocked() {
+    auto& pool = g_image_pool;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - pool.last_report < std::chrono::seconds{30}) {
+        return;
+    }
+    pool.last_report = now;
+    LOG_INFO(Render_Vulkan, "Image recycling: {} reused, {} kept, {} gone after their time, {} MiB held",
+             pool.hits, pool.kept, pool.evicted, pool.held >> 20);
+}
+
+/// A kept image with that create info, the one kept longest ago first. The caller gives it back
+/// to a new owner: it is in use again, so a later release keeps it again.
+bool TakeRecycled(const ImageRecyclePool::Key& key, VkImage& image, VmaAllocation& allocation) {
+    auto& pool = g_image_pool;
+    if (pool.cap.load(std::memory_order_relaxed) == 0) {
+        return false;
+    }
+    std::vector<ImageRecyclePool::Entry> destroy;
+    ImageRecyclePool::Entry found;
+    VmaAllocator pool_allocator{};
+    bool hit = false;
+    {
+        std::scoped_lock lock{pool.mutex};
+        pool_allocator = pool.allocator;
+        ExpireRecycledLocked(destroy);
+        for (auto it = pool.free.begin(); it != pool.free.end(); ++it) {
+            if (!(it->key == key)) {
+                continue;
+            }
+            found = std::move(*it);
+            pool.free.erase(it);
+            pool.held -= found.size;
+            pool.candidates.emplace(found.image, std::make_pair(found.key, found.size));
+            ++pool.hits;
+            hit = true;
+            break;
+        }
+        ReportRecycleLocked();
+    }
+    if (pool_allocator != nullptr) {
+        DestroyRecycled(pool_allocator, destroy);
+    }
+    if (hit) {
+        image = found.image;
+        allocation = found.allocation;
+    }
+    return hit;
+}
+
+/// vk::Image::Release's hook (vk::g_image_recycler): an image about to be destroyed is kept for
+/// reuse when it is one of the candidates made with its own memory, and destroyed as usual when
+/// false is returned. Called after the texture cache's destruction delay, so the GPU is done with
+/// it. While the pool is critical nothing is kept and the images kept until now go back.
+bool RecycleImage(VmaAllocator allocator, VkImage image, VmaAllocation allocation) noexcept {
+    auto& pool = g_image_pool;
+    std::vector<ImageRecyclePool::Entry> destroy;
+    VmaAllocator pool_allocator{};
+    bool kept = false;
+    {
+        std::scoped_lock lock{pool.mutex};
+        if (pool.cap.load(std::memory_order_relaxed) == 0 || allocator != pool.allocator) {
+            return false;
+        }
+        const auto it = pool.candidates.find(image);
+        if (it == pool.candidates.end()) {
+            return false;
+        }
+        ImageRecyclePool::Key key = std::move(it->second.first);
+        const u64 size = it->second.second;
+        pool.candidates.erase(it);
+        pool_allocator = pool.allocator;
+        if (::Eden::Performance::GraphicsMemoryIsCritical()) {
+            // A recycler must never hold memory while the pool is critical: what it keeps goes
+            // back to the driver, and this image is destroyed as usual by its owner.
+            MoveAllRecycledLocked(destroy);
+        } else {
+            pool.free.push_back({std::move(key), image, allocation, size, RecycleNowNs()});
+            pool.held += size;
+            ++pool.kept;
+            ExpireRecycledLocked(destroy);
+            kept = true;
+        }
+        ReportRecycleLocked();
+    }
+    if (pool_allocator != nullptr) {
+        DestroyRecycled(pool_allocator, destroy);
+    }
+    return kept;
+}
+} // Anonymous namespace
+
+u64 FlushImageRecyclePool() {
+    auto& pool = g_image_pool;
+    std::vector<ImageRecyclePool::Entry> destroy;
+    VmaAllocator pool_allocator{};
+    u64 bytes = 0;
+    {
+        std::scoped_lock lock{pool.mutex};
+        pool_allocator = pool.allocator;
+        bytes = MoveAllRecycledLocked(destroy);
+        if (bytes != 0) {
+            ReportRecycleLocked();
+        }
+    }
+    if (pool_allocator != nullptr) {
+        DestroyRecycled(pool_allocator, destroy);
+    }
+    return bytes;
+}
+
+void ReleaseImageRecyclePool() {
+    auto& pool = g_image_pool;
+    std::vector<ImageRecyclePool::Entry> destroy;
+    VmaAllocator pool_allocator{};
+    {
+        std::scoped_lock lock{pool.mutex};
+        vk::g_image_recycler.store(nullptr, std::memory_order_release);
+        pool_allocator = pool.allocator;
+        MoveAllRecycledLocked(destroy);
+        // The candidates are images their owners still hold: with the hook off, their own
+        // destructors destroy them (the allocator pointer is cleared last).
+        pool.candidates.clear();
+        pool.cap.store(0, std::memory_order_relaxed);
+        pool.allocator = nullptr;
+    }
+    if (pool_allocator != nullptr) {
+        DestroyRecycled(pool_allocator, destroy);
+    }
+}
+
+namespace {
 std::mutex vma_probe_mutex;
 VmaAllocator vma_probe_allocator{};
 void EdenVmaSnapshot(VmaAllocator allocator, unsigned tag) {
@@ -271,6 +529,28 @@ MemoryAllocator::MemoryAllocator(const Device &device_)
                 }
             }
         });
+    }
+    {
+        // Image recycling: hand freed images with their own memory back to the next request of
+        // the same shape instead of destroying and remaking them (vulkan_wrapper.h's
+        // g_image_recycler, RecycleImage above). EDEN_NX2_IMAGE_RECYCLE_MIB=0 turns it off.
+        static const u64 recycle_cap = [] {
+            const char* value = std::getenv("EDEN_NX2_IMAGE_RECYCLE_MIB");
+            const unsigned long long mib =
+                value != nullptr ? std::strtoull(value, nullptr, 10) : 256ull;
+            return static_cast<u64>(mib) << 20;
+        }();
+        std::scoped_lock lock{g_image_pool.mutex};
+        if (recycle_cap != 0 && g_image_pool.allocator == nullptr) {
+            g_image_pool.cap.store(recycle_cap, std::memory_order_relaxed);
+            g_image_pool.allocator = allocator;
+            vk::g_image_recycler.store(RecycleImage, std::memory_order_release);
+            LOG_INFO(Render_Vulkan,
+                     "Image recycling: images of {} MiB and more with their own memory are kept up "
+                     "to {} MiB and {} ms for reuse (EDEN_NX2_IMAGE_RECYCLE_MIB=0 turns it off)",
+                     MinRecycledImageBytes >> 20, recycle_cap >> 20,
+                     static_cast<unsigned long long>(RecycleKeepNs() / 1'000'000));
+        }
     }
 }
 
@@ -319,8 +599,32 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
     VmaAllocationInfo alloc_info{};
     const u64 texels = u64{ci.extent.width} * ci.extent.height * ci.extent.depth * ci.arrayLayers;
     const bool huge = texels > MaxBackedImageTexels;
+    // A target of the same shape kept from a moment ago is handed back as it is (RecycleImage).
+    std::optional<ImageRecyclePool::Key> recycle_key;
+    if (g_image_pool.cap.load(std::memory_order_relaxed) != 0 && !huge) {
+        recycle_key = RecycleKey(ci);
+        if (recycle_key && TakeRecycled(*recycle_key, handle, allocation)) {
+            image = vk::Image(handle, ci.usage, *device.GetLogical(), allocator, allocation,
+                              device.GetDispatchLoader());
+            return VK_SUCCESS;
+        }
+    }
+    bool host_placed = false;
     VkResult result = huge ? VK_ERROR_OUT_OF_DEVICE_MEMORY
                            : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
+        // The images the recycler keeps are memory their owners have already given up: give it
+        // back to the driver before accepting that the pool is out, and try once more.
+        if (const u64 released = FlushImageRecyclePool(); released != 0) {
+            static std::atomic<u32> recycled_logged{0};
+            if (recycled_logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+                LOG_INFO(Render_Vulkan,
+                         "Image recycling: gave {} MiB back for a refused image, trying again",
+                         released >> 20);
+            }
+            result = vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+        }
+    }
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
         // Over the device memory budget (Switch 2 titles fill 8 GB cards): let the driver page
         // it out rather than failing the draw and aborting.
@@ -350,12 +654,15 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
         host.preferredFlags = 0;
         result = vmaCreateImage(allocator, &ci, &host, &handle, &allocation, &alloc_info);
         static u32 host_logged{};
-        if (result == VK_SUCCESS && host_logged++ < 16) {
-            LOG_WARNING(Render_Vulkan,
-                        "Image {}x{}x{} ({} levels, {} layers, format {}) is out of device memory; "
-                        "placed in host memory",
-                        ci.extent.width, ci.extent.height, ci.extent.depth, ci.mipLevels,
-                        ci.arrayLayers, static_cast<u32>(ci.format));
+        if (result == VK_SUCCESS) {
+            host_placed = true;
+            if (host_logged++ < 16) {
+                LOG_WARNING(Render_Vulkan,
+                            "Image {}x{}x{} ({} levels, {} layers, format {}) is out of device "
+                            "memory; placed in host memory",
+                            ci.extent.width, ci.extent.height, ci.extent.depth, ci.mipLevels,
+                            ci.arrayLayers, static_cast<u32>(ci.format));
+            }
         }
     }
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
@@ -403,6 +710,19 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
         );
     }
 
+    if (recycle_key && allocation != nullptr && !host_placed &&
+        alloc_info.size >= MinRecycledImageBytes) {
+        VmaAllocationInfo2 info2{};
+        vmaGetAllocationInfo2(allocator, allocation, &info2);
+        // Its own memory: dedicated, or the only allocation in a block of exactly its size (VMA
+        // makes one for allocations over the block size, and it goes back whole when freed).
+        // Keeping such an image holds no more than its bytes.
+        if (info2.dedicatedMemory || info2.blockSize == info2.allocationInfo.size) {
+            std::scoped_lock lock{g_image_pool.mutex};
+            g_image_pool.candidates.emplace(
+                handle, std::make_pair(std::move(*recycle_key), alloc_info.size));
+        }
+    }
     image = vk::Image(handle, ci.usage, *device.GetLogical(), allocator, allocation,
                       device.GetDispatchLoader());
     return VK_SUCCESS;

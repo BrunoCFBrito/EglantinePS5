@@ -897,6 +897,9 @@ Device::~Device() {
 #endif
     SaveStaticPipelineCache();
     ShutdownGPULogging();
+    // The images kept for reuse belong to the VMA allocator, not to a pool of their own: give
+    // them back before it goes.
+    ReleaseImageRecyclePool();
     for (auto& pools : separate_pools) {
         for (VmaPool pool : pools) {
             if (pool != VK_NULL_HANDLE) {
@@ -1049,6 +1052,13 @@ void Device::MaintainMemoryBlocks() const {
     next_ns.store(now + 500'000'000, std::memory_order_relaxed);
     if (!::Eden::Performance::GraphicsMemoryIsCritical()) {
         return;
+    }
+    // The images the allocator keeps for reuse go back first: a recycler must never hold memory
+    // while the pool is critical. Nothing new is kept while it is (RecycleImage).
+    if (const u64 recycled = FlushImageRecyclePool(); recycled != 0) {
+        LOG_INFO(Render_Vulkan,
+                 "EDEN_VK_RECYCLE released {} MiB of kept images while the pool is critical",
+                 recycled >> 20);
     }
     u32 blocks = 0;
     const u64 freed = ReleaseEmptySeparatePools(4, blocks);

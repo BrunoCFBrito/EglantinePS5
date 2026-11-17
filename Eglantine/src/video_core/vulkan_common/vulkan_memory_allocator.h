@@ -89,6 +89,15 @@ namespace Vulkan {
         void *mapped_ptr{};  ///< Optional persistent mapped pointer
     };
 
+/// Destroys the images the allocator keeps for reuse and stops keeping more: before the VMA
+/// allocator they belong to goes (Device's destructor).
+void ReleaseImageRecyclePool();
+
+/// Destroys the images kept for reuse now, returning the bytes given back; the recycler stays on.
+/// The caches and the allocator call it while the pool is critical and an image is refused: a
+/// recycler must never hold memory the game could use.
+u64 FlushImageRecyclePool();
+
 /// Memory allocator container.
 /// Allocates and releases memory allocations on demand.
     class MemoryAllocator {
