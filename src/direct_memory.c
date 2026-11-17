@@ -45,12 +45,13 @@ static void eden_direct_release(void) { atomic_flag_clear_explicit(&eden_direct_
  * (eden_direct_report): a pool split into hundreds of holes is made by many small gives back
  * between blocks that stay. The cost of placing blocks at the top is counted too: every try
  * there is a call to the system. */
-#define EDEN_DIRECT_SITES 64
+#define EDEN_DIRECT_SITES 256
 struct eden_direct_site {
   uintptr_t caller;
   unsigned long count;
   unsigned long bytes;
 };
+/* The last entry of each table counts every site past the others (printed as site=other). */
 static struct eden_direct_site eden_direct_takes[EDEN_DIRECT_SITES], eden_direct_gives[EDEN_DIRECT_SITES];
 static atomic_flag eden_direct_sites_lock = ATOMIC_FLAG_INIT;
 static atomic_ulong eden_direct_high_calls, eden_direct_high_tries, eden_direct_high_ns, eden_direct_take_rounds;
@@ -59,8 +60,8 @@ static void eden_direct_note(struct eden_direct_site *sites, const void *caller,
   const uintptr_t at = (uintptr_t)caller;
   while (atomic_flag_test_and_set_explicit(&eden_direct_sites_lock, memory_order_acquire)) {}
   for (unsigned i = 0; i < EDEN_DIRECT_SITES; ++i) {
-    if (sites[i].caller == at || sites[i].caller == 0 || i == EDEN_DIRECT_SITES - 1) {
-      sites[i].caller = sites[i].caller == 0 ? at : sites[i].caller; /* the last entry takes the rest */
+    if (i == EDEN_DIRECT_SITES - 1 || sites[i].caller == at || sites[i].caller == 0) {
+      if (i != EDEN_DIRECT_SITES - 1 && sites[i].caller == 0) sites[i].caller = at;
       sites[i].count++;
       sites[i].bytes += size;
       break;
@@ -86,8 +87,11 @@ static void eden_direct_print(FILE *out, const char *name, struct eden_direct_si
       if (copy[i].count != 0 && (best == EDEN_DIRECT_SITES || copy[i].count > copy[best].count)) best = i;
     if (best == EDEN_DIRECT_SITES) break;
     /* Offsets as EDEN_HEAP_SITE prints them (the code is loaded at 0x400000). */
-    fprintf(out, "%s n=%lu MiB=%lu site=%lx\n", name, copy[best].count, copy[best].bytes >> 20,
-            (unsigned long)(copy[best].caller - 0x400000ul));
+    if (best == EDEN_DIRECT_SITES - 1)
+      fprintf(out, "%s n=%lu MiB=%lu site=other\n", name, copy[best].count, copy[best].bytes >> 20);
+    else
+      fprintf(out, "%s n=%lu MiB=%lu site=%lx\n", name, copy[best].count, copy[best].bytes >> 20,
+              (unsigned long)(copy[best].caller - 0x400000ul));
     copy[best].count = 0;
   }
 }

@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <optional>
 #include <algorithm>
 #include "performance.h"
 #include "image_pages.h"
@@ -989,6 +990,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     }
 
     SCOPE_EXIT {
+        VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::TickWork};
         gpu.TickWork();
     };
     SCOPE_EXIT {
@@ -1085,7 +1087,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         TrackOotTonemappedImage(*pipeline);
     }
 #if defined(__PROSPERO__) // PS5
-    ::Eden::AstcPolicy::Draw(); // busy frames decode ASTC in the background (astc_policy.h)
+    {
+        Profile::Scope scope{Profile::Zone::AstcPolicy};
+        ::Eden::AstcPolicy::Draw(); // busy frames decode ASTC in the background (astc_policy.h)
+    }
 #endif // PS5
     // Task/mesh pipelines: the draw's vertex count is the number of task workgroups.
     mesh_draw = pipeline->IsMeshPipeline();
@@ -1350,8 +1355,13 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         mesh_emulation_groups = groups;
         mesh_emulation_vertices_per_group = pipeline->MeshEmulationVerticesPerGroup();
     }
-    ::Eden::Performance::YieldToGuests();  // a guest thread asleep on a cache lock goes first
+    {
+        Profile::Scope scope{Profile::Zone::YieldToGuests};
+        ::Eden::Performance::YieldToGuests();  // a guest thread asleep on a cache lock goes first
+    }
+    std::optional<Profile::Scope> lock_scope{std::in_place, Profile::Zone::CacheLock};
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+    lock_scope.reset();
     prepared_pipeline = pipeline;
     probe_pipeline = pipeline;
     SCOPE_EXIT {
@@ -1455,15 +1465,20 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         UpdateDynamicStates(pipeline);
     }
 
-    query_cache.NotifySegment(true);
-    HandleTransformFeedback();
-    query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, maxwell3d->regs.zpass_pixel_count_enable);
+    {
+        Profile::Scope scope{Profile::Zone::DrawQueries};
+        query_cache.NotifySegment(true);
+        HandleTransformFeedback();
+        query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
+                                  maxwell3d->regs.zpass_pixel_count_enable);
+    }
     {
         Profile::Scope scope{Profile::Zone::DrawRecord};
         scheduler.TraceGraphicsPipeline(pipeline->ShaderHashes());
         trace_draw_hashes = {pipeline->ShaderHashes()[1], pipeline->ShaderHashes()[5]};
         draw_func();
     }
+    Profile::Scope tail_scope{Profile::Zone::DrawTail};
     submitted = true;
     buffer_cache.NoteWorkRecorded(false);
     constexpr u64 final_vertex = 0x16aff33d999f993fULL;
