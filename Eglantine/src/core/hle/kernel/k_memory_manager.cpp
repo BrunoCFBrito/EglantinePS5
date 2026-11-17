@@ -471,8 +471,14 @@ size_t KMemoryManager::Impl::Initialize(KPhysicalAddress address, size_t size,
     // Setup region.
     m_pool = p;
     m_management_region = management;
-    m_page_reference_counts.resize(
-        Kernel::Board::Nintendo::Nx::KSystemControl::Init::GetIntendedMemorySize() / PageSize);
+    // One reference count per page of this manager's own region, not of the whole console: the
+    // vector is indexed with GetPageOffset(address), which is (address - region base) / PageSize
+    // (k_page_heap.h), so every index is inside [0, size / PageSize). Sized by the intended memory
+    // instead, each of the (up to MaxManagerCount) managers allocated 2 bytes for every 4 KiB page
+    // of the whole console to track its own slice: at 8-12 GiB that is 4-6 MiB each. The management
+    // layout above already reserves exactly (size / PageSize) * sizeof(u16) for it
+    // (ref_count_size), so the two now agree.
+    m_page_reference_counts.resize(size / PageSize);
     ASSERT(Common::IsAligned(GetInteger(m_management_region), PageSize));
 
     // Initialize the manager's KPageHeap.
