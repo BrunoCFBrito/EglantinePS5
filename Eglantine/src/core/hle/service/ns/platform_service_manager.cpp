@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <mutex>
 #include <span>
 #include <vector>
 #include <boost/container/static_vector.hpp>
@@ -89,13 +90,149 @@ void EncryptSharedFont(const std::vector<u32>& input, std::vector<u8>& output, s
     offset += transformed_font.size() * sizeof(u32);
 }
 
+/// Finds the .bfttf file of one shared font: the system NAND's data NCA, else the synthesized
+/// system archive. Used to read the file's size when the region table is built and, for a title
+/// that asks for the fonts, to read its bytes when they are decrypted.
+static FileSys::VirtualFile ResolveSharedFontFile(Core::System& system,
+                                                  const std::pair<FontArchives, const char*>& font) {
+    auto& fsc = system.GetFileSystemController();
+    const auto* nand = fsc.GetSystemNANDContents();
+    FileSys::VirtualFile romfs;
+    const auto nca = nand->GetEntry(static_cast<u64>(font.first), FileSys::ContentRecordType::Data);
+    if (nca) {
+        romfs = nca->GetRomFS();
+    }
+    if (!romfs) {
+        romfs = FileSys::SystemArchive::SynthesizeSystemArchive(static_cast<u64>(font.first));
+    }
+    if (!romfs) {
+        LOG_ERROR(Service_NS, "Failed to find or synthesize {:016X}! Skipping", font.first);
+        return nullptr;
+    }
+    const auto extracted_romfs = FileSys::ExtractRomFS(romfs);
+    if (!extracted_romfs) {
+        LOG_ERROR(Service_NS, "Failed to extract RomFS for {:016X}! Skipping", font.first);
+        return nullptr;
+    }
+    const auto font_fp = extracted_romfs->GetFile(font.second);
+    if (!font_fp) {
+        LOG_ERROR(Service_NS, "{:016X} has no file \"{}\"! Skipping", font.first, font.second);
+        return nullptr;
+    }
+    return font_fp;
+}
+
 struct IPlatformServiceManager::Impl {
     const FontRegion& GetSharedFontRegion(std::size_t index) const {
         return index < shared_font_regions.size() ? shared_font_regions[index] : EMPTY_REGION;
     }
+    /// Reads each font's file size and fills the region table. No font data is kept: this is what
+    /// GetSize, GetSharedMemoryAddressOffset and GetSharedFontInOrderOfPriority answer, and it is
+    /// all a title that never maps the font memory costs. The regions must match what
+    /// EnsureFontsLoaded produces, so the size of the u32-rounded file is used, as the decrypt is.
+    void EnsureFontRegions(Core::System& system) {
+        if (regions_built) {
+            return;
+        }
+        std::size_t offset = 0;
+        for (size_t font_index = 0; font_index < SHARED_FONTS.size(); ++font_index) {
+            const auto& font = SHARED_FONTS[font_index];
+            const auto font_fp = ResolveSharedFontFile(system, font);
+            if (!font_fp) {
+                continue;
+            }
+            const u64 bytes = (font_fp->GetSize() / sizeof(u32)) * sizeof(u32);
+            if (bytes <= 8 || bytes >= SHARED_FONT_MEM_SIZE - offset) {
+                LOG_ERROR(Service_NS, "Shared font {:016X} is {} bytes, too large; skipping",
+                          font.first, bytes);
+                continue;
+            }
+            // Font offset and size do not account for the header.
+            const FontRegion region{u32(offset + 8), u32(bytes - 8)};
+            shared_font_regions.push_back(region);
+            type_regions_of[font_index] = region;
+            offset += bytes;
+        }
+        regions_built = true;
+    }
+    /// Decrypts every font into shared_font, the 17 MiB the shared memory has. Called on the first
+    /// request that reads font data; a title that never asks for fonts never allocates or decrypts
+    /// them.
+    void EnsureFontsLoaded(Core::System& system) {
+        if (fonts_loaded) {
+            return;
+        }
+        EnsureFontRegions(system);
+        shared_font.assign(SHARED_FONT_MEM_SIZE, 0);
+        std::size_t offset = 0;
+        for (size_t font_index = 0; font_index < SHARED_FONTS.size(); ++font_index) {
+            const FontRegion region = type_regions_of[font_index];
+            if (region.size == 0) {
+                continue;
+            }
+            const u64 bytes = static_cast<u64>(region.size) + 8;
+            const auto font_fp = ResolveSharedFontFile(system, SHARED_FONTS[font_index]);
+            std::vector<u32> font_data_u32;
+            if (font_fp) {
+                font_data_u32.resize(font_fp->GetSize() / sizeof(u32));
+                font_fp->ReadBytes<u32>(font_data_u32.data(), font_fp->GetSize());
+                // We need to be BigEndian as u32s for the xor encryption.
+                std::transform(font_data_u32.begin(), font_data_u32.end(), font_data_u32.begin(),
+                               Common::swap32);
+            }
+            if (font_data_u32.size() * sizeof(u32) == bytes) {
+                DecryptSharedFont(font_data_u32, shared_font, offset);
+            } else {
+                // The file changed or vanished between the size pass and now: leave its region as
+                // it is (zeroed) and keep every later font at its region's offset.
+                LOG_ERROR(Service_NS, "Shared font {:016X} could not be read; its region stays empty",
+                          SHARED_FONTS[font_index].first);
+                offset += bytes;
+            }
+        }
+        fonts_loaded = true;
+    }
+    /// Builds the Switch 2 standard font (the firmware's with the controller button icons added)
+    /// and the built-in font region table. First Switch 2 font request only: it is ~17 MiB of
+    /// merged font that a Switch 1 title never asks for.
+    void EnsureBuiltinFont(Core::System& system) {
+        if (builtin_built) {
+            return;
+        }
+        EnsureFontsLoaded(system);
+        // Switch 2 titles look the controller button icons up in the standard font. The firmware's
+        // has none of them (they are in the extension font), so the icons would draw as "?". The
+        // copy of the standard font that Switch 2 titles get is the firmware's with those glyphs
+        // added.
+        constexpr size_t standard_type = static_cast<size_t>(SharedFontType::JapanUSEuropeStandard);
+        constexpr size_t extension_type = static_cast<size_t>(SharedFontType::NintendoExtended);
+        if (type_regions_of[standard_type].size != 0 && type_regions_of[extension_type].size != 0) {
+            const auto font_data = [&](const FontRegion& region) {
+                return std::span<const u8>{shared_font.data() + region.offset, region.size};
+            };
+            builtin_standard_font = MergeGlyphs(font_data(type_regions_of[standard_type]),
+                                                font_data(type_regions_of[extension_type]),
+                                                BUTTON_GLYPHS);
+        }
+        // The data after each BFTTF header is the plain font: GetBuiltInFontSharedMemory copies it.
+        u32 builtin_offset = 0;
+        for (size_t type_index = 0; type_index < type_regions_of.size(); ++type_index) {
+            const auto& region = type_regions_of[type_index];
+            const u32 size = type_index == standard_type && !builtin_standard_font.empty()
+                                 ? static_cast<u32>(builtin_standard_font.size())
+                                 : region.size;
+            builtin_font_sources.push_back(region.offset);
+            builtin_font_regions.push_back({builtin_offset, size});
+            builtin_offset = Common::AlignUp(builtin_offset + size, 0x1000);
+        }
+        builtin_font_memory_size = std::max<u32>(builtin_offset, 0x1000);
+        builtin_built = true;
+    }
     // Automatically populated based on shared_fonts dump or system archives.
     // 6 builtin fonts + extra 2 for whatever may come after
     boost::container::static_vector<FontRegion, 8> shared_font_regions;
+    /// The region of each SHARED_FONTS entry (zero when it could not be loaded), in font order.
+    std::array<FontRegion, SHARED_FONTS.size()> type_regions_of{};
     /// Where Switch 2 GetBuiltInFontData finds the same fonts as plain TTF data: page-aligned
     /// copies in builtin_font_memory (the Switch 1 font memory is full with the system fonts).
     boost::container::static_vector<FontRegion, 8> builtin_font_regions;
@@ -106,8 +243,13 @@ struct IPlatformServiceManager::Impl {
     u32 builtin_font_memory_size{};
     /// Made by the first GetBuiltInFontSharedMemory (Switch 2 titles only).
     Kernel::KSharedMemory* builtin_font_memory{};
-    /// Backing memory for the shared font data
-    std::array<u8, SHARED_FONT_MEM_SIZE> shared_font;
+    /// Backing memory for the shared font data, allocated and decrypted by EnsureFontsLoaded.
+    std::vector<u8> shared_font;
+    /// The three passes above, which any guest thread's font request may be the first to need.
+    std::mutex lock;
+    bool regions_built{};
+    bool fonts_loaded{};
+    bool builtin_built{};
 };
 
 IPlatformServiceManager::IPlatformServiceManager(Core::System& system_, const char* service_name_)
@@ -136,85 +278,17 @@ IPlatformServiceManager::IPlatformServiceManager(Core::System& system_, const ch
     // clang-format on
     RegisterHandlers(functions);
 
-    auto& fsc = system.GetFileSystemController();
-
-    // Attempt to load shared font data from disk
-    const auto* nand = fsc.GetSystemNANDContents();
-    std::size_t offset = 0;
-    // Each font type's region, empty when the font could not be loaded.
-    std::array<FontRegion, SHARED_FONTS.size()> type_regions{};
-    // Rebuild shared fonts from data ncas or synthesize
-    for (size_t font_index = 0; font_index < SHARED_FONTS.size(); ++font_index) {
-        const auto& font = SHARED_FONTS[font_index];
-        FileSys::VirtualFile romfs;
-        const auto nca =
-            nand->GetEntry(static_cast<u64>(font.first), FileSys::ContentRecordType::Data);
-        if (nca) {
-            romfs = nca->GetRomFS();
-        }
-
-        if (!romfs) {
-            romfs = FileSys::SystemArchive::SynthesizeSystemArchive(static_cast<u64>(font.first));
-        }
-
-        if (!romfs) {
-            LOG_ERROR(Service_NS, "Failed to find or synthesize {:016X}! Skipping", font.first);
-            continue;
-        }
-
-        const auto extracted_romfs = FileSys::ExtractRomFS(romfs);
-        if (!extracted_romfs) {
-            LOG_ERROR(Service_NS, "Failed to extract RomFS for {:016X}! Skipping", font.first);
-            continue;
-        }
-        const auto font_fp = extracted_romfs->GetFile(font.second);
-        if (!font_fp) {
-            LOG_ERROR(Service_NS, "{:016X} has no file \"{}\"! Skipping", font.first, font.second);
-            continue;
-        }
-        std::vector<u32> font_data_u32(font_fp->GetSize() / sizeof(u32));
-        font_fp->ReadBytes<u32>(font_data_u32.data(), font_fp->GetSize());
-        // We need to be BigEndian as u32s for the xor encryption
-        std::transform(font_data_u32.begin(), font_data_u32.end(), font_data_u32.begin(),
-                       Common::swap32);
-        // Font offset and size do not account for the header
-        const FontRegion region{u32(offset + 8), u32((font_data_u32.size() * sizeof(u32)) - 8)};
-        DecryptSharedFont(font_data_u32, impl->shared_font, offset);
-        impl->shared_font_regions.push_back(region);
-        type_regions[font_index] = region;
-    }
-
-    // Switch 2 titles look the controller button icons up in the standard font. The firmware's has
-    // none of them (they are in the extension font), so the icons would draw as "?". The copy of the
-    // standard font that Switch 2 titles get is the firmware's with those glyphs added.
-    constexpr size_t standard_type = static_cast<size_t>(SharedFontType::JapanUSEuropeStandard);
-    constexpr size_t extension_type = static_cast<size_t>(SharedFontType::NintendoExtended);
-    if (type_regions[standard_type].size != 0 && type_regions[extension_type].size != 0) {
-        const auto font_data = [&](const FontRegion& region) {
-            return std::span<const u8>{impl->shared_font.data() + region.offset, region.size};
-        };
-        impl->builtin_standard_font = MergeGlyphs(font_data(type_regions[standard_type]),
-                                                  font_data(type_regions[extension_type]),
-                                                  BUTTON_GLYPHS);
-    }
-
-    // The data after each BFTTF header is the plain font: GetBuiltInFontSharedMemory copies it.
-    u32 builtin_offset = 0;
-    for (size_t type_index = 0; type_index < type_regions.size(); ++type_index) {
-        const auto& region = type_regions[type_index];
-        const u32 size = type_index == standard_type && !impl->builtin_standard_font.empty()
-                             ? static_cast<u32>(impl->builtin_standard_font.size())
-                             : region.size;
-        impl->builtin_font_sources.push_back(region.offset);
-        impl->builtin_font_regions.push_back({builtin_offset, size});
-        builtin_offset = Common::AlignUp(builtin_offset + size, 0x1000);
-    }
-    impl->builtin_font_memory_size = std::max<u32>(builtin_offset, 0x1000);
+    // Nothing is loaded here. The shared fonts (a 17 MiB decrypted array) and the Switch 2 merged
+    // standard font (another 17 MiB, plus the glyph merge's transient allocations) are built by
+    // the first request that needs them: a title that never asks for fonts never allocates either.
+    // GetSize/GetSharedMemoryAddressOffset answer from the region table alone (file sizes).
 }
 
 // Switch 2: the shared memory GetBuiltInFontData offsets point into (copy handle, u32 size); the
 // SDK maps it read-only. It holds plain copies of the fonts, apart from the Switch 1 font memory.
 void IPlatformServiceManager::GetBuiltInFontSharedMemory(HLERequestContext& ctx) {
+    std::scoped_lock guard{impl->lock};
+    impl->EnsureBuiltinFont(system);
     LOG_WARNING(Service_NS, "(STUBBED) Switch 2 GetBuiltInFontSharedMemory, {:#x} bytes",
                 impl->builtin_font_memory_size);
     if (impl->builtin_font_memory == nullptr) {
@@ -263,6 +337,10 @@ void IPlatformServiceManager::GetBuiltInFontData(HLERequestContext& ctx) {
     const u32 args = rp.Pop<u32>();
     const u32 type = args & 0xff;
     const bool flag = ((args >> 8) & 1) != 0;
+    // The standard font's built-in size is the merged font's, so its region table needs the merge:
+    // a title asking for built-in font data is about to map and read it anyway.
+    std::scoped_lock guard{impl->lock};
+    impl->EnsureBuiltinFont(system);
     const auto& regions = impl->builtin_font_regions;
     const bool found = type < regions.size() && regions[type].size != 0;
     const FontRegion region = found ? regions[type] : EMPTY_REGION;
@@ -296,6 +374,8 @@ Result IPlatformServiceManager::GetLoadState(Out<LoadState> out_load_state, Shar
 
 Result IPlatformServiceManager::GetSize(Out<u32> out_size, SharedFontType type) {
     LOG_DEBUG(Service_NS, "called, shared_font_type={}", type);
+    std::scoped_lock guard{impl->lock};
+    impl->EnsureFontRegions(system);
     *out_size = impl->GetSharedFontRegion(static_cast<size_t>(type)).size;
     R_SUCCEED();
 }
@@ -303,6 +383,8 @@ Result IPlatformServiceManager::GetSize(Out<u32> out_size, SharedFontType type) 
 Result IPlatformServiceManager::GetSharedMemoryAddressOffset(Out<u32> out_shared_memory_offset,
                                                              SharedFontType type) {
     LOG_DEBUG(Service_NS, "called, shared_font_type={}", type);
+    std::scoped_lock guard{impl->lock};
+    impl->EnsureFontRegions(system);
     *out_shared_memory_offset = impl->GetSharedFontRegion(static_cast<size_t>(type)).offset;
     R_SUCCEED();
 }
@@ -310,6 +392,10 @@ Result IPlatformServiceManager::GetSharedMemoryAddressOffset(Out<u32> out_shared
 Result IPlatformServiceManager::GetSharedMemoryNativeHandle(OutCopyHandle<Kernel::KSharedMemory> out_shared_memory_native_handle) {
     // Map backing memory for the font data
     LOG_DEBUG(Service_NS, "called");
+
+    // The first request that reads font data decrypts every font (and allocates the 17 MiB array).
+    std::scoped_lock guard{impl->lock};
+    impl->EnsureFontsLoaded(system);
 
     // Create shared font memory object
     std::memcpy(kernel.GetFontSharedMem().GetPointer(), impl->shared_font.data(), impl->shared_font.size());
@@ -325,6 +411,11 @@ Result IPlatformServiceManager::GetSharedFontInOrderOfPriority(
     OutArray<u32, BufferAttr_HipcMapAlias> out_font_sizes, Out<bool> out_fonts_are_loaded,
     Out<u32> out_font_count, Set::LanguageCode language_code) {
     LOG_DEBUG(Service_NS, "called, language_code={:#x}", language_code);
+
+    // The regions come from the fonts' file sizes; the fonts themselves are decrypted on the first
+    // request that reads their bytes (GetSharedMemoryNativeHandle).
+    std::scoped_lock guard{impl->lock};
+    impl->EnsureFontRegions(system);
 
     // The maximum number of elements that can be returned is 6. Regardless of the available fonts
     // or buffer size.
