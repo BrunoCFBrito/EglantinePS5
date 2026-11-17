@@ -169,8 +169,10 @@ public:
     // With every member quiescent: forget all blocks and sites (their regions are reset too).
     void Clear() {
         ++invalidations;
-        blocks.clear();
-        sites.clear();
+        // Swap with empty tables instead of clear(): clear() keeps their capacity, so after a
+        // full flush the group would keep the memory of every block and site it ever held.
+        decltype(blocks){}.swap(blocks);
+        decltype(sites){}.swap(sites);
         ranges.ClearCache();
     }
 

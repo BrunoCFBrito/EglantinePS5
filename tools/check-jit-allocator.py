@@ -35,8 +35,12 @@ extern "C" int sceKernelEnableDmemAliasing() { enabled=true; return 0; }
 // The same source file also holds the heap's growing range and the sparse tables; this check
 // does not use them (tools/check-heap-growth.py and eden-memory-check do).
 extern "C" int sceKernelDebugOutText(int, const char*) { return 0; }
-extern "C" int sceKernelReserveVirtualRange(void** out, size_t size, int, size_t) {
+extern "C" int sceKernelReserveVirtualRange(void** out, size_t size, int flags, size_t) {
     if (!reserve_ok) return std::int32_t(0x80020001u);
+    if (flags & MAP_FIXED) { // a step given back: the address stays the cache's (VoidRange)
+        void* at=mmap(*out,size,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE|MAP_FIXED,-1,0);
+        assert(at==*out); return 0;
+    }
     void* at=mmap(reinterpret_cast<void*>(reserve_at),size,PROT_NONE,
                   MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE|MAP_FIXED_NOREPLACE,-1,0);
     assert(at!=MAP_FAILED); reserve_at+=size+(std::size_t{1}<<30); *out=at; return 0;
@@ -169,6 +173,31 @@ int main() {
         for (int fd : handles) { errno=0; assert(fcntl(fd,F_GETFD)==-1 && errno==EBADF); }
         for (void* p : views) { unsigned char state; errno=0; assert(mincore(p,page,&state)==-1 && errno==ENOMEM); }
     }
+    {
+        // A full flush gives the steps above the prelude back (DecommitCodeRange) and the cache
+        // takes memory again when the JIT fills past them.
+        fail_stage=0; stage=0; reserve_ok=true; handles.clear();
+        const std::size_t size=std::size_t(64)<<20, step=std::size_t(16)<<20;
+        const unsigned char *p, *writable;
+        {
+            Xbyak::CodeGenerator code(size,Xbyak::DontSetProtectRWE,allocator);
+            p=code.getCode(); writable=code.writableAddress(p);
+            auto* const start=const_cast<unsigned char*>(p);
+            allocator->commit(start, 3*step);                 // the prelude's step and two more
+            assert(handles.size()==3*8);
+            Common::DecommitCodeRange(p, step);               // a full flush keeps the prelude's step
+            std::size_t open=0;
+            for (int fd : handles) if (fcntl(fd,F_GETFD)!=-1) ++open;
+            assert(open==8);                                  // step 0's pieces, and nothing else
+            fault(writable+step+page,true);                   // step 1's memory went back
+            allocator->commit(start, 2*step);                 // the cache takes it again
+            assert(handles.size()==4*8);
+            const_cast<unsigned char*>(writable)[step+page]=0xc3;
+            assert(p[step+page]==0xc3);
+        }
+        reserve_ok=false;
+        for (int fd : handles) { errno=0; assert(fcntl(fd,F_GETFD)==-1 && errno==EBADF); }
+    }
 #endif
 }
 '''
@@ -182,4 +211,4 @@ with tempfile.TemporaryDirectory() as temp:
             *(['-DEDEN_JIT_ALIAS_NATIVE=1','-DPS5_NATIVE=1','-Wl,--wrap=mprotect'] if native_mock else []),
             str(root/'src/memory_pages.cpp'),'-o',str(exe)],check=True)
         subprocess.run([str(exe)],check=True, cwd=temp)
-print('Production JIT aliases: 512/64/64/16 MiB, overflow, RX write/RW execute faults, live rewrite, a cache that takes its memory as it fills, both-view release and native API partial-failure cleanup PASS (host backend/mocked native APIs)')
+print('Production JIT aliases: 512/64/64/16 MiB, overflow, RX write/RW execute faults, live rewrite, a cache that takes its memory as it fills, a full flush giving steps back and taking them again, both-view release and native API partial-failure cleanup PASS (host backend/mocked native APIs)')

@@ -419,6 +419,13 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     config.code_cache_size = std::uint32_t(16_MiB);
 #else // PS5
     config.code_cache_size = std::uint32_t(m_cb->m_process->IsSwitch2() ? (m_core_index == 0 ? 160_MiB : m_core_index == 1 ? 144_MiB : m_core_index < 6 ? 96_MiB : 16_MiB) : (m_core_index == 0 ? 256_MiB : m_core_index < 3 ? 192_MiB : 128_MiB));
+    // EDEN_NX2_JIT_MIB: every core's code cache in MiB, a measurement aid (16 to 512, rounded
+    // down to the 16 MiB step the port's growing code cache takes memory in). A small value makes
+    // a core fill, flush and give its code pages back within one session (EDEN_JIT_RELEASE).
+    if (const char* value = std::getenv("EDEN_NX2_JIT_MIB")) {
+        const unsigned long mib = std::strtoul(value, nullptr, 10);
+        config.code_cache_size = std::uint32_t(std::clamp<unsigned long>(mib / 16 * 16, 16, 512) << 20);
+    }
 #endif // PS5
 #endif
 

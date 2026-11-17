@@ -18,6 +18,7 @@ void* MapExecutableAlias(void*, std::size_t) noexcept;
 // A cache that takes its memory as it fills (src/memory_pages.cpp).
 void* ReserveCodeRange(std::size_t, void** executable) noexcept;
 bool CommitCodeRange(const void* executable, std::size_t bytes) noexcept;
+void DecommitCodeRange(const void* executable, std::size_t keep_bytes) noexcept;
 bool FreeCodeRange(void* executable) noexcept;
 }
 // Separate RW/NX and RX views avoid changing page permissions per compiled block.

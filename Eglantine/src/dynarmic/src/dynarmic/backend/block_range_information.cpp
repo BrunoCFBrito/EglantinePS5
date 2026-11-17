@@ -28,7 +28,10 @@ void BlockRangeInformation<P>::AddRange(boost::icl::discrete_interval<P> range, 
 
 template<typename P>
 void BlockRangeInformation<P>::ClearCache() {
-    pages.clear();
+    // Swap with empty tables instead of clear(): clear() keeps the buckets and the per-page
+    // vectors' capacity, so after a full flush the table would keep the memory of everything
+    // compiled before it.
+    decltype(pages){}.swap(pages);
 }
 
 template<typename P>

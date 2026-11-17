@@ -260,6 +260,12 @@ void BlockOfCode::ClearCache() {
     DisableWriting();
     static const size_t page = sysconf(_SC_PAGESIZE);
     const size_t begin = reinterpret_cast<const u8*>(code_begin) - getCode();
+    // A cache that takes its memory as it fills (headless/jit-allocator.h) gives the steps above
+    // the prelude back to the pool here: after a full flush nothing above the prelude can be
+    // entered, and on the console those pages are direct memory the guest and the GPU can have.
+    // Without this a flush only rewound the pointers and everything compiled before it stayed
+    // resident for the rest of the session.
+    ::Common::DecommitCodeRange(getCode(), begin);
     if (hasWritableAlias()) {
         protection_end = begin;
         setSize(begin);

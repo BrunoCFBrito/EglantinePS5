@@ -1197,7 +1197,9 @@ std::size_t CommittedSplit() noexcept {
 // the pool the CPU shares with the GPU, and a large game fills little more than half of that.
 // So a cache is address space only, in two ranges (the one the JIT writes through and the one
 // the code runs from), and memory is put behind both a step at a time as the JIT reaches it:
-// CommitCodeRange is asked before every block. Memory is not taken back while the cache lives.
+// CommitCodeRange is asked before every block. A full flush of the cache (BlockOfCode::ClearCache)
+// gives the steps above the prelude back (DecommitCodeRange): the JIT starts again at the
+// beginning, so the code that was there is dead, and its memory goes to the guest and the GPU.
 namespace {
 constexpr std::size_t CodeStep = std::size_t{16} << 20;
 constexpr std::size_t CodeSteps = 64; // the largest cache: 1 GiB
@@ -1251,6 +1253,65 @@ bool CommitCodeStep(CodeRange& range, std::size_t offset) {
         return false;
 #endif
     code_committed.fetch_add(CodeStep, std::memory_order_relaxed);
+    return true;
+}
+
+#ifdef PS5_NATIVE
+// Maps a committed step's pieces back into both views; physical[] still records them. The failure
+// path of ReleaseCodeStep: a step that could not be emptied must stay usable, because a committed
+// step is written through the writable view and entered through the executable one. As
+// PageOutRange's restore: a refusal here is a kernel inconsistency and the session cannot go on.
+void MapCodeStepBack(CodeRange& range, std::size_t offset) {
+    void* const writable = reinterpret_cast<void*>(range.writable + offset);
+    void* const executable = reinterpret_cast<void*>(range.executable.load(std::memory_order_relaxed) + offset);
+    std::int64_t* const pieces = &range.physical[offset / CodeStep * CodePieces];
+    for (std::size_t piece = 0; piece < CodePieces; ++piece) {
+        void* at = static_cast<char*>(writable) + piece * CodePiece;
+        void* const want_writable = at;
+        if (sceKernelMapDirectMemory(&at, CodePiece, PROT_READ | PROT_WRITE, MAP_FIXED, pieces[piece], LargePage) != 0 ||
+            at != want_writable)
+            std::abort();
+        at = static_cast<char*>(executable) + piece * CodePiece;
+        void* const want_executable = at;
+        if (sceKernelMapDirectMemory(&at, CodePiece, PROT_READ, MAP_FIXED, pieces[piece], LargePage) != 0 ||
+            at != want_executable)
+            std::abort();
+    }
+    if (mprotect(executable, CodeStep, PROT_READ | PROT_EXEC) != 0) std::abort();
+}
+#endif
+
+// Takes one committed step of a cache away from both views and gives its pieces back. False when
+// a view could not be emptied: the step is mapped back and stays a committed prefix entry. A
+// piece the kernel refuses to release after both views were emptied stays held by us; the count
+// goes to the caller for the log, and the memory is the kernel's answer, not something to abort a
+// session under memory pressure over.
+bool ReleaseCodeStep(CodeRange& range, std::size_t offset, std::size_t* stuck) {
+    void* const writable = reinterpret_cast<void*>(range.writable + offset);
+    void* const executable = reinterpret_cast<void*>(range.executable.load(std::memory_order_relaxed) + offset);
+#ifdef PS5_NATIVE
+    // No hole first: the address space stays the cache's, as a reservation or a PROT_NONE guard,
+    // and the next commit maps the step back over it (CommitCodeStep).
+    if (!VoidRange(reinterpret_cast<std::uintptr_t>(writable), CodeStep) ||
+        !VoidRange(reinterpret_cast<std::uintptr_t>(executable), CodeStep)) {
+        MapCodeStepBack(range, offset);
+        return false;
+    }
+    std::int64_t* const pieces = &range.physical[offset / CodeStep * CodePieces];
+    for (std::size_t piece = 0; piece < CodePieces; ++piece)
+        if (sceKernelReleaseDirectMemory(pieces[piece], CodePiece) != 0) ++*stuck;
+#else
+    // The host's two views are one memfd: PROT_NONE keeps the aliasing and the commit path maps
+    // the step back; the pages are the file's, not the process's to free.
+    (void)stuck;
+    if (mprotect(writable, CodeStep, PROT_NONE) != 0 ||
+        mprotect(executable, CodeStep, PROT_NONE) != 0) {
+        if (mprotect(writable, CodeStep, PROT_READ | PROT_WRITE) != 0 ||
+            mprotect(executable, CodeStep, PROT_READ | PROT_EXEC) != 0)
+            std::abort();
+        return false;
+    }
+#endif
     return true;
 }
 } // namespace
@@ -1337,6 +1398,42 @@ bool CommitCodeRange(const void* executable, std::size_t bytes) noexcept {
         return true;
     }
     return true;
+}
+
+// Gives back the memory behind the steps of the cache that runs from `executable` above
+// `keep_bytes`: a full flush of the JIT (BlockOfCode::ClearCache). The JIT starts again at the
+// beginning, so nothing above the prelude can be entered. The address space stays the cache's and
+// the commit path maps memory behind it again when the JIT fills past `keep_bytes`. Steps go back
+// from the top down, so whatever a refused step leaves behind is still a committed prefix. A
+// cache that was taken whole (too small for a range) has nothing to give back.
+void DecommitCodeRange(const void* executable, std::size_t keep_bytes) noexcept {
+    const auto address = reinterpret_cast<std::uintptr_t>(executable);
+    if (address == 0) return;
+    const std::lock_guard lock{code_mutex};
+    for (auto& range : code_ranges) {
+        if (range.executable.load(std::memory_order_relaxed) != address) continue;
+        const std::size_t committed = range.committed.load(std::memory_order_relaxed);
+        // The step holding the prelude (the executable helpers every flush keeps) stays.
+        std::size_t keep = (keep_bytes + CodeStep - 1) / CodeStep * CodeStep;
+        if (keep < CodeStep) keep = CodeStep;
+        if (keep >= committed) return;
+        std::size_t released = 0, stuck = 0, new_committed = committed;
+        for (std::size_t offset = committed; offset >= keep + CodeStep; offset -= CodeStep) {
+            const std::size_t step = offset - CodeStep;
+            if (!ReleaseCodeStep(range, step, &stuck)) break;
+            released += CodeStep;
+            new_committed = step;
+        }
+        if (released == 0) return;
+        range.committed.store(new_committed, std::memory_order_release);
+        code_committed.fetch_sub(released, std::memory_order_relaxed);
+        char line[160];
+        const int length = std::snprintf(line, sizeof(line),
+                                         "EDEN_JIT_RELEASE code=%p held=%zu of=%zu released=%zu stuck_pieces=%zu\n",
+                                         executable, new_committed, range.span, released, stuck);
+        if (length > 0) Report(line);
+        return;
+    }
 }
 
 // Gives back a cache ReserveCodeRange made: its memory and both ranges. False for any other.

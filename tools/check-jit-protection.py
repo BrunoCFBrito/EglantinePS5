@@ -42,6 +42,7 @@ program = r'''
 #include <unistd.h>
 #define ASSERT assert
 #define DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT
+namespace Common { void DecommitCodeRange(const void*, std::size_t) noexcept {} }
 using CodePtr = const void*;
 using u8 = unsigned char;
 static size_t last_span, transitions, transitioned_bytes;
