@@ -8,6 +8,8 @@
 #elif defined(EDEN_MKW_DIAGNOSTICS) // PS5 Mario Kart diagnostics
 #include "headless/performance.h"
 #include "core/hle/kernel/k_thread.h"
+#elif defined(__PROSPERO__) // PS5 release: the overlay's CPU figure (SampleCpu)
+#include "headless/performance.h"
 #else // PS5
 #endif // PS5
 #include <algorithm>
@@ -557,6 +559,12 @@ HaltReason ArmDynarmic64::RunThread(Kernel::KThread* thread) {
     ::Eden::Performance::MkwRecordRunExit(mkw_tid, m_jit->GetPC(), ::Eden::Performance::NowNs() - mkw_start);
     ::Eden::Performance::MkwSlowRun(mkw_tid, ::Eden::Performance::NowNs(), ::Eden::Performance::NowNs() - mkw_start, static_cast<unsigned>(mkw_halt), *m_jit, m_cb->m_memory);
     return TranslateHaltReason(mkw_halt);
+#elif defined(__PROSPERO__) // PS5 release
+    // The overlay's busiest-core figure reads each core's CPU time here (BusiestGuestCore):
+    // one counter compare per run, a clock read once per overlay refresh.
+    const auto halt = m_jit->Run();
+    ::Eden::Performance::SampleCpu(m_core_index, 0, m_jit->GetPC(), GetSvcNumber(), m_jit->GetFpcr());
+    return TranslateHaltReason(halt);
 #else // PS5
     return TranslateHaltReason(m_jit->Run());
 #endif // PS5

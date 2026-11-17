@@ -4,6 +4,8 @@
 #elif defined(EDEN_MKW_DIAGNOSTICS) // PS5 Mario Kart diagnostics
 #include "headless/performance.h"
 #include "core/hle/kernel/k_thread.h"
+#elif defined(__PROSPERO__) // PS5 release: the overlay's CPU figure (SampleCpu)
+#include "headless/performance.h"
 #else // PS5
 #endif // PS5
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
@@ -394,6 +396,12 @@ HaltReason ArmDynarmic32::RunThread(Kernel::KThread* thread) {
     const auto mkw_halt = m_jit->Run();
     ::Eden::Performance::MkwRecordRunExit(mkw_tid, m_jit->Regs()[15], ::Eden::Performance::NowNs() - mkw_start);
     return TranslateHaltReason(mkw_halt);
+#elif defined(__PROSPERO__) // PS5 release
+    // The overlay's busiest-core figure reads each core's CPU time here (BusiestGuestCore):
+    // one counter compare per run, a clock read once per overlay refresh.
+    const auto halt = m_jit->Run();
+    ::Eden::Performance::SampleCpu(m_core_index, 0, m_jit->Regs()[15], GetSvcNumber(), m_jit->Fpscr());
+    return TranslateHaltReason(halt);
 #else // PS5
     return TranslateHaltReason(m_jit->Run());
 #endif // PS5
