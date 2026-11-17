@@ -322,7 +322,7 @@ private:
     void EvictUnusedPipelines(EvictionPass pass);
     /// The pool's pressure, sampled once a frame on the GPU thread (the probe behind it is
     /// throttled to 100 ms and takes paths of the GPU thread's): the eviction rules above read
-    /// them, and the rest of the file may from any thread.
+    /// them, and the pipeline memory gate in the .cpp does from any thread.
     std::atomic<bool> pool_short{false};
     std::atomic<bool> pool_critical{false};
     u64 frame_count{};

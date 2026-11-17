@@ -2241,6 +2241,156 @@ void ReportPipeEvict(size_t evicted, const EvictionLimits& limits, size_t left) 
                  limits.reason, left);
 }
 
+// The pipeline memory gate: a pipeline build that no draw waits for -- the boot and background
+// prebuild, the shader precache, a stage translated on a shader job worker -- holds while the
+// shared pool is critical. The driver's compiler takes its memory unchecked and ends the session
+// when it finds none (Ocarina of Time, 2026-11-15: ACO's allocator returned NULL with 3 MiB free),
+// and eight translations at once held 800 MiB of IR pools of their own on the way into Castle Town
+// (2026-11-10). While the pool is critical such a build waits for it to come back, at most the
+// limit below; a build is never refused, and past the limit it goes ahead.
+//
+// A build the frame waits for never waits here: a draw needs that pipeline, and with a 10 s limit
+// the gate froze menus and area loads for 3-10 s (PokeDinner 99aa4284, 45c1520f5). FramePipelineBuild
+// marks those. References: PokeDinner's pipeline_memory_gate.h (research/pokedinner-core, commits
+// dd6479d83, ba4df6f7, 45c1520f5) and BananaNative's vka_pso.c gate, which lets the frame's own
+// compiles go first.
+//
+// EDEN_PS5_PIPELINE_GATE_MS=<ms> sets the limit (default 1000; 0 turns the gate off).
+
+/// Marks, for as long as it lives, a pipeline build a draw waits for: the GPU thread's own builds,
+/// and a build it runs or joins from the background prebuild (scheduled_prebuild->Take). The gate
+/// never waits on this thread, and `draw_waits` tells a build already on a worker to go ahead at
+/// once instead of waiting out its limit: a wait there would hold the frame too.
+class FramePipelineBuild {
+public:
+    explicit FramePipelineBuild(bool joins_worker_build = false) : joins{joins_worker_build} {
+        ++depth;
+        if (joins) {
+            draw_waits.fetch_add(1, std::memory_order_acq_rel);
+        }
+    }
+    ~FramePipelineBuild() {
+        if (joins) {
+            draw_waits.fetch_sub(1, std::memory_order_acq_rel);
+        }
+        --depth;
+    }
+    FramePipelineBuild(const FramePipelineBuild&) = delete;
+    FramePipelineBuild& operator=(const FramePipelineBuild&) = delete;
+
+    /// Whether this thread is building (or running) a pipeline the frame waits for
+    [[nodiscard]] static bool OnThisThread() noexcept {
+        return depth != 0;
+    }
+    /// Whether a draw is waiting for a build that runs on a worker right now
+    [[nodiscard]] static bool DrawWaitsForWorkerBuild() noexcept {
+        return draw_waits.load(std::memory_order_acquire) != 0;
+    }
+
+private:
+    static inline thread_local u32 depth{};
+    static inline std::atomic<u32> draw_waits{};
+    const bool joins;
+};
+
+struct PipelineGateCounters {
+    std::atomic<u64> builds{0};   ///< Background builds through the gate
+    std::atomic<u64> waited{0};   ///< Of them, the ones that had to wait
+    std::atomic<u64> wait_us{0};  ///< The time they waited in all
+    std::atomic<u64> timeouts{0}; ///< Waits that reached the limit and went ahead
+    std::atomic<u64> critical{0}; ///< Builds that had to wait with the pool critical
+};
+PipelineGateCounters pipeline_gate;
+
+/// Between two looks at the pool while waiting. The probe behind `pool_critical` is refreshed once
+/// a frame, on the GPU thread, so looking often buys nothing and costs nothing.
+constexpr auto PipelineGatePoll = std::chrono::milliseconds{4};
+
+/// EDEN_PS5_PIPELINE_GATE_MS, read once: the longest a background build waits, 0 turns the gate off
+std::chrono::milliseconds PipelineGateLimit() {
+    static const std::chrono::milliseconds limit = [] {
+        const char* const value = std::getenv("EDEN_PS5_PIPELINE_GATE_MS");
+        const u64 ms =
+            value != nullptr && value[0] != '\0' ? std::strtoull(value, nullptr, 10) : u64{1000};
+        return std::chrono::milliseconds{ms};
+    }();
+    return limit;
+}
+
+/// One line the first time the gate holds a build, with the limit in force.
+void AnnouncePipelineGate() {
+    static const bool announced = [] {
+        const auto limit = PipelineGateLimit();
+        LOG_INFO(Render_Vulkan,
+                 "EDEN_PIPELINE_MEMORY_GATE: pipeline builds no draw waits for wait while the pool "
+                 "is critical, at most {} ms each (EDEN_PS5_PIPELINE_GATE_MS=0 turns it off)",
+                 limit.count());
+        return true;
+    }();
+    static_cast<void>(announced);
+}
+
+/// One line whenever 32 more builds have waited, with what they waited for.
+void ReportPipelineGate() {
+    static std::atomic<u64> reported{0};
+    const u64 waited = pipeline_gate.waited.load(std::memory_order_relaxed);
+    u64 last = reported.load(std::memory_order_relaxed);
+    if (waited == 0 || (last != 0 && waited < last + 32) ||
+        !reported.compare_exchange_strong(last, waited, std::memory_order_relaxed)) {
+        return;
+    }
+    LOG_INFO(Render_Vulkan,
+             "EDEN_PIPELINE_MEMORY_GATE: {} of {} pipeline builds waited, {} ms in all, {} at the "
+             "limit, {} with the pool critical",
+             waited, pipeline_gate.builds.load(std::memory_order_relaxed),
+             pipeline_gate.wait_us.load(std::memory_order_relaxed) / 1000,
+             pipeline_gate.timeouts.load(std::memory_order_relaxed),
+             pipeline_gate.critical.load(std::memory_order_relaxed));
+}
+
+/// One background build's hold on the gate, released when it goes out of scope.
+class PipelineMemoryGate {
+public:
+    explicit PipelineMemoryGate(const std::atomic<bool>& pool_critical) {
+        const auto limit = PipelineGateLimit();
+        // Off, or a build the frame waits for: it never waits here (see FramePipelineBuild).
+        if (limit.count() <= 0 || FramePipelineBuild::OnThisThread()) {
+            return;
+        }
+        AnnouncePipelineGate();
+        const auto begin = std::chrono::steady_clock::now();
+        bool waited = false;
+        for (;;) {
+            if (!pool_critical.load(std::memory_order_relaxed) ||
+                FramePipelineBuild::DrawWaitsForWorkerBuild()) {
+                break;
+            }
+            if (!waited) {
+                waited = true;
+                pipeline_gate.critical.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (std::chrono::steady_clock::now() - begin >= limit) {
+                // The pool stayed critical: go ahead rather than refuse (or hold) the build.
+                pipeline_gate.timeouts.fetch_add(1, std::memory_order_relaxed);
+                break;
+            }
+            std::this_thread::sleep_for(PipelineGatePoll);
+        }
+        pipeline_gate.builds.fetch_add(1, std::memory_order_relaxed);
+        if (waited) {
+            pipeline_gate.waited.fetch_add(1, std::memory_order_relaxed);
+            pipeline_gate.wait_us.fetch_add(
+                static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                     std::chrono::steady_clock::now() - begin)
+                                     .count()),
+                std::memory_order_relaxed);
+            ReportPipelineGate();
+        }
+    }
+    ~PipelineMemoryGate() = default;
+    PipelineMemoryGate(const PipelineMemoryGate&) = delete;
+    PipelineMemoryGate& operator=(const PipelineMemoryGate&) = delete;
+};
 } // Anonymous namespace
 
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
@@ -2250,6 +2400,9 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
     if (is_new) {
         ReportNewPipelineKey(graphics_key);
         if (scheduled_prebuild) {
+            // The GPU thread runs or joins this translation, so the memory gate must not hold it
+            // (FramePipelineBuild), and a build already running on a worker goes ahead too.
+            const FramePipelineBuild frame_build{true};
             pipeline = scheduled_prebuild->Take(graphics_key);
         }
         if (StutterTrace::Enabled()) {
@@ -2354,9 +2507,10 @@ void PipelineCache::TickFrame() {
            retired_compute_pipelines.front().second->IsBuildTaskDone()) {
         retired_compute_pipelines.pop_front();
     }
-    // The pool's pressure once a frame, for the eviction rules below: they run here, on the GPU
-    // thread, and the probe behind them takes paths of this thread's, so the sample is taken once
-    // and stored for whoever else reads it.
+    // The pool's pressure once a frame: the eviction rules below and the pipeline memory gate in
+    // Create*Pipeline read it, here and on the shader workers. The probe behind it takes paths of
+    // this thread's and refreshes at most every 100 ms, so one sample a frame is all the gate can
+    // use and all the eviction rules need.
     const bool critical = ::Eden::Performance::GraphicsMemoryIsCritical();
     pool_critical.store(critical, std::memory_order_relaxed);
     pool_short.store(::Eden::Performance::GraphicsMemoryIsShort(), std::memory_order_relaxed);
@@ -2541,6 +2695,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
     bool build_in_parallel, std::shared_ptr<ShaderPools> emit_pools,
     ParallelTranslation* parallel) try {
+    // A build no draw waits for holds here while the pool is critical (PipelineMemoryGate)
+    const PipelineMemoryGate memory_gate{pool_critical};
     auto hash = key.Hash();
     LOG_DEBUG(Render_Vulkan, "{:#016x}", hash);
     // Declared before the programs, whose IR they hold
@@ -3087,6 +3243,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     if (pool_oom) {
         *pool_oom = false;
     }
+    // The frame's own build: a draw waits for it, so the memory gate never holds it
+    const FramePipelineBuild frame_build;
     std::size_t recovered{0};
     for (u32 attempt = 0;; ++attempt) {
         try {
@@ -3219,6 +3377,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipelineOnce(
 ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(const ComputePipelineCacheKey& key,
                                                                const ShaderInfo* shader,
                                                                std::span<const u64> keep_pointers) {
+    // The frame's own build: a draw waits for it, so the memory gate never holds it
+    const FramePipelineBuild frame_build;
     std::size_t recovered{0};
     for (u32 attempt = 0;; ++attempt) {
         try {
@@ -3300,6 +3460,8 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     ShaderPools& pools, const ComputePipelineCacheKey& key, Shader::Environment& env,
     PipelineStatistics* statistics, bool build_in_parallel,
     std::shared_ptr<ShaderPools> emit_pools) try {
+    // A build no draw waits for holds here while the pool is critical (PipelineMemoryGate)
+    const PipelineMemoryGate memory_gate{pool_critical};
     SCOPE_EXIT {
         if (emit_pools) {
             ReturnPools(std::move(emit_pools));
