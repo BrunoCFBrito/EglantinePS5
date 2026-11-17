@@ -43,11 +43,12 @@ bash "$vulkan/tools/setup-native-dependencies.sh"
 bash "$vulkan/tools/build-radv.sh" release
 python3 "$root/tools/patch-radv-wsi.py"
 python3 "$root/tools/patch-radv-disk-cache.py"
-python3 "$root/tools/patch-radv-memory-report.py"
 python3 "$root/tools/patch-radv-pieces.py"
 python3 "$root/tools/patch-radv-trim.py"
 python3 "$root/tools/patch-radv-alloc-report.py"
 python3 "$root/tools/patch-radv-gs-compute.py"
+# After the allocation patches: it splits their p30/p31 report and retries a refused allocation.
+python3 "$root/tools/patch-radv-memory-report.py"
 # ProsperoEden's patch-radv-transfer-split.py (splitting before transfers and barriers) is not
 # taken: with it, Mario Kart World hung the GPU under memory pressure (PR #77).
 bash "$vulkan/tools/build-radv.sh" release
