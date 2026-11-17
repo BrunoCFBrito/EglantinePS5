@@ -81,9 +81,9 @@ BufferCache<P>::~BufferCache() {
 }
 
 template <class P>
-void BufferCache<P>::RunGarbageCollector(bool aggressive_gc) {
+void BufferCache<P>::RunGarbageCollector(bool aggressive_gc, u64 idle_frames) {
     const StutterTrace::SiteScope site{StutterTrace::Site::BufferCollect};
-    const u64 ticks_to_destroy = aggressive_gc ? 60 : 120;
+    const u64 ticks_to_destroy = idle_frames != 0 ? idle_frames : (aggressive_gc ? 60 : 120);
     int num_iterations = aggressive_gc ? 64 : 32;
     // Their GPU-written data is downloaded first, all with one wait for the GPU: one wait per
     // buffer stalled the GPU thread every frame on title 1 (an 8 GB GPU near its budget, no
@@ -276,9 +276,21 @@ void BufferCache<P>::TickFrame() {
         if (buffer_bytes >= 256_MiB || pool_short) {
             RunGarbageCollector(buffer_bytes >= 768_MiB ||
                                 Eden::Performance::GraphicsMemoryIsCritical());
+        } else {
+            // Below the cache's own mark nothing was ever collected: buffers unused for a minute
+            // or more (3,600 frames) go too, as long as they hold no GPU-written data. Mario Kart
+            // World's race kept 21-80 MiB of menu, video and loading buffers nothing used again
+            // while the cache sat under its trigger (Lichii #1949). Their contents are in guest
+            // memory, as for any collected buffer, so a later use re-creates and uploads them.
+            RunGarbageCollector(false, 3600);
         }
     } else if (total_used_memory >= minimum_memory) {
         RunGarbageCollector(total_used_memory >= critical_memory);
+    } else {
+        // The mark counts the whole device, textures and other users included, so it can sit far
+        // above the buffers' own use: below it nothing was ever collected either. The same
+        // minute-old pass runs there, so an area load's buffers do not stay for the session.
+        RunGarbageCollector(false, 3600);
     }
     ++frame_tick;
     delayed_destruction_ring.Tick();
@@ -3192,8 +3204,10 @@ void BufferCache<P>::UpdateIndexBuffer() {
             }
         }
         if (slot_buffers[inline_buffer_id].SizeBytes() < buffer_size) [[unlikely]] {
-            ++buffer_deletions;
-            slot_buffers.erase(inline_buffer_id);
+            // Unregisters the old buffer and keeps it for the draws already recorded: erasing it
+            // here left its LRU entry and its buffer_bytes share behind, and destroyed it at
+            // once. DeleteBuffer clears inline_buffer_id, set again from the new buffer below.
+            DeleteBuffer(inline_buffer_id);
             inline_buffer_id = CreateBuffer(0, buffer_size, false);
             if (inline_buffer_id == NULL_BUFFER_ID) {
                 channel_state->index_buffer = NULL_BINDING;
@@ -4489,6 +4503,11 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
     }
 
     Unregister(buffer_id);
+    if (buffer_id == inline_buffer_id) {
+        // The collector can delete the inline index buffer once it goes unused: the next inline
+        // index draw makes a new one instead of using (or resizing) the freed slot.
+        inline_buffer_id = NULL_BUFFER_ID;
+    }
 
 #ifdef YUZU_LEGACY
     if (!do_not_mark || !immediately_free)
