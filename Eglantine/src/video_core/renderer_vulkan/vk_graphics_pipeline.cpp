@@ -880,6 +880,14 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             texture_cache.LogPrepares(nullptr, false);
         }
     }
+    // Every view the draw binds must name a live slot. An entry the fill left untouched holds the
+    // struct default; pushing it would index slot_image_views with a wild id in
+    // PushImageDescriptors (the 2026-11-16 crash at values[0x7FFFFFFF]). EDEN_BAD_IMAGE_VIEW named
+    // the first one: skip the draw rather than record a binding that kills the session.
+    if (!ValidateImageViews(texture_cache, stage_infos, Spec::enabled_stages,
+                            std::span(views.data(), views.size()))) {
+        return false;
+    }
     // Every texture handle read out of guest memory, every sampler and view filled.
     ::Eden::Performance::Mark(::Eden::Performance::cfg_read, since);
     long long since_bind = ::Eden::Performance::MarkStart();    if (use_memo) {
@@ -1077,7 +1085,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             Profile::Scope scope{Profile::Zone::PushDescriptors};
             const size_t first_entry = guest_descriptor_queue.UpdateCount();
             PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage],
-                                 rescaling, samplers_it, views_it);
+                                 rescaling, samplers_it, views_it, stage, false);
             if (captured_delta) {
                 KeepImageDescriptors(stage, first_entry);
             }
@@ -1234,7 +1242,7 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
             Profile::Scope scope{Profile::Zone::PushDescriptors};
             const size_t first_entry = guest_descriptor_queue.UpdateCount();
             PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage],
-                                 rescaling, samplers_it, views_it);
+                                 rescaling, samplers_it, views_it, stage, false);
             KeepImageDescriptors(stage, first_entry);
         }
         if (stage_infos[stage].uses_render_area) {

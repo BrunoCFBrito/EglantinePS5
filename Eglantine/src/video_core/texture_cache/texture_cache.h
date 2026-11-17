@@ -1421,6 +1421,16 @@ typename P::ImageView& TextureCache<P>::GetImageView(ImageViewId id) noexcept {
 }
 
 template <class P>
+const typename P::ImageView* TextureCache<P>::TryGetImageView(ImageViewId id) const noexcept {
+    return slot_image_views.contains(id) ? &slot_image_views[id] : nullptr;
+}
+
+template <class P>
+typename P::ImageView* TextureCache<P>::TryGetImageView(ImageViewId id) noexcept {
+    return slot_image_views.contains(id) ? &slot_image_views[id] : nullptr;
+}
+
+template <class P>
 typename P::ImageView& TextureCache<P>::GetImageView(u32 index) noexcept {
     // Not compute!
     const auto image_view_id = VisitImageView(index, false);

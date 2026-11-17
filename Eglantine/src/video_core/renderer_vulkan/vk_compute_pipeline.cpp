@@ -560,6 +560,13 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         add_image(desc, desc.is_written);
     }
     texture_cache.FillImageViews(std::span(views.data(), views.size()), true);
+    // Every view the dispatch binds must name a live slot. An entry the fill left untouched holds
+    // the struct default; using it would index slot_image_views with a wild id in
+    // PushImageDescriptors (the 2026-11-16 crash at values[0x7FFFFFFF]). EDEN_BAD_IMAGE_VIEW named
+    // the first one: skip the dispatch rather than record a binding that kills the session.
+    if (!ValidateImageViews(texture_cache, info, std::span(views.data(), views.size()))) {
+        return false;
+    }
     if (auto& trace{GetUpscalerTrace()}; trace.enabled && kepler_compute.IsNativeMode()) {
         const u64 frame{trace.frame.load(std::memory_order_relaxed)};
         if (!trace.armed && frame >= trace.first_frame && info.uses_subgroup_shuffles) {
@@ -697,12 +704,12 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     const VideoCommon::ImageViewInOut* views_it{views.data()};
     if (!shadow) {
         PushImageDescriptors(texture_cache, guest_descriptor_queue, info, rescaling, samplers_it,
-                             views_it);
+                             views_it, 0, true);
     } else {
         auto sampled_info{info};
         sampled_info.image_descriptors.clear();
         PushImageDescriptors(texture_cache, guest_descriptor_queue, sampled_info, rescaling,
-                             samplers_it, views_it);
+                             samplers_it, views_it, 0, true);
         for (const auto& desc : info.image_descriptors) {
             bool is_rescaled{};
             for (u32 i = 0; i < desc.count; ++i) {

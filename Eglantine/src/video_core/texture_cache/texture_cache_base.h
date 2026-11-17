@@ -70,7 +70,10 @@ using namespace Common::Literals;
 struct ImageViewInOut {
     u32 index{};
     bool blacklist{};
-    ImageViewId id{};
+    /// An entry the fill did not write samples the null view, not a wild slot id (see
+    /// PushImageDescriptors and ValidateImageViews): the default used to be INVALID_INDEX, which
+    /// SlotVector::operator[] indexes as values[0x7FFFFFFF] in release builds.
+    ImageViewId id{NULL_IMAGE_VIEW_ID};
 };
 
 /// A texture handle word a draw read, and where.
@@ -328,6 +331,12 @@ public:
 
     /// Return a reference to the given image view id
     [[nodiscard]] ImageView& GetImageView(ImageViewId id) noexcept;
+
+    /// Return a pointer to the given image view id, or nullptr when the id names no live view.
+    /// An id that was never inserted, or one already erased, names none: GetImageView would index
+    /// slot_image_views with it unchecked (a wild id such as INVALID_INDEX faults in release).
+    [[nodiscard]] const ImageView* TryGetImageView(ImageViewId id) const noexcept;
+    [[nodiscard]] ImageView* TryGetImageView(ImageViewId id) noexcept;
 
     /// Get the imageview from the graphics descriptor table in the specified index
     [[nodiscard]] ImageView& GetImageView(u32 index) noexcept;
