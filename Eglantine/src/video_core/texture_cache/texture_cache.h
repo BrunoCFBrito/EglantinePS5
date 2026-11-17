@@ -3956,7 +3956,7 @@ void TextureCache<P>::ReportGpuOnlyGuest(bool discard, bool report) {
     u64 pages{}, whole_slots{}, clean_slots{}, clean_pages{};
     // Slots wholly behind GPU-only images and behind no other image: their guest bytes are a copy
     // the caches write back before anything reads them.
-    std::array<std::uint64_t, 5> by_state{}; // zero, own, shared, fine, packed
+    std::array<std::uint64_t, 7> by_state{}; // zero, own, shared, fine, packed, probe, out
     u64 discarded_slots{}, given_back{}, kept_written{};
     for (const auto& [slot, covered] : gpu_only_slots) {
         pages += covered.count();
@@ -4004,8 +4004,8 @@ void TextureCache<P>::ReportGpuOnlyGuest(bool discard, bool report) {
         if (given_back != 0 || kept_written != 0 || report) {
             std::fprintf(stderr,
                          "EDEN_GPU_ONLY_DISCARD %llu slots: %llu MiB given back now (%llu MiB in %llu "
-                         "passes); found zero %llu own %llu shared %llu fine %llu packed %llu; "
-                         "%llu slots held by pending CPU writes\n",
+                         "passes); found zero %llu own %llu shared %llu fine %llu packed %llu "
+                         "probe %llu out %llu; %llu slots held by pending CPU writes\n",
                          static_cast<unsigned long long>(discarded_slots),
                          static_cast<unsigned long long>(given_back >> 20),
                          static_cast<unsigned long long>(total_given_back >> 20),
@@ -4015,6 +4015,8 @@ void TextureCache<P>::ReportGpuOnlyGuest(bool discard, bool report) {
                          static_cast<unsigned long long>(by_state[2]),
                          static_cast<unsigned long long>(by_state[3]),
                          static_cast<unsigned long long>(by_state[4]),
+                         static_cast<unsigned long long>(by_state[5]),
+                         static_cast<unsigned long long>(by_state[6]),
                          static_cast<unsigned long long>(kept_written));
         }
     }
