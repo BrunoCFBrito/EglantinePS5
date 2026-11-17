@@ -55,8 +55,9 @@ python3 "$root/tools/patch-radv-pipeline-oom.py"
 python3 "$root/tools/patch-radv-memory-report.py"
 # After patch-radv-trim.py, whose radv_ps5_trim_untrack and radv_ps5_eden_trim it extends.
 python3 "$root/tools/patch-radv-retire.py"
-# The render-pass fail-soft; independent of the scripts above.
+# The render-pass and copy-propagation fail-softs; independent of the scripts above.
 python3 "$root/tools/patch-radv-failsoft-renderpass.py"
+python3 "$root/tools/patch-radv-failsoft-copyprop.py"
 # ProsperoEden's patch-radv-transfer-split.py (splitting before transfers and barriers) is not
 # taken: with it, Mario Kart World hung the GPU under memory pressure (PR #77).
 bash "$vulkan/tools/build-radv.sh" release
@@ -71,6 +72,8 @@ python3 "$root/tools/patch-radv-retire.py" --digest \
     > "$vulkan/.deps/native/radv-release/EDEN_RETIRE_SHA256"
 python3 "$root/tools/patch-radv-failsoft-renderpass.py" --digest \
     > "$vulkan/.deps/native/radv-release/EDEN_FAILSOFT_RENDER_PASS_SHA256"
+python3 "$root/tools/patch-radv-failsoft-copyprop.py" --digest \
+    > "$vulkan/.deps/native/radv-release/EDEN_FAILSOFT_COPY_PROP_SHA256"
 python3 "$root/tools/patch-radv-pieces.py" --digest \
     > "$vulkan/.deps/native/radv-release/EDEN_MEMORY_PIECES_SHA256"
 python3 "$root/tools/patch-radv-trim.py" --digest \
