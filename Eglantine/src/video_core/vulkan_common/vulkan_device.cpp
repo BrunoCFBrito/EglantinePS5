@@ -862,14 +862,15 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
             .flags = flags,
             .physicalDevice = physical,
             .device = *logical,
-            // 16 MiB blocks on discrete GPUs too: with 256 MiB ones, Switch 2 titles' mix of
+            // Blocks are small so that they drain: with 256 MiB ones, Switch 2 titles' mix of
             // texture sizes left ~38% of the image blocks empty (2 GB of an 8 GB card in title
             // 1), which the texture cache counted as used and kept evicting textures for. With
             // 64 MiB ones textures created and deleted by the thousand still left ~1.7 GB of holes
             // after ten minutes, with 32 MiB ones ~0.5 GB: a block drains only once all of its
             // images are gone, and fewer per block drain sooner. VMA gives allocations over half a
-            // block (8 MiB) their own memory, which goes back to the driver when they are freed.
-            .preferredLargeHeapBlockSize = 16u * 1024u * 1024u,
+            // block their own memory, which goes back to the driver when they are freed.
+            // DefaultBlockSize(): 16 MiB, 8 on the console (EDEN_PS5_VMA_BLOCK_MIB overrides it).
+            .preferredLargeHeapBlockSize = DefaultBlockSize(),
             .pAllocationCallbacks = nullptr,
             .pDeviceMemoryCallbacks = nullptr,
             .pHeapSizeLimit = heap_size_limit != 0 ? heap_size_limits.data() : nullptr,
@@ -907,7 +908,26 @@ Device::~Device() {
 }
 
 VkDeviceSize Device::DefaultBlockSize() {
-    return VkDeviceSize{16} << 20;
+    // 8 MiB on the console: Ocarina's Castle Town on the BC-250 (the PS5's APU, RADV GFX1013)
+    // left 464 MiB free inside 16 MiB blocks (19% of 2358 MiB) and 22-34 MiB inside 8 MiB ones;
+    // device memory in use at the peak 5453 -> 5056 MiB, the castle route 54.4 -> 55.0-55.1 fps.
+    // 4 MiB saved nothing more and was slower. Elsewhere it stays 16 MiB, the best of 256, 64
+    // and 32 measured on a desktop card (see the allocator's creation).
+    // EDEN_PS5_VMA_BLOCK_MIB=<n> (4 to 256) overrides it, for an A/B run on the console.
+    static const VkDeviceSize bytes = [] {
+        const char* value = std::getenv("EDEN_PS5_VMA_BLOCK_MIB");
+        const unsigned long mib = value != nullptr ? std::strtoul(value, nullptr, 10) : 0;
+        if (mib >= 4 && mib <= 256) {
+            LOG_INFO(Render_Vulkan, "EDEN_PS5_VMA_BLOCK_MIB: {} MiB device memory blocks", mib);
+            return static_cast<VkDeviceSize>(mib) << 20;
+        }
+#ifdef __PROSPERO__
+        return VkDeviceSize{8} << 20;
+#else
+        return VkDeviceSize{16} << 20;
+#endif
+    }();
+    return bytes;
 }
 
 VkDeviceSize Device::SeparatePoolBlockSize(SeparatePool kind) {

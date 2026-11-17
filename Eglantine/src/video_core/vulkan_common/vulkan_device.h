@@ -286,7 +286,8 @@ public:
     };
 
     /// The size of the allocator's default blocks (`preferredLargeHeapBlockSize`) and of the
-    /// separate pools other than the device buffers': 16 MiB.
+    /// separate pools other than the device buffers': 16 MiB, 8 on the console
+    /// (EDEN_PS5_VMA_BLOCK_MIB, 4 to 256, overrides it).
     static VkDeviceSize DefaultBlockSize();
 
     /// Block size for a pool of that kind: DefaultBlockSize(), except the device buffers' pool,
