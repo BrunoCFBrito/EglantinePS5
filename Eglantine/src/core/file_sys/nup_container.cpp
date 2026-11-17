@@ -665,6 +665,12 @@ bool NupContainer::Parse() {
     }
 
     files.resize(header.file_count);
+    // Every member's name lives once, in `names`; FileNode keeps its offset and length. The records
+    // are walked twice: once to size the name blob exactly, once to copy into it.
+    const std::size_t file_records_pos = pos;
+    file_records_offset = toc_offset + file_records_pos;
+    names.clear();
+    std::size_t names_size = 0;
     for (u64 i = 0; i < header.file_count; ++i) {
         FileRecord record{};
         std::memcpy(&record, base + pos, sizeof(record));
@@ -679,14 +685,29 @@ bool NupContainer::Parse() {
             status = Loader::ResultStatus::ErrorNUPBadFormat;
             return false;
         }
-        files[i].name = std::string(reinterpret_cast<const char*>(base) + header.pool_offset +
-                                        record.name_offset,
-                                    record.name_length);
+        names_size += record.name_length;
+    }
+    if (names_size > ~u32(0)) {
+        status = Loader::ResultStatus::ErrorNUPBadFormat;
+        return false;
+    }
+    names.resize(names_size);
+    std::size_t names_at = 0;
+    pos = file_records_pos;
+    for (u64 i = 0; i < header.file_count; ++i) {
+        FileRecord record{};
+        std::memcpy(&record, base + pos, sizeof(record));
+        pos += FileRecordSize;
+        std::memcpy(names.data() + names_at,
+                    reinterpret_cast<const char*>(base) + header.pool_offset + record.name_offset,
+                    record.name_length);
+        files[i].name_offset = static_cast<u32>(names_at);
+        files[i].name_length = record.name_length;
         files[i].size = record.size;
-        files[i].sha256 = record.sha256;
         files[i].extent_offset = record.extent_offset;
         files[i].extent_size = record.extent_size;
         files[i].codec = record.codec;
+        names_at += record.name_length;
     }
 
     children.resize(children_bytes / sizeof(u32));
@@ -875,21 +896,21 @@ VirtualFile NupContainer::OpenFile(std::size_t file_index) {
     if (file_index >= files.size()) {
         return nullptr;
     }
-    return OpenFileAs(file_index, files[file_index].name);
+    return OpenFileAs(file_index, FileName(file_index));
 }
 
-VirtualFile NupContainer::OpenFileAs(std::size_t file_index, const std::string& name) {
+VirtualFile NupContainer::OpenFileAs(std::size_t file_index, std::string_view name) {
     const FileNode& node = files[file_index];
     if (node.size == 0) {
-        return std::make_shared<VectorVfsFile>(std::vector<u8>{}, name);
+        return std::make_shared<VectorVfsFile>(std::vector<u8>{}, std::string{name});
     }
     if (node.codec == CodecRaw) {
         return std::make_shared<OffsetVfsFile>(
             file, static_cast<std::size_t>(node.extent_size),
-            static_cast<std::size_t>(node.extent_offset), name);
+            static_cast<std::size_t>(node.extent_offset), std::string{name});
     }
     return std::make_shared<NupVfsFile>(file, node.extent_offset, node.extent_size, node.size,
-                                        name, cache, file_index);
+                                        std::string{name}, cache, file_index);
 }
 
 std::optional<bool> NupContainer::HasZstdMagic(std::size_t file_index) const {
@@ -932,17 +953,17 @@ std::optional<std::size_t> NupContainer::FindStandIn(std::size_t damaged,
                                                      std::span<const std::size_t> siblings) const {
     // Same directory and same last name token ("Nrm.bntx.zs"), longest common name prefix,
     // then the closest size: a texture of the same kind and, often, the same resolution.
-    const std::string& name = files[damaged].name;
+    const std::string_view name = FileName(damaged);
     const std::size_t separator = name.rfind('_');
-    if (separator == std::string::npos) {
+    if (separator == std::string_view::npos) {
         return std::nullopt;
     }
-    const std::string_view suffix = std::string_view{name}.substr(separator + 1);
+    const std::string_view suffix = name.substr(separator + 1);
     std::optional<std::size_t> best;
     std::size_t best_prefix = 0;
     u64 best_gap = 0;
     for (const std::size_t candidate : siblings) {
-        const std::string& other = files[candidate].name;
+        const std::string_view other = FileName(candidate);
         if (candidate == damaged || other.size() <= suffix.size() || !other.ends_with(suffix) ||
             other[other.size() - suffix.size() - 1] != '_') {
             continue;
@@ -978,7 +999,7 @@ void NupContainer::BuildDirTree(u32 dir_index, VectorVfsDirectory& out, bool ser
             // A game .zs is already compressed, so the NUP only recompresses one that shrinks,
             // which a zeroed range does: only those members need their header checked.
             const FileNode& member = files[index];
-            if (serve_stand_ins && member.codec == CodecZstd && member.name.ends_with(".zs") &&
+            if (serve_stand_ins && member.codec == CodecZstd && FileName(index).ends_with(".zs") &&
                 HasZstdMagic(index) == false) {
                 damaged.push_back(index);
             } else {
@@ -998,15 +1019,15 @@ void NupContainer::BuildDirTree(u32 dir_index, VectorVfsDirectory& out, bool ser
             LOG_WARNING(Loader,
                         "NUP: {} has no zstd header, so this dump is damaged and the game cannot "
                         "load the file. Dump the game again.",
-                        files[index].name);
+                        FileName(index));
             out.AddFile(OpenFile(index));
             continue;
         }
         LOG_WARNING(Loader,
                     "NUP: {} has no zstd header, so this dump is damaged. Serving {} in its place, "
                     "a different texture; dump the game again to get the original.",
-                    files[index].name, files[*stand_in].name);
-        out.AddFile(OpenFileAs(*stand_in, files[index].name));
+                    FileName(index), FileName(*stand_in));
+        out.AddFile(OpenFileAs(*stand_in, FileName(index)));
     }
 }
 
@@ -1114,17 +1135,27 @@ Loader::ResultStatus NupContainer::VerifyIntegrity(
         } else if (node.codec == CodecRaw) {
             content = ReadExtentRaw(node);
         } else {
-            NupVfsFile view(file, node.extent_offset, node.extent_size, node.size, node.name,
-                            cache, i);
+            NupVfsFile view(file, node.extent_offset, node.extent_size, node.size,
+                            std::string(FileName(i)), cache, i);
             content = view.ReadAllBytes();
         }
         if (content.size() != node.size) {
-            LOG_ERROR(Loader, "NUP integrity check failed for {}: short read", node.name);
+            LOG_ERROR(Loader, "NUP integrity check failed for {}: short read", FileName(i));
+            return Loader::ResultStatus::ErrorIntegrityVerificationFailed;
+        }
+        // The SHA-256 stays in the container's file record, which is where it is read from: this is
+        // the only check that needs it, and it is not worth 32 bytes per member for the whole
+        // session.
+        FileRecord record{};
+        if (file->ReadObject(&record, file_records_offset + static_cast<u64>(i) * FileRecordSize) !=
+            sizeof(record)) {
+            LOG_ERROR(Loader, "NUP integrity check failed for {}: TOC record could not be read",
+                      FileName(i));
             return Loader::ResultStatus::ErrorIntegrityVerificationFailed;
         }
         std::array<u8, 0x20> hash{};
-        if (!Sha256(content.data(), content.size(), hash) || hash != node.sha256) {
-            LOG_ERROR(Loader, "NUP integrity check failed for {}: SHA-256 mismatch", node.name);
+        if (!Sha256(content.data(), content.size(), hash) || hash != record.sha256) {
+            LOG_ERROR(Loader, "NUP integrity check failed for {}: SHA-256 mismatch", FileName(i));
             return Loader::ResultStatus::ErrorIntegrityVerificationFailed;
         }
         if (progress_callback && !progress_callback(i + 1, total)) {

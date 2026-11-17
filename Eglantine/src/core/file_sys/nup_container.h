@@ -10,6 +10,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "common/common_types.h"
@@ -122,20 +123,27 @@ private:
     };
 
     struct FileNode {
-        std::string name;
         u64 size{};
-        std::array<u8, 0x20> sha256{};
         u64 extent_offset{};
         u64 extent_size{};
+        /// Where the name sits in `names`, and its length: 8 bytes instead of a std::string's 32.
+        u32 name_offset{};
+        u32 name_length{};
         u8 codec{};
     };
+
+    /// A member's name: FileNode keeps only its place in `names`, which holds every name once.
+    std::string_view FileName(std::size_t index) const {
+        const FileNode& node = files[index];
+        return std::string_view{names.data() + node.name_offset, node.name_length};
+    }
 
     bool Parse();
     bool ParseMeta(PackageInfo& package);
     bool ValidateDirTree() const;
     /// With serve_stand_ins, a .zs member with no zstd header is served from a sound sibling.
     void BuildDirTree(u32 dir_index, VectorVfsDirectory& out, bool serve_stand_ins);
-    VirtualFile OpenFileAs(std::size_t file_index, const std::string& name);
+    VirtualFile OpenFileAs(std::size_t file_index, std::string_view name);
     /// Whether a member starts with the zstd frame magic; nothing when it cannot be read.
     std::optional<bool> HasZstdMagic(std::size_t file_index) const;
     /// A sound sibling to serve in place of a damaged .zs member, if any.
@@ -154,6 +162,12 @@ private:
 
     std::vector<DirNode> dirs;
     std::vector<FileNode> files;
+    /// Every member's name, concatenated in file order; FileNode holds its offset and length.
+    std::string names;
+    /// Where the file records start in the container. VerifyIntegrity reads each member's SHA-256
+    /// from its record there, rather than keeping 32 bytes per member for a check nothing in a
+    /// session runs.
+    u64 file_records_offset{};
     std::vector<u32> children;
     std::vector<PackageInfo> packages;
 
