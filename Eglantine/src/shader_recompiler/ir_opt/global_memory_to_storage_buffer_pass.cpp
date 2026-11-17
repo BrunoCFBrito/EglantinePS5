@@ -2160,6 +2160,11 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
         }
     }
     for (const StorageBufferAddr& storage_buffer : info.set) {
+        // A small_vector grows where the static_vector threw, and the backends index their
+        // MAX_SSBOS-entry arrays by this list: keep the old bound.
+        if (program.info.storage_buffers_descriptors.size() >= Info::MAX_SSBOS) {
+            break;
+        }
         const bool is_written{info.writes.contains(storage_buffer)};
         const auto extent{extents.find(storage_buffer)};
         program.info.storage_buffers_descriptors.push_back({
