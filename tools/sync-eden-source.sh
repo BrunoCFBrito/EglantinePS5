@@ -6,7 +6,7 @@
 # stay. The tree's .unpacked-from names the committed tree of Eglantine/, plus a hash of any local
 # changes in it; a tree that already carries that stamp is left alone.
 set -euo pipefail
-export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH=${EDEN_TOOL_PATH:+$EDEN_TOOL_PATH:}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 tree=$1
 src="$root/Eglantine"
