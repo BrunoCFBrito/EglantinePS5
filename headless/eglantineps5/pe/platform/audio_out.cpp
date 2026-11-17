@@ -45,7 +45,19 @@ bool AudioOut::start(audio::Mixer &mixer)
     mixer_ = &mixer;
     stop_.store(false);
     // Never name threads: pthread_setname_np hangs on this platform.
-    if (pthread_create(&thread_, nullptr, &AudioOut::thread_main, this) != 0)
+    // 1 MiB instead of the Payload SDK's 2 MiB: this thread renders one grain into a small stack
+    // buffer and calls sceAudioOutOutput (pool budget, 2026-11-17).
+    pthread_attr_t attributes;
+    if (pthread_attr_init(&attributes) != 0)
+    {
+        sceAudioOutClose(handle_);
+        handle_ = -1;
+        return false;
+    }
+    (void)pthread_attr_setstacksize(&attributes, 1024 * 1024);
+    const int started = pthread_create(&thread_, &attributes, &AudioOut::thread_main, this);
+    (void)pthread_attr_destroy(&attributes);
+    if (started != 0)
     {
         sys::log("audio thread creation failed");
         sceAudioOutClose(handle_);

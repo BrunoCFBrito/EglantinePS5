@@ -23,7 +23,7 @@ TEST_CASE("Switch 2 microphone format query accepts input functionality", "[sysm
         context.process->Close(kernel);
         kernel.UnregisterKernelObject(&client);
     };
-    std::optional<std::jthread> server_thread;
+    std::optional<Common::WorkerThread> server_thread;
     Service::ServerManager server{context.system};
     server_thread.emplace(
         kernel.RunOnHostCoreProcess("microphone-ipc-test", [&] { server.LoopProcess(); }));

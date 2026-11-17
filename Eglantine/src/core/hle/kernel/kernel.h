@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "common/polyfill_thread.h"
+#include "common/thread.h"
 #include "core/hardware_properties.h"
 #include "core/hle/kernel/k_auto_object.h"
 #include "core/hle/kernel/k_slab_heap.h"
@@ -215,9 +216,12 @@ public:
 
     void RunOnGuestCoreProcess(std::string&& process_name, std::function<void()> func);
 
-    std::jthread RunOnHostCoreProcess(std::string&& process_name, std::function<void()> func);
+    /// Service and worker host threads: their loops are shallow, so they get a smaller stack than
+    /// the platform's default (Common::WorkerThread; on the PS5 the default is 2 MiB of the pool
+    /// the GPU shares). The emulated CPU cores and the shader compiler keep std::jthread.
+    Common::WorkerThread RunOnHostCoreProcess(std::string&& process_name, std::function<void()> func);
 
-    std::jthread RunOnHostCoreThread(std::string&& thread_name, std::function<void()> func);
+    Common::WorkerThread RunOnHostCoreThread(std::string&& thread_name, std::function<void()> func);
 
     /// Gets global data for KObjectName.
     KObjectNameGlobalData& ObjectNameGlobalData();

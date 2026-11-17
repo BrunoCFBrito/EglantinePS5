@@ -11,6 +11,7 @@
 #include <catch2/generators/catch_generators.hpp>
 #include "common/page_table.h"
 #include "common/scope_exit.h"
+#include "common/thread.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_shared_memory.h"
@@ -85,7 +86,7 @@ TEST_CASE("Streamplay command 300 returns mappable guest HID memory", "[streampl
         kernel.UnregisterKernelObject(&client);
     };
 
-    std::optional<std::jthread> server_thread;
+    std::optional<Common::WorkerThread> server_thread;
     Service::ServerManager server{system};
     server_thread.emplace(
         kernel.RunOnHostCoreProcess("streamplay-test", [&] { server.LoopProcess(); }));

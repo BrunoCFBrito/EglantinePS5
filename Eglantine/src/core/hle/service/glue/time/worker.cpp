@@ -122,7 +122,7 @@ void TimeWorker::Initialize(std::shared_ptr<Service::PSC::Time::StaticService> t
 }
 
 void TimeWorker::StartThread() {
-    m_thread = std::jthread(std::bind_front(&TimeWorker::ThreadFunc, this));
+    m_thread = Common::WorkerThread(std::bind_front(&TimeWorker::ThreadFunc, this));
 }
 
 void TimeWorker::ThreadFunc(std::stop_token stop_token) {

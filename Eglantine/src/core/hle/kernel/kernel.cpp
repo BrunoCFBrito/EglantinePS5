@@ -1218,7 +1218,10 @@ void KernelCore::RegisterHostThread(KThread* existing_thread) {
     }
 }
 
-static std::jthread RunHostThreadFunc(KernelCore& kernel, KProcess* process, std::string&& thread_name, std::function<void()>&& func) {
+// A service or worker host thread: Common::WorkerThread gives it a 1 MiB stack instead of the
+// platform's default (2 MiB of the pool the GPU shares on the PS5). Its work is the HLE service's
+// loop and handlers, not emulated code: the CPU cores and the shader compiler keep std::jthread.
+static Common::WorkerThread RunHostThreadFunc(KernelCore& kernel, KProcess* process, std::string&& thread_name, std::function<void()>&& func) {
     // Reserve a new thread from the process resource limit.
     KScopedResourceReservation thread_reservation(kernel, process, LimitableResource::ThreadCountMax);
     ASSERT(thread_reservation.Succeeded());
@@ -1233,7 +1236,7 @@ static std::jthread RunHostThreadFunc(KernelCore& kernel, KProcess* process, std
     // Register the thread.
     KThread::Register(kernel, thread);
 
-    return std::jthread([&kernel, thread, thread_name_{std::move(thread_name)}, func_{std::move(func)}] {
+    return Common::WorkerThread([&kernel, thread, thread_name_{std::move(thread_name)}, func_{std::move(func)}] {
         // Set the thread name.
         Common::SetCurrentThreadName(thread_name_.c_str());
 
@@ -1249,8 +1252,8 @@ static std::jthread RunHostThreadFunc(KernelCore& kernel, KProcess* process, std
     });
 }
 
-std::jthread KernelCore::RunOnHostCoreProcess(std::string&& process_name,
-                                              std::function<void()> func) {
+Common::WorkerThread KernelCore::RunOnHostCoreProcess(std::string&& process_name,
+                                                      std::function<void()> func) {
     // Make a new process.
     KProcess* process = KProcess::Create(*this);
     ASSERT(R_SUCCEEDED(
@@ -1268,8 +1271,8 @@ std::jthread KernelCore::RunOnHostCoreProcess(std::string&& process_name,
     return RunHostThreadFunc(*this, process, std::move(process_name), std::move(func));
 }
 
-std::jthread KernelCore::RunOnHostCoreThread(std::string&& thread_name,
-                                             std::function<void()> func) {
+Common::WorkerThread KernelCore::RunOnHostCoreThread(std::string&& thread_name,
+                                                     std::function<void()> func) {
     // Get the current process.
     KProcess* process = GetCurrentProcessPointer(*this);
 

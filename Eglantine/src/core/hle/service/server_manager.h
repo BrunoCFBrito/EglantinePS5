@@ -114,7 +114,7 @@ private:
 
     // Host state tracking
     Common::Event m_stopped{};
-    std::vector<std::jthread> m_threads{};
+    std::vector<Common::WorkerThread> m_threads{};
     std::stop_source m_stop_source{};
 };
 

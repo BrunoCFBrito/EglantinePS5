@@ -41,7 +41,7 @@ Conductor::Conductor(Core::System& system, Container& container, DisplayList& di
             });
 
         system.CoreTiming().ScheduleLoopingEvent(FrameNs, FrameNs, m_event);
-        m_thread = std::jthread([this](std::stop_token token) { this->VsyncThread(token); });
+        m_thread = Common::WorkerThread([this](std::stop_token token) { this->VsyncThread(token); });
     } else {
         m_event = Core::Timing::CreateEvent(
             "ScreenComposition",

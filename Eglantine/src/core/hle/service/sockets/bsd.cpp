@@ -25,6 +25,7 @@
 #include "common/logging.h"
 #include "common/polyfill_thread.h"
 #include "common/socket_types.h"
+#include "common/thread.h"
 #include "common/zstd_compression.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_event.h"
@@ -656,7 +657,7 @@ private:
     /// Set once requests can no longer wait.
     bool stopped = false;
 
-    std::jthread thread;
+    Common::WorkerThread thread;
 };
 
 std::shared_ptr<BSD_USA::SelectNotifier> BSD_USA::CreateSelectNotifier(

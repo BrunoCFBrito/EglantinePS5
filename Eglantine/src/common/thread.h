@@ -11,12 +11,169 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdlib>
+#include <memory>
 #include <mutex>
+#include <stop_token>
+#include <system_error>
 #include <thread>
+#include <type_traits>
+#include <utility>
+#if !defined(_WIN32)
+#include <pthread.h>
+#endif
 #include "common/common_types.h"
 #include "common/polyfill_thread.h"
+#include "common/unique_function.h"
 
 namespace Common {
+
+#if !defined(_WIN32)
+/// A thread whose stack is smaller than the platform's default, for the service and worker threads
+/// whose work is shallow: the HLE service loops, the vsync thread, the time worker and event
+/// observer, cache writers. On the PS5 the Payload SDK takes 2 MiB of the pool shared with the GPU
+/// for every thread's stack (pool budget, 2026-11-17: 49 stacks, 98 MiB), and the pool is what a
+/// game runs out of first. The emulated CPU cores, the shader compiler and the GPU threads keep the
+/// default stack and stay std::jthread.
+///
+/// A std::jthread-compatible handle: runs its function with a std::stop_token when the function
+/// takes one, and the destructor requests the stop and joins. EDEN_WORKER_STACK_KIB (1024 by
+/// default, 256 to 8192) sets the stack, for one A/B run without a rebuild.
+class WorkerThread {
+public:
+    WorkerThread() noexcept = default;
+
+    template <typename Function>
+    explicit WorkerThread(Function&& function) {
+        using Callable = std::decay_t<Function>;
+        auto state = std::make_shared<State>();
+        state->task = [fn = std::forward<Function>(function)](std::stop_token token) mutable {
+            if constexpr (std::is_invocable_v<Callable&, std::stop_token>) {
+                fn(std::move(token));
+            } else {
+                fn();
+            }
+        };
+        auto* holder = new std::shared_ptr<State>{state};
+        pthread_attr_t attributes;
+        const int initialized = pthread_attr_init(&attributes);
+        if (initialized != 0) {
+            delete holder;
+            throw std::system_error(initialized, std::generic_category(), "WorkerThread");
+        }
+        (void)pthread_attr_setstacksize(&attributes, StackSize());
+        const int created = pthread_create(&thread, &attributes, &WorkerThread::Entry, holder);
+        (void)pthread_attr_destroy(&attributes);
+        if (created != 0) {
+            delete holder;
+            throw std::system_error(created, std::generic_category(), "WorkerThread");
+        }
+        state_ = std::move(state);
+        joinable_ = true;
+    }
+
+    WorkerThread(const WorkerThread&) = delete;
+    WorkerThread& operator=(const WorkerThread&) = delete;
+
+    WorkerThread(WorkerThread&& other) noexcept
+        : thread{other.thread}, state_{std::move(other.state_)}, joinable_{other.joinable_} {
+        other.joinable_ = false;
+    }
+
+    WorkerThread& operator=(WorkerThread&& other) noexcept {
+        if (this != &other) {
+            if (joinable_) {
+                request_stop();
+                (void)pthread_join(thread, nullptr);
+            }
+            thread = other.thread;
+            state_ = std::move(other.state_);
+            joinable_ = other.joinable_;
+            other.joinable_ = false;
+        }
+        return *this;
+    }
+
+    ~WorkerThread() {
+        if (joinable_) {
+            request_stop();
+            (void)pthread_join(thread, nullptr);
+        }
+    }
+
+    [[nodiscard]] bool joinable() const noexcept {
+        return joinable_;
+    }
+
+    void join() {
+        if (!joinable_) {
+            throw std::system_error(std::make_error_code(std::errc::invalid_argument),
+                                    "WorkerThread::join");
+        }
+        const int result = pthread_join(thread, nullptr);
+        if (result != 0) {
+            throw std::system_error(result, std::generic_category(), "WorkerThread::join");
+        }
+        joinable_ = false;
+    }
+
+    void detach() {
+        if (!joinable_) {
+            throw std::system_error(std::make_error_code(std::errc::invalid_argument),
+                                    "WorkerThread::detach");
+        }
+        const int result = pthread_detach(thread);
+        if (result != 0) {
+            throw std::system_error(result, std::generic_category(), "WorkerThread::detach");
+        }
+        joinable_ = false;
+    }
+
+    bool request_stop() noexcept {
+        return state_ != nullptr && state_->stop.request_stop();
+    }
+
+    [[nodiscard]] std::stop_token get_stop_token() const noexcept {
+        return state_ != nullptr ? state_->stop.get_token() : std::stop_token{};
+    }
+
+    void swap(WorkerThread& other) noexcept {
+        std::swap(thread, other.thread);
+        state_.swap(other.state_);
+        std::swap(joinable_, other.joinable_);
+    }
+
+private:
+    struct State {
+        std::stop_source stop;
+        UniqueFunction<void, std::stop_token> task;
+    };
+
+    static std::size_t StackSize() {
+        static const std::size_t size = [] {
+            const char* const text = std::getenv("EDEN_WORKER_STACK_KIB");
+            const long kib = text != nullptr ? std::strtol(text, nullptr, 10) : 1024;
+            return static_cast<std::size_t>(kib < 256 ? 256 : (kib > 8192 ? 8192 : kib)) << 10;
+        }();
+        return size;
+    }
+
+    static void* Entry(void* opaque) {
+        std::unique_ptr<std::shared_ptr<State>> holder{static_cast<std::shared_ptr<State>*>(opaque)};
+        const std::shared_ptr<State> state = *holder;
+        holder.reset();
+        state->task(state->stop.get_token());
+        return nullptr;
+    }
+
+    pthread_t thread{};
+    std::shared_ptr<State> state_;
+    bool joinable_{};
+};
+#else
+/// Windows: the operating system's default stack, as before.
+using WorkerThread = std::jthread;
+#endif
 
 class Event {
 public:

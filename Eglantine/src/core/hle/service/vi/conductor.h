@@ -52,7 +52,7 @@ private:
     ::Common::unordered_map<u64, VsyncManager> m_vsync_managers;
     std::shared_ptr<Core::Timing::EventType> m_event;
     Common::Event m_signal;
-    std::jthread m_thread;
+    Common::WorkerThread m_thread;
 
 private:
     s32 m_swap_interval = 1;

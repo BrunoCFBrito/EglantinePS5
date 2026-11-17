@@ -7,6 +7,7 @@
 #pragma once
 
 #include "common/common_types.h"
+#include "common/thread.h"
 #include "core/hle/kernel/k_event.h"
 #include "core/hle/service/glue/time/alarm_worker.h"
 #include "core/hle/service/glue/time/pm_state_change_handler.h"
@@ -46,7 +47,7 @@ private:
     KernelHelpers::ServiceContext m_ctx;
     std::shared_ptr<Service::Set::ISystemSettingsServer> m_set_sys;
 
-    std::jthread m_thread;
+    Common::WorkerThread m_thread;
     Kernel::KEvent* m_event{};
     std::shared_ptr<Service::PSC::Time::ServiceManager> m_time_m;
     std::shared_ptr<Service::PSC::Time::StaticService> m_time_sm;

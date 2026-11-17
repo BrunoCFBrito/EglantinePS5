@@ -62,7 +62,7 @@ private:
     MultiWait m_deferred_wait_list;
 
     // Processing thread.
-    std::jthread m_thread{};
+    Common::WorkerThread m_thread{};
 };
 
 } // namespace Service::AM

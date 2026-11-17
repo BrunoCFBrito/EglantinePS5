@@ -12,6 +12,7 @@
 
 #include "common/common_types.h"
 #include "common/polyfill_thread.h"
+#include "common/thread.h"
 #include "video_core/shader_cache_v2/cache_file.h"
 #include "video_core/shader_cache_v2/cache_format.h"
 
@@ -91,7 +92,7 @@ private:
     CompactLimit compact_limit;
     WriterStats stats;
 
-    std::jthread thread;
+    Common::WorkerThread thread;
 };
 
 } // namespace VideoCommon::ShaderCacheV2
