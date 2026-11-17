@@ -517,6 +517,8 @@ extern "C" std::size_t eden_heap_large_held(unsigned* blocks) __attribute__((wea
 extern "C" std::size_t eden_heap_trim(void) __attribute__((weak));
 extern "C" void eden_heap_sites_report(void) __attribute__((weak));
 extern "C" void eden_heap_usage(std::size_t* held, std::size_t* in_use, std::size_t* returned) __attribute__((weak));
+extern "C" void eden_heap_page_usage(std::size_t* free_pages, std::size_t* idle_arenas, std::size_t* live)
+    __attribute__((weak));
 extern "C" void eden_heap_slack(std::size_t*, std::size_t*, unsigned*, unsigned*) __attribute__((weak));
 extern "C" std::size_t eden_heap_arena_live __attribute__((weak));
 extern "C" unsigned eden_heap_arena_empty __attribute__((weak)), eden_heap_arena_quarter __attribute__((weak));
@@ -672,6 +674,14 @@ void ReportHeap(const char* why) {
                      tcache >> 20, arena_count, arenas >> 20, holders, eden_heap_arena_live >> 20,
                      eden_heap_arena_empty, eden_heap_arena_quarter,
                      ((held - large) > arenas ? (held - large) - arenas : 0) >> 20);
+    }
+    // What a heap that gives whole free 2 MiB pages back could return now (heap_arenas.inc).
+    if (eden_heap_page_usage) {
+        std::size_t free_pages = 0, idle_arenas = 0, live = 0;
+        eden_heap_page_usage(&free_pages, &idle_arenas, &live);
+        std::fprintf(stderr, "EDEN_HEAP_PAGES %zu MiB of the pieces are whole 2 MiB pages with no block in use "
+                             "(%zu MiB of them idle arenas); the blocks in use hold %zu MiB\n",
+                     free_pages >> 20, idle_arenas >> 20, live >> 20);
     }
     if (eden_heap_sites_report) eden_heap_sites_report();
 }
