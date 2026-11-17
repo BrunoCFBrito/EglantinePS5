@@ -62,6 +62,14 @@ namespace Common { void CommitGuestMemory(std::uint64_t offset, std::size_t byte
 #include "core/hle/service/sm/sm.h"
 #include "core/memory.h"
 
+// PS5 port (src/guest_memory_service.inc): where the game's pool lies in the guest's backing.
+#if defined(__GNUC__) || defined(__clang__)
+extern "C" void eden_guest_swap_pool(std::uint64_t offset, std::uint64_t bytes) noexcept
+    __attribute__((weak));
+#else
+static constexpr void (*eden_guest_swap_pool)(std::uint64_t, std::uint64_t) noexcept = nullptr;
+#endif
+
 namespace Kernel {
 
 // Can only be used by a single implementation PER THREAD
@@ -889,6 +897,13 @@ struct KernelCore::Impl {
         const auto& management_region = memory_layout->GetPoolManagementRegion();
         ASSERT(management_region.GetEndAddress() != 0);
         memory_manager->Initialize(management_region.GetAddress(), management_region.GetSize());
+
+        // PS5 port: only the game's own pool may lose its mapping for a while. The slab heaps and
+        // the other pools hold objects of this kernel and what the emulator reads all the time.
+        if (eden_guest_swap_pool) {
+            const auto pool = memory_layout->GetKernelApplicationPoolRegionPhysicalExtents();
+            eden_guest_swap_pool(pool.GetAddress() - Core::DramMemoryMap::Base, pool.GetSize());
+        }
     }
 
     void InitializeHackSharedMemory(KernelCore& kernel) {
