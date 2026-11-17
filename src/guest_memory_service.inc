@@ -997,6 +997,7 @@ std::atomic<unsigned> memory_waiters{0};
 // being served, so one pass frees enough for the whole burst rather than a block per call.
 // Throttled per thread, so the fault handler's 20 ms retry loop does not turn into a pack storm.
 bool RecoverForFault() noexcept {
+    const EdenStallScope stall_scope{EdenStallRecover};
     static thread_local std::uint64_t last_ns = 0;
     timespec now{};
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return false;
@@ -1022,6 +1023,7 @@ void NoteUnpackWait() noexcept {
 
 // Packed -> Own: a block of its own, read-write, with the slot's data unpacked into it.
 bool UnpackSlot(SparseRange& range, std::size_t slot) noexcept {
+    const EdenStallScope stall_scope{EdenStallUnpack};
 #ifdef PS5_NATIVE
     PackedSlot* const table = packed_slots.load(std::memory_order_acquire);
     if (table == nullptr || table[slot].data == nullptr) std::abort();
@@ -1388,6 +1390,7 @@ bool SwapOut(SparseRange& range, std::size_t slot) noexcept {
 // the slot shows them in one step. Nothing here allocates. The place in the file goes back at once:
 // the slot can be written now, and a later trip writes it again.
 bool SwapIn(SparseRange& range, std::size_t slot) noexcept {
+    const EdenStallScope stall_scope{EdenStallSwapIn};
 #ifdef PS5_NATIVE
     const int saved = errno;
     const std::uint64_t start = NowNs();
@@ -1537,6 +1540,7 @@ std::atomic<std::uint64_t> memory_waits_won{0}, memory_waits_lost{0};
 // again every 20 ms for up to 2 s while the caches give memory back. Only then is it refused.
 template <typename Promote>
 bool WaitForBlock(Promote&& promote) noexcept {
+    const EdenStallScope stall_scope{EdenStallBlockWait};
     bool ok = false;
     for (unsigned tries = 0; tries < 100 && !ok; ++tries) {
         // Every 100 ms, ask again for what the other owners can give: a fault that is not on a
@@ -1632,6 +1636,7 @@ extern "C" void eden_guest_memory_waits(unsigned long long* won, unsigned long l
 // A write fault at `address`: true when it was a write to a slot of the guest's memory that is
 // now writable (the faulting instruction repeats), false for anything else.
 bool HandleGuestWriteFault(void* fault) noexcept {
+    const EdenStallScope stall_scope{EdenStallFault};
     auto address = reinterpret_cast<std::uintptr_t>(fault);
     if (const auto expected = probe_expected.load(std::memory_order_acquire); expected != 0 && address != expected) {
         probe_mismatch.store(true, std::memory_order_relaxed);

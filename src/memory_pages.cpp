@@ -24,6 +24,34 @@
 #include <vector>
 
 #include "fastmem.h"
+#include "../Eglantine/src/common/eden_stall.h"
+
+// Stall meter counters (common/eden_stall.h): per kind, total ns, count and longest ns since the
+// last eden_stall_take.
+namespace {
+std::atomic<std::uint64_t> eden_stall_total[EdenStallKinds];
+std::atomic<std::uint64_t> eden_stall_count[EdenStallKinds];
+std::atomic<std::uint64_t> eden_stall_longest[EdenStallKinds];
+} // namespace
+
+extern "C" void eden_stall_add(int kind, std::uint64_t ns) noexcept {
+    if (kind < 0 || kind >= EdenStallKinds) return;
+    eden_stall_total[kind].fetch_add(ns, std::memory_order_relaxed);
+    eden_stall_count[kind].fetch_add(1, std::memory_order_relaxed);
+    std::uint64_t longest = eden_stall_longest[kind].load(std::memory_order_relaxed);
+    while (ns > longest &&
+           !eden_stall_longest[kind].compare_exchange_weak(longest, ns, std::memory_order_relaxed)) {
+    }
+}
+
+extern "C" void eden_stall_take(std::uint64_t* total_ns, std::uint64_t* count,
+                                std::uint64_t* longest_ns) noexcept {
+    for (int kind = 0; kind < EdenStallKinds; ++kind) {
+        total_ns[kind] = eden_stall_total[kind].exchange(0, std::memory_order_relaxed);
+        count[kind] = eden_stall_count[kind].exchange(0, std::memory_order_relaxed);
+        longest_ns[kind] = eden_stall_longest[kind].exchange(0, std::memory_order_relaxed);
+    }
+}
 // Linked in the app (common, lz4); absent in the host checks that build this file alone.
 // The driver gives back device memory no bound resource uses (tools/patch-radv-trim.py; the RADV
 // archive's symbols carry the isolation prefix). Absent in the host checks and other drivers.

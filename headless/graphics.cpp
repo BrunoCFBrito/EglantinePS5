@@ -18,6 +18,7 @@
 #include <cstring>
 #include <time.h>
 #include "hud.h"
+#include "../Eglantine/src/common/eden_stall.h"
 #include "network/network.h"
 #include "loading_scene_glsl.h"
 #include "preferences.h"
@@ -738,6 +739,20 @@ void GraphicsWindow::OnFrameDisplayed() {
             std::fprintf(stderr, "EDEN_FPS fps=%.1f frames=%u seconds=%.2f worst_ms=%.1f speed=%.0f\n",
                          fps_frames / (now - fps_start), fps_frames, now - fps_start,
                          fps_worst * 1000.0, speed);
+            // EDEN_STALL: per kind, ms the threads that touched guest memory spent on it over the
+            // same window (summed over threads), how many times, and the longest one.
+            std::uint64_t stall_ns[EdenStallKinds], stall_n[EdenStallKinds], stall_max[EdenStallKinds];
+            eden_stall_take(stall_ns, stall_n, stall_max);
+            static constexpr const char* stall_names[EdenStallKinds] = {
+                "fault", "unpack", "swap_in", "recover", "block_wait"};
+            char stall_line[512];
+            int used = std::snprintf(stall_line, sizeof(stall_line), "EDEN_STALL");
+            for (int kind = 0; kind < EdenStallKinds && used > 0 && used < int(sizeof(stall_line)); ++kind)
+                used += std::snprintf(stall_line + used, sizeof(stall_line) - used,
+                                      " %s=%.0fms/%llu/max%.1fms", stall_names[kind],
+                                      stall_ns[kind] / 1e6, (unsigned long long)stall_n[kind],
+                                      stall_max[kind] / 1e6);
+            std::fprintf(stderr, "%s\n", stall_line);
             fps_start = now;
             fps_frames = 0;
             fps_worst = 0;
