@@ -349,7 +349,9 @@ std::int64_t* pack_kept = nullptr; // per slot: the block a packed slot kept, -1
 // itself touched packed slots; the slots' data came back intact, so what the GPU reads through its
 // caches and their ordering must not meet a packed slot. That left MKW ~86 MiB to pack (it maps
 // nearly all its memory for the GPU), and it still ran out; the impossible draws come without
-// packing too. So such slots are packed by default; EDEN_CRAM_PACK_GPU=0 keeps them out.
+// packing too. Since the 2026-11-17 report the packs that come straight back (87-90% of the zstd
+// ones, many of them GPU-side data) are not worth their store and fault cost, so such slots are
+// left out by default; EDEN_CRAM_PACK_GPU=1 packs them as before.
 std::atomic<std::atomic<std::int32_t>*> gpu_cached_table{nullptr};
 std::size_t gpu_cached_slots = 0;
 std::atomic<std::uint64_t> pack_gpu_skips{0}, pack_gpu_marked{0};
@@ -1826,10 +1828,13 @@ bool ScanShare(SparseRange& range, std::size_t keep, std::size_t other) noexcept
 }
 
 // ---- Packing (see "Packed slots" above) ----
-// EDEN_CRAM_PACK=0 turns it off. While the pool's largest free block is under PackBelowLargest,
-// each scan pass packs up to PackPerPass slots unwritten for ColdSeconds or more, the
-// coldest first. A slot packed before waits twice as many passes each time (it came back), and
-// one that does not compress to PackMaxRatio is left as it is.
+// EDEN_CRAM_PACK=0 turns it off. Packing arms once the pool's largest free block falls under
+// PackBelowLargest and stays armed until it is back above PackStopLargest (hysteresis: a pool
+// sitting between the two does not switch packing on and off every pass). While armed, each scan
+// pass packs up to PackPerPass slots unwritten for ColdSeconds or more, the coldest first, and at
+// most PackPerPassWaiting while a guest write is waiting for a block. A slot packed before waits
+// twice as many passes each time (it came back); one that does not compress to PackMaxRatio is left
+// as it is, and a GPU-held slot is skipped unless EDEN_CRAM_PACK_GPU=1.
 // On unless EDEN_CRAM_PACK=0 (2026-11-09). It only starts once the pool's largest free block is
 // below EDEN_CRAM_PACK_BELOW_MIB, so a game that fits never packs. Without PS5 Pro memory (12,224
 // MiB) Mario Kart World ran out at every race load without it; with it (GPU-reachable slots
@@ -1845,10 +1850,12 @@ bool PackEnabled() noexcept {
     }();
     return on;
 }
-constexpr std::size_t PackPerPass = 256;                       // 512 MiB of slots
-// EDEN_CRAM_PACK_BELOW_MIB / EDEN_CRAM_PACK_COLD_S: when packing starts (largest free block) and how long
-// a slot must stay unwritten (tuning; defaults 3072 MiB and 30 s: MKW without Pro memory needs packing
-// to start well before the race load, which takes ~1.5 GB at once).
+constexpr std::size_t PackPerPass = 256;        // 512 MiB of slots
+constexpr std::size_t PackPerPassWaiting = 64; // 128 MiB, while a guest write waits for a block
+// EDEN_CRAM_PACK_BELOW_MIB / EDEN_CRAM_PACK_STOP_MIB / EDEN_CRAM_PACK_COLD_S: where packing arms,
+// where it stands down (default: start + 1024 MiB) and how long a slot must stay unwritten
+// (tuning; defaults 3072 MiB, 4096 MiB and 30 s: MKW without Pro memory needs packing to start
+// well before the race load, which takes ~1.5 GB at once).
 std::size_t EnvOr(const char* name, std::size_t fallback) noexcept {
     const char* value = std::getenv(name);
     return value != nullptr && *value ? static_cast<std::size_t>(std::strtoull(value, nullptr, 10)) : fallback;
@@ -1857,10 +1864,22 @@ std::size_t PackBelowLargest() noexcept {
     static const std::size_t bytes = EnvOr("EDEN_CRAM_PACK_BELOW_MIB", 3072) << 20;
     return bytes;
 }
+std::size_t PackStopLargest() noexcept {
+    static const std::size_t bytes = [] {
+        const std::size_t start = PackBelowLargest() >> 20;
+        const std::size_t stop = std::max(EnvOr("EDEN_CRAM_PACK_STOP_MIB", start + 1024), start + 256);
+        return stop << 20;
+    }();
+    return bytes;
+}
+// Armed while the pool is short (PoolShortForPacking): set under the same hysteresis.
+std::atomic<bool> pack_pool_short{false};
 constexpr double PackMaxRatio = 0.6;
-// zstd is slower to unpack than LZ4, so it is kept for slots LZ4 packs too little; it is taken when
-// it gives back at least this many pages (256 KiB), which is what the fork's PackOut asked.
-constexpr std::size_t PackMinGainPages = 16;
+// zstd is slower to unpack than LZ4, so it is kept for slots LZ4 packs too little; it is taken only
+// when it packs to half the slot or less (a gain of 1 MiB or more), so a slot that saves less is
+// left alone instead of entering the store and faulting back out (the 2026-11-17 report: the weak
+// zstd packs were most of the 87-90% unpack churn).
+constexpr double PackZstdMaxRatio = 0.5;
 std::vector<std::uint8_t> pack_times; // per slot: how often it was packed or tried (scanner, recovery)
 std::atomic<bool> pack_refused{false};
 std::mutex pack_mutex; // the scanner's cold pass and packing, and eden_memory_recover
@@ -1880,9 +1899,16 @@ bool PoolShortForPacking() noexcept {
     const auto total = sceKernelGetDirectMemorySize();
     std::int64_t start = 0;
     std::size_t largest = 0;
-    return total > 0 && &sceKernelAvailableDirectMemorySize != nullptr &&
-           sceKernelAvailableDirectMemorySize(0, total, SparseSlot, &start, &largest) == 0 &&
-           largest < PackBelowLargest();
+    if (total <= 0 || &sceKernelAvailableDirectMemorySize == nullptr ||
+        sceKernelAvailableDirectMemorySize(0, total, SparseSlot, &start, &largest) != 0)
+        return false;
+    // Arm under PackBelowLargest, stand down only above PackStopLargest: the pool's largest free
+    // block sits close to the single mark most of the time, and with one mark packing started and
+    // stopped every pass (2026-11-17: the store grew and unloaded in the same minute).
+    const bool armed = pack_pool_short.load(std::memory_order_relaxed);
+    const bool short_now = largest < (armed ? PackStopLargest() : PackBelowLargest());
+    pack_pool_short.store(short_now, std::memory_order_relaxed);
+    return short_now;
 #else
     return false;
 #endif
@@ -1895,7 +1921,7 @@ bool PackSlot(SparseRange& range, std::size_t slot) noexcept {
     if (table == nullptr) return false;
     static const bool pack_gpu = [] {
         const char* value = std::getenv("EDEN_CRAM_PACK_GPU");
-        return value == nullptr || value[0] != '0';
+        return value != nullptr && value[0] == '1';
     }();
     if (auto* gpu_cached = gpu_cached_table.load(std::memory_order_acquire);
         !pack_gpu && gpu_cached != nullptr && slot < gpu_cached_slots &&
@@ -1925,16 +1951,16 @@ bool PackSlot(SparseRange& range, std::size_t slot) noexcept {
         zstd_ready.load(std::memory_order_acquire)) {
         const std::size_t packed = ZSTD_compressCCtx(zstd_pack, pack_scratch.data(), pack_scratch.size(),
                                                      reinterpret_cast<const void*>(at), SparseSlot, 1);
-        if (!ZSTD_isError(packed) && packed > 0 && packed <= SparseSlot - PackMinGainPages * FinePage) {
+        if (!ZSTD_isError(packed) && packed > 0 && packed <= static_cast<std::size_t>(SparseSlot * PackZstdMaxRatio)) {
             size = static_cast<int>(packed);
             zstd = true;
             packed_zstd.fetch_add(1, std::memory_order_relaxed);
         }
     }
 #endif
-    // LZ4 must pack to PackMaxRatio; zstd only has to give back PackMinGainPages.
+    // LZ4 must pack to PackMaxRatio; zstd to PackZstdMaxRatio (a gain of at least half the slot).
     const std::size_t max_size =
-        zstd ? SparseSlot - PackMinGainPages * FinePage : static_cast<std::size_t>(SparseSlot * PackMaxRatio);
+        zstd ? static_cast<std::size_t>(SparseSlot * PackZstdMaxRatio) : static_cast<std::size_t>(SparseSlot * PackMaxRatio);
     if (size <= 0 || static_cast<std::size_t>(size) > max_size || !StoreStart()) {
         Unfence(at);
         UnlockSlot(range, slot, SlotOwn);
@@ -2217,9 +2243,13 @@ void PackPass(SparseRange& range, std::size_t slots, std::vector<std::size_t>& c
     for (const std::size_t slot : candidates)
         if (now - cold_since[slot] >= (ColdSeconds << std::min<unsigned>(pack_times[slot], 4))) ready.push_back(slot);
     std::sort(ready.begin(), ready.end(), [](std::size_t a, std::size_t b) { return cold_since[a] < cold_since[b]; });
+    // A writer waiting for a block gets the memory its own pass packs; keeping the pass short keeps
+    // the store (and the packer's mutex) from growing while it waits.
+    const std::size_t per_pass =
+        memory_waiters.load(std::memory_order_acquire) != 0 ? PackPerPassWaiting : PackPerPass;
     std::size_t done = 0;
     for (const std::size_t slot : ready) {
-        if (done >= PackPerPass) break;
+        if (done >= per_pass) break;
         if (pack_times[slot] < 255) ++pack_times[slot];
         if (PackSlot(range, slot)) {
             ++done;
@@ -2442,10 +2472,10 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
         }
     }
     if (PackEnabled()) {
-        char pack_line[400];
+        char pack_line[448];
         const int pack_length = std::snprintf(pack_line, sizeof(pack_line),
             "EDEN_CRAM_PACK %s packed=%lluMiB stored=%lluMiB packs=%llu unpacks=%llu skips=%llu unpack_keep=%lluMiB"
-            " kept_compared=%llu kept_differed=%llu zero_block_dirty=%llu gpu_skips=%llu gpu_marked=%llu zstd=%llu\n", when,
+            " kept_compared=%llu kept_differed=%llu zero_block_dirty=%llu gpu_skips=%llu gpu_marked=%llu zstd=%llu armed=%d\n", when,
             (unsigned long long)(packed_count.load(std::memory_order_relaxed) * (SparseSlot >> 20)),
             (unsigned long long)(packed_bytes.load(std::memory_order_relaxed) >> 20),
             (unsigned long long)packs.load(std::memory_order_relaxed), (unsigned long long)unpacks.load(std::memory_order_relaxed),
@@ -2456,10 +2486,11 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
             (unsigned long long)pack_gpu_skips.load(std::memory_order_relaxed),
             (unsigned long long)pack_gpu_marked.load(std::memory_order_relaxed),
 #ifdef EDEN_SWAP_ZSTD
-            (unsigned long long)packed_zstd.load(std::memory_order_relaxed));
+            (unsigned long long)packed_zstd.load(std::memory_order_relaxed),
 #else
-            0ull);
+            0ull,
 #endif
+            pack_pool_short.load(std::memory_order_relaxed) ? 1 : 0);
         if (pack_length > 0) Report(pack_line);
         ReportUnpackers();
     }
