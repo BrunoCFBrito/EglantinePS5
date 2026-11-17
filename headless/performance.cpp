@@ -531,6 +531,31 @@ extern "C" std::int32_t sceKernelAvailableDirectMemorySize(std::int64_t, std::in
 // The allocated region at or after an offset (flag 1: find the next one).
 struct DirectMemoryRegion { std::int64_t start; std::int64_t end; std::int32_t type; };
 extern "C" std::int32_t sceKernelDirectMemoryQuery(std::int64_t, int, DirectMemoryRegion*, std::size_t);
+
+// All the pool's free memory and the holes it lies in, from its allocated regions. Against the
+// largest free block it tells how much of the pool is holes between allocations. False: the
+// regions could not be read.
+struct DirectMemoryHoles { std::int64_t free; unsigned holes; unsigned regions; };
+static bool ReadDirectMemoryHoles(std::int64_t total, DirectMemoryHoles& out) {
+    out = {};
+    std::int64_t offset = 0;
+    DirectMemoryRegion region{};
+    while (offset < total && out.regions < 8192 &&
+           sceKernelDirectMemoryQuery(offset, 1, &region, sizeof(region)) == 0 && region.end > offset) {
+        if (region.start > offset) {
+            out.free += region.start - offset;
+            ++out.holes;
+        }
+        offset = region.end;
+        ++out.regions;
+    }
+    if (out.regions == 0) return false;
+    if (offset < total) {
+        out.free += total - offset;
+        ++out.holes;
+    }
+    return true;
+}
 #endif
 
 #ifdef PS5_NATIVE
@@ -593,10 +618,13 @@ static void RefreshFreeMemory() {
         std::size_t guest_span = 0, guest_held = 0;
         ::Common::GuestMemoryUsage(&guest_span, &guest_held);
         const auto kernel_memory = guest_kernel_memory.load(std::memory_order_relaxed);
+        DirectMemoryHoles holes{};
+        const bool read_holes = total > 0 && ReadDirectMemoryHoles(total, holes);
         std::fprintf(stderr, "EDEN_MEMORY pool largest free block %zu MiB, short=%d; the guest's memory holds %zu MiB"
-                     " (the kernel maps %llu MiB)\n",
+                     " (the kernel maps %llu MiB); free %lld MiB in %u holes, %u regions\n",
                      largest >> 20, int(view.short_memory), guest_held >> 20,
-                     kernel_memory ? kernel_memory() >> 20 : 0ULL);
+                     kernel_memory ? kernel_memory() >> 20 : 0ULL,
+                     read_holes ? static_cast<long long>(holes.free >> 20) : -1LL, holes.holes, holes.regions);
         std::fprintf(stderr, "EDEN_MEMORY_PARTS t=%lld driver_mib=%llu guest_held_mib=%zu guest_span_mib=%zu\n",
                      now / 1'000'000'000,
                      &eden_radv_private_radv_ps5_allocated_bytes != nullptr
@@ -752,20 +780,12 @@ void ReportGpuThread(unsigned frame) {
         std::int64_t start = 0;
         std::size_t largest = 0;
         if (sceKernelAvailableDirectMemorySize(0, total, 0x4000, &start, &largest) == 0) {
-            // All that is free, against the largest block: how far apart they are tells how much
-            // of the pool is holes between allocations. -1: the regions could not be read.
-            std::int64_t taken = 0, offset = 0;
-            unsigned regions = 0;
-            DirectMemoryRegion region{};
-            while (offset < total && regions < 8192 &&
-                   sceKernelDirectMemoryQuery(offset, 1, &region, sizeof(region)) == 0 && region.end > offset) {
-                taken += region.end - region.start;
-                offset = region.end;
-                ++regions;
-            }
+            // -1: the regions could not be read.
+            DirectMemoryHoles holes{};
+            const bool read_holes = ReadDirectMemoryHoles(total, holes);
             std::printf("EDEN_PERF_DIRECT total=%lld largest_free=%zu free=%lld regions=%u short=%d\n",
                         static_cast<long long>(total), largest,
-                        regions != 0 ? static_cast<long long>(total - taken) : -1LL, regions,
+                        read_holes ? static_cast<long long>(holes.free) : -1LL, holes.regions,
                         int(graphics_memory_short.load(std::memory_order_relaxed)));
         }
     }

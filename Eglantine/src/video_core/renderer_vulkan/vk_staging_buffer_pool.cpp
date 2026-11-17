@@ -117,6 +117,28 @@ constexpr u64 NO_STAGING_CAP_BYTES = ~u64{0};
 // next sweep (up to 64 frames later). One 12288x12288 D16 shadow map is 288 MiB.
 constexpr u64 LARGE_IDLE_RELEASE_BYTES = u64{32} << 20;
 
+// What the caches may keep idle while the pool is short. With nothing kept, every transfer made a
+// buffer and let it go again, and each of those is a driver allocation that maps fresh memory: in
+// a long Ocarina of Time session the pool stayed short for minutes and the back thread spent its
+// frames there. EDEN_STAGING_SHORT_MIB overrides it in MiB (0 keeps nothing).
+constexpr u64 DEFAULT_SHORT_STAGING_CAP_BYTES = u64{32} << 20;
+
+u64 GetShortStagingCapBytes() {
+    static const u64 cap = [] {
+        const char* const text = std::getenv("EDEN_STAGING_SHORT_MIB");
+        if (text == nullptr || text[0] == '\0') {
+            return DEFAULT_SHORT_STAGING_CAP_BYTES;
+        }
+        char* end = nullptr;
+        const unsigned long long mib = std::strtoull(text, &end, 10);
+        if (end == text || *end != '\0' || mib > 1024) {
+            return DEFAULT_SHORT_STAGING_CAP_BYTES;
+        }
+        return u64{mib} << 20;
+    }();
+    return cap;
+}
+
 u64 GetStagingCapBytes() {
     static const u64 cap = [] {
         const char* const text = std::getenv("EDEN_STAGING_CAP_MIB");
@@ -294,10 +316,11 @@ void StagingBufferPool::TickFrame() {
     }
 
     // Over the cap: let go of the largest idle buffers until the caches fit again. While the pool
-    // is short nothing idle is kept: the game's memory and the next allocation need it more than
-    // the next transfer of the same size does.
+    // is short only a small cap is kept (GetShortStagingCapBytes): the game's memory and the next
+    // allocation need the rest more than the next transfer of the same size does.
     const bool short_memory = ::Eden::Performance::GraphicsMemoryIsShort();
-    ReleaseIdleToCap(short_memory ? 0 : GetStagingCapBytes(), short_memory ? "short" : "frame");
+    ReleaseIdleToCap(short_memory ? GetShortStagingCapBytes() : GetStagingCapBytes(),
+                     short_memory ? "short" : "frame");
 }
 
 StagingReleased StagingBufferPool::ReleaseIdleToCap(u64 cap, const char* why) {
@@ -498,12 +521,12 @@ std::optional<StagingBufferRef> StagingBufferPool::TryCreateStagingBuffer(size_t
     }
     // The cap is enforced here too, not only in TickFrame: a burst inside one frame asked for
     // more than the cap at once, and buffers that became idle after the frame's own check were
-    // still kept when the next allocation came. Under a short pool no idle buffer survives a
-    // request; otherwise the scan only runs for buffers of at least a MiB, the ones that can
+    // still kept when the next allocation came. Under a short pool the smaller cap is enforced on
+    // every request; otherwise the scan only runs for buffers of at least a MiB, the ones that can
     // take the pool, so small allocations stay as cheap as they were.
     {
         const bool short_memory = ::Eden::Performance::GraphicsMemoryIsShort();
-        const u64 cap = short_memory ? 0 : GetStagingCapBytes();
+        const u64 cap = short_memory ? GetShortStagingCapBytes() : GetStagingCapBytes();
         if (short_memory || made >= (VkDeviceSize{1} << 20)) {
             ReleaseIdleToCap(cap > made ? cap - made : 0, short_memory ? "short" : "request");
         }
