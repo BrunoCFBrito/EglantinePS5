@@ -35,6 +35,7 @@
 #include "video_core/vulkan_common/nsight_aftermath_tracker.h"
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/vulkan_common/vulkan_device.h"
+#include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/shader_cache_v2/cache.h"
@@ -924,6 +925,92 @@ VmaPool Device::GetSeparatePool(SeparatePool kind, u32 memory_type) const {
         }
     }
     return pool;
+}
+
+void Device::SeparatePoolUse(SeparatePool kind, u64& blocks, u64& used) const {
+    blocks = 0;
+    used = 0;
+    std::scoped_lock lk{separate_pools_mutex};
+    for (const VmaPool pool : separate_pools[static_cast<u32>(kind)]) {
+        if (pool == VK_NULL_HANDLE) {
+            continue;
+        }
+        VmaStatistics statistics{};
+        vmaGetPoolStatistics(allocator, pool, &statistics);
+        blocks += statistics.blockBytes;
+        used += statistics.allocationBytes;
+    }
+}
+
+u64 Device::ReleaseEmptySeparatePools(u32 max_blocks, u32& blocks_released) const {
+    blocks_released = 0;
+    struct Candidate {
+        VmaPool* slot;
+        u64 bytes;
+        u32 blocks;
+    };
+    std::array<Candidate, 2 * VK_MAX_MEMORY_TYPES> candidates{};
+    size_t count = 0;
+    std::scoped_lock lk{separate_pools_mutex};
+    for (auto& pools : separate_pools) {
+        for (VmaPool& pool : pools) {
+            if (pool == VK_NULL_HANDLE) {
+                continue;
+            }
+            VmaStatistics statistics{};
+            vmaGetPoolStatistics(allocator, pool, &statistics);
+            // No allocation: every block the pool holds is empty (VMA keeps one of them as its
+            // hysteresis instead of giving it back at the free that emptied it).
+            if (statistics.blockCount == 0 || statistics.allocationCount != 0 ||
+                count == candidates.size()) {
+                continue;
+            }
+            candidates[count++] = {&pool, statistics.blockBytes, statistics.blockCount};
+        }
+    }
+    std::sort(candidates.begin(), candidates.begin() + count,
+              [](const Candidate& a, const Candidate& b) { return a.bytes > b.bytes; });
+    u64 freed = 0;
+    u32 blocks = 0;
+    for (size_t i = 0; i < count && blocks < max_blocks; ++i) {
+        if (candidates[i].blocks > max_blocks - blocks) {
+            continue;
+        }
+        vmaDestroyPool(allocator, *candidates[i].slot);
+        *candidates[i].slot = VK_NULL_HANDLE; // made again on its next allocation (GetSeparatePool)
+        blocks += candidates[i].blocks;
+        freed += candidates[i].bytes;
+    }
+    blocks_released = blocks;
+    return freed;
+}
+
+void Device::MaintainMemoryBlocks() const {
+    if (allocator == nullptr) {
+        return;
+    }
+    ::Vulkan::LogVmaPools(*this);
+    // Giving empty blocks back is only for the pool's critical state, and at most about every 30
+    // frames: the allocator has no frame clock, and the caches ask for memory in use once a frame
+    // each (this is the allocator's per-frame hook), so 500 ms is 30 frames at 60 fps and 15 at
+    // 30. Without the gate a collect-then-allocate cycle would destroy and remake a pool a frame.
+    static std::atomic<long long> next_ns{0};
+    const long long now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch())
+                              .count();
+    if (now < next_ns.load(std::memory_order_relaxed)) {
+        return;
+    }
+    next_ns.store(now + 500'000'000, std::memory_order_relaxed);
+    if (!::Eden::Performance::GraphicsMemoryIsCritical()) {
+        return;
+    }
+    u32 blocks = 0;
+    const u64 freed = ReleaseEmptySeparatePools(4, blocks);
+    if (freed != 0) {
+        LOG_INFO(Render_Vulkan, "EDEN_VK_POOLS released whole empty blocks: {} MiB ({} block(s))",
+                 freed >> 20, blocks);
+    }
 }
 
 void Device::LoadStaticPipelineCache() {
@@ -2027,6 +2114,9 @@ u64 graphics_capacity = 0;
 }
 
 u64 Device::GetDeviceMemoryUsage() const {
+    // The caches call this every frame: the allocator's periodic work (empty blocks back to the
+    // driver while the pool is critical, EDEN_VK_POOLS) runs from here.
+    MaintainMemoryBlocks();
     if (const auto free_memory = ::Eden::Performance::graphics_memory_free.load(std::memory_order_relaxed);
         free_memory && ::Eden::Performance::graphics_usage_from_pool.load(std::memory_order_relaxed)) {
         // The caches evict what is unused 1.6 GiB under the budget and evict hard 0.8 GiB under

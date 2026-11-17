@@ -289,6 +289,9 @@ public:
     /// The pool of that kind for a memory type, created on first use (null if that failed).
     VmaPool GetSeparatePool(SeparatePool kind, u32 memory_type) const;
 
+    /// The blocks the pools of that kind hold and what of them is in use, in bytes.
+    void SeparatePoolUse(SeparatePool kind, u64& blocks, u64& used) const;
+
     /// Returns the logical device.
     const vk::Device& GetLogical() const {
         return logical;
@@ -1331,6 +1334,18 @@ private:
 
     void LoadStaticPipelineCache();
     void SaveStaticPipelineCache() const;
+
+    /// The caches ask for memory in use every frame (GetDeviceMemoryUsage): the allocator's
+    /// periodic work runs from there. While the pool is critical, whole empty blocks of the
+    /// separate pools go back to the driver (ReleaseEmptySeparatePools).
+    void MaintainMemoryBlocks() const;
+
+    /// Destroys the separate pools that hold blocks but no allocation, emptiest first, at most
+    /// `max_blocks` blocks in all: their whole VkDeviceMemory goes back to the driver, and the
+    /// pool is made again by its next allocation. Returns the bytes released. Never overlaps the
+    /// driver's trim of unbound granules (eden_memory_recover): a pool is only destroyed once it
+    /// has no allocation left. GPU thread only, as the pools are.
+    u64 ReleaseEmptySeparatePools(u32 max_blocks, u32& blocks_released) const;
 
 private:
     VkInstance instance;         ///< Vulkan instance.

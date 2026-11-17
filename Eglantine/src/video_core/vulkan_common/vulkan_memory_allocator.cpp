@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <array>
 #include <bit>
@@ -915,6 +916,53 @@ void PrintMemoryStatistics(const Device& device) {
                      static_cast<unsigned long long>(s.blockBytes >> 20), s.allocationCount,
                      static_cast<unsigned long long>(s.allocationBytes >> 20));
     }
+}
+
+void LogVmaPools(const Device& device) {
+    // One line per 10 s, at most: the caches ask for memory in use every frame (Device::
+    // GetDeviceMemoryUsage), which is where this is called from.
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_VK_POOLS");
+        return value == nullptr || value[0] != '0';
+    }();
+    static std::atomic<long long> next_ns{0};
+    const long long now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch())
+                              .count();
+    if (!enabled || now < next_ns.load(std::memory_order_relaxed)) {
+        return;
+    }
+    next_ns.store(now + 10'000'000'000, std::memory_order_relaxed);
+    const VmaAllocator allocator = device.GetAllocator();
+    const VkPhysicalDeviceMemoryProperties* properties{};
+    vmaGetMemoryProperties(allocator, &properties);
+    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> budgets{};
+    vmaGetHeapBudgets(allocator, budgets.data());
+    u64 blocks = 0, used = 0;
+    for (u32 heap = 0; heap < properties->memoryHeapCount; ++heap) {
+        blocks += budgets[heap].statistics.blockBytes;
+        used += budgets[heap].statistics.allocationBytes;
+    }
+    if (blocks == 0) {
+        return; // nothing allocated yet
+    }
+    // Where the empty space is: the pools of their own, and the default blocks as what is left
+    // (the heap figures include both). Empty is blocks less allocations: a block goes back to the
+    // driver only once every allocation in it is gone, which is how Ocarina held 0.85 GB of its
+    // 4.35 GB empty while the pool was at 0 for minutes (2026-11-16).
+    u64 buffer_blocks = 0, buffer_used = 0, sparse_blocks = 0, sparse_used = 0;
+    device.SeparatePoolUse(Device::SeparatePool::DeviceBuffers, buffer_blocks, buffer_used);
+    device.SeparatePoolUse(Device::SeparatePool::SparsePages, sparse_blocks, sparse_used);
+    const u64 pool_blocks = buffer_blocks + sparse_blocks;
+    const u64 pool_used = buffer_used + sparse_used;
+    const u64 default_blocks = blocks > pool_blocks ? blocks - pool_blocks : 0;
+    const u64 default_used = used > pool_used ? used - pool_used : 0;
+    LOG_INFO(Render_Vulkan,
+             "EDEN_VK_POOLS empty space: default blocks {} MiB of {} MiB, device buffers {} MiB of "
+             "{} MiB, sparse pages {} MiB of {} MiB",
+             (default_blocks - std::min(default_blocks, default_used)) >> 20, default_blocks >> 20,
+             (buffer_blocks - std::min(buffer_blocks, buffer_used)) >> 20, buffer_blocks >> 20,
+             (sparse_blocks - std::min(sparse_blocks, sparse_used)) >> 20, sparse_blocks >> 20);
 }
 
 void LogMemoryStatistics(const Device& device) {

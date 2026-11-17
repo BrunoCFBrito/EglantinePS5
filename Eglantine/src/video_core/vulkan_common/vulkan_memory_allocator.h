@@ -205,6 +205,10 @@ namespace Vulkan {
     /// EDEN_NX2_MEM_SPLIT: the allocator's blocks and allocations per memory type, to stderr.
     void PrintMemoryStatistics(const Device& device);
 
+    /// EDEN_VK_POOLS: where the empty space in the allocator's blocks is, per pool (the default
+    /// blocks and each pool of its own), at most every 10 s. EDEN_VK_POOLS=0 turns it off.
+    void LogVmaPools(const Device& device);
+
     /// One line each for the process's memory, what DXGI counts for the GPU (Windows), and VMA's
     /// heaps and memory types against what the driver reports (EDEN_NX2_MEM_TRACE).
     void LogMemoryTrace(const Device& device);
