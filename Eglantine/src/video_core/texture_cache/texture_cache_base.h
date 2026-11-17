@@ -51,6 +51,7 @@
 #include "video_core/texture_cache/stale_pages.h"
 #include "video_core/texture_cache/superseded_images.h"
 #include "video_core/texture_cache/types.h"
+#include "video_core/texture_cache/util.h"
 #include "video_core/textures/texture.h"
 #include "video_core/textures/unswizzle_worker.h"
 
@@ -112,11 +113,20 @@ struct SampledTextureMemo {
 
 struct AsyncDecodeContext {
     ImageId image_id;
-    Common::ScratchBuffer<u8> decoded_data;
     boost::container::small_vector<BufferImageCopy, 16> copies;
     std::mutex mutex;
     std::atomic_bool complete;
     bool cancelled{}; ///< The image was deleted meanwhile: drop the result (GPU thread only).
+    /// An async decode runs band by band (QueueAsyncDecode): the unswizzled input and the
+    /// converted output of the whole image or layer were 2x60 MiB in an area load, so each is
+    /// cut into bands of at most UploadSliceBytes. The band's input and output live in the
+    /// cache's shared decode_input/decode_output pair (one band runs at a time: the decode
+    /// worker is a single thread); these plan the bands and carry the converted copies back.
+    ImageInfo info;       ///< The image, or the single layer, the bands are planned over
+    GPUVAddr base_addr{}; ///< The guest address the band offsets are relative to
+    u64 guest_bytes{};    ///< How many guest bytes from base_addr the bands cover
+    u64 offset{};         ///< The next band's first guest byte from base_addr
+    s32 base_layer{};     ///< Added to each copy's base_layer (a layered decode)
 };
 
 using TextureCacheGPUMap = ::Common::unordered_map<u64, std::vector<ImageId>, Common::IdentityHash<u64>>;
@@ -245,7 +255,9 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     using BufferType = typename P::BufferType;
 
     static constexpr u32 LayerUploadMinSize = 64U << 20;
-    static constexpr size_t LargeScratchCapacity = 64U << 20;
+    /// The most the swizzle/unswizzle scratch pair keeps between uses: a larger image is uploaded
+    /// or downloaded in bands, so the pair is freed rather than held for the session (TickFrame).
+    static constexpr size_t LargeScratchCapacity = 32U << 20;
     /// Downloads at least this large are split into row bands (DownloadInChunks).
     static constexpr u64 DownloadChunkMinSize = 64U << 20;
 
@@ -718,8 +730,31 @@ private:
     /// and no other image, go back to the guest memory service's zero block. Caller holds mutex.
     void ReportGpuOnlyGuest(bool discard = false, bool report = true);
 
-    void QueueAsyncDecode(Image& image, ImageId image_id);
+    /// Queues an asynchronous decode of `image`, band by band (see AsyncDecodeContext); false
+    /// when the image's layout cannot be cut into bands, which takes the synchronous upload.
+    [[nodiscard]] bool QueueAsyncDecode(Image& image, ImageId image_id);
     void TickAsyncDecode();
+
+    /// One step of an async decode: the image (or layer) is unswizzled and converted a band at a
+    /// time, so no whole-image buffer is held.
+    enum class DecodeBandPlan : u8 {
+        Planned,     ///< A band was planned at `offset`
+        Done,        ///< Nothing is left at `offset` (padding, or the end of the image)
+        Unplannable, ///< The layout cannot be cut into bands
+    };
+    /// Plans the band at `offset` (guest bytes from `base_addr`), advancing it past every range
+    /// the band covers. `output_bytes` is the converted size ConvertImage writes for it.
+    DecodeBandPlan PlanDecodeBand(const ImageInfo& info, GPUVAddr base_addr, u64 guest_bytes,
+                                  u64& offset, UnswizzlePlan& plan, size_t& output_bytes);
+    /// Starts the next band of `decode` on the shared decode_input/decode_output pair. False when
+    /// the decode has no bands left. GPU thread only.
+    bool StartDecodeBand(AsyncDecodeContext& decode);
+    /// Frees the shared decode pair when no band is in flight (TickAsyncDecode, TickFrame).
+    void ReleaseDecodeBuffers();
+    /// Zeroes the converted image (or `base_layer` of it) before its decode lands, in bands of
+    /// UploadSliceBytes.
+    void UploadDecodeZeroFill(Image& image, const ImageInfo& info, GPUVAddr base_addr,
+                              u64 guest_bytes, s32 base_layer);
 
     void QueueAsyncUnswizzle(Image& image, ImageId image_id);
     void TickAsyncUnswizzle();
@@ -856,14 +891,28 @@ private:
 
     Common::ScratchBuffer<u8> swizzle_data_buffer;
     Common::ScratchBuffer<u8> unswizzle_data_buffer;
+    /// The frame a texture upload or download last used the scratch pair above (TickFrame frees
+    /// it after a long idle, and at once while the console's pool is short).
+    u64 scratch_used_frame{};
     Tegra::Texture::UnswizzleWorker unswizzle_worker;
 
     u64 modification_tick = 0;
     u64 frame_tick = 0;
 
+    std::vector<std::unique_ptr<AsyncDecodeContext>> async_decodes;
+    /// The band of an async decode in flight: its unswizzled input and its converted output, each
+    /// grown to at most UploadSliceBytes. One band runs at a time (the decode worker is a single
+    /// thread), so the pair is shared by every queued decode instead of one pair per context;
+    /// both are freed when a decode finishes and while the pool is short. The GPU thread only
+    /// touches them while decode_band is null (the worker reads the input and writes the output
+    /// in between, and publishes complete when it is done).
+    Common::ScratchBuffer<u8> decode_input;
+    Common::ScratchBuffer<u8> decode_output;
+    AsyncDecodeContext* decode_band{};
+    /// Declared after the decode state above: its destructor joins a band that is still running,
+    /// and that band reads decode_input and writes decode_output.
     Common::ThreadWorker texture_decode_worker{1, "TextureDecoder", {},
                                                Common::ThreadPlacement::Efficiency};
-    std::vector<std::unique_ptr<AsyncDecodeContext>> async_decodes;
     /// Guest memory images were uploaded from since the last cold hint (device address, size).
     std::vector<std::pair<DAddr, u64>> uploaded_ranges;
 

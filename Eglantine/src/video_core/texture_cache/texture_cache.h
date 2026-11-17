@@ -647,6 +647,9 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         if (pending_write_backs.empty()) {
             return;
         }
+        // The swizzle scratch buffer is in use this frame (TickFrame frees the pair after a long
+        // idle and while the pool is short).
+        scratch_used_frame = frame_tick;
         runtime.Finish();
         // A guest CPU write into memory the buffer cache holds GPU-written bytes of is stored at
         // once and reaches this cache only later (OnCacheInvalidations, which waits for this
@@ -989,12 +992,33 @@ u64 TextureCache<P>::ReclaimMemory() {
 
 template <class P>
 void TextureCache<P>::TickFrame() {
-    // Upload buffers grown for one huge image (title 1's 341 MiB terrain layer pools) are freed
-    // rather than kept for the rest of the session.
+    // The swizzle/unswizzle scratch pair gives its memory back when it is not needed: while the
+    // console's pool is short it does so as soon as a frame does not use it (the next image grows
+    // it again), after EDEN_NX2_TC_SCRATCH_IDLE frames (1800 by default) without an upload or a
+    // download it lets go as well, and a buffer over LargeScratchCapacity (32 MiB) that no frame
+    // is using is not kept. Title 1's 341 MiB terrain layer pools used to leave a large buffer
+    // behind for the rest of the session.
+    static const u64 scratch_idle = [] {
+        const char* value = std::getenv("EDEN_NX2_TC_SCRATCH_IDLE");
+        return value != nullptr ? std::strtoull(value, nullptr, 10) : 1800ULL;
+    }();
+    // A pair a frame still used (an upload or a download ran since the last TickFrame) stays:
+    // freeing it would only make that frame grow it again.
+    const bool scratch_idle_now = frame_tick != scratch_used_frame;
+    const bool scratch_unused = scratch_idle_now && scratch_idle != 0 &&
+                                frame_tick >= scratch_used_frame + scratch_idle;
+    const bool scratch_give_back =
+        scratch_unused || (scratch_idle_now && Eden::Performance::GraphicsMemoryIsShort());
     for (auto* const scratch : {&swizzle_data_buffer, &unswizzle_data_buffer}) {
-        if (scratch->capacity() > LargeScratchCapacity) {
+        if (scratch_give_back ||
+            (scratch_idle_now && scratch->capacity() > LargeScratchCapacity)) {
             scratch->release();
         }
+    }
+    // The decode band pair gives its memory back too, once nothing is converting in it: with the
+    // queue empty, and at once while the pool is short (the next band grows it again).
+    if (async_decodes.empty() || Eden::Performance::GraphicsMemoryIsShort()) {
+        ReleaseDecodeBuffers();
     }
     if constexpr (requires { runtime.CurrentTick(); }) {
         while (!gpu_sentenced_images.empty() &&
@@ -1254,13 +1278,9 @@ void TextureCache<P>::TickFrame() {
                 gpu_written_bytes += bytes;
             }
         }
-        u64 decode_bytes{};
-        for (const auto& decode : async_decodes) {
-            // The worker sizes the buffer before it publishes complete.
-            if (decode->complete.load(std::memory_order_acquire)) {
-                decode_bytes += decode->decoded_data.capacity();
-            }
-        }
+        // The band pair the decode worker shares: the input is sized by the GPU thread, the
+        // output by the worker before it publishes complete.
+        const u64 decode_bytes = decode_input.capacity() + decode_output.capacity();
         const u64 sentenced = std::accumulate(sentenced_image_bytes.begin(),
                                               sentenced_image_bytes.end(), gpu_sentenced_bytes);
         LOG_INFO(HW_GPU,
@@ -2238,6 +2258,9 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
         return;
     }
     const StutterTrace::SiteScope site{StutterTrace::Site::TextureDownload};
+    // The swizzle scratch buffer is in use this frame (TickFrame frees the pair after a long idle
+    // and while the pool is short).
+    scratch_used_frame = frame_tick;
     std::ranges::sort(images, [this](ImageId lhs, ImageId rhs) {
         return slot_images[lhs].modification_tick < slot_images[rhs].modification_tick;
     });
@@ -3165,6 +3188,9 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         return;
     }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureUpload};
+    // The swizzle/unswizzle scratch pair is in use this frame (TickFrame frees it after a long
+    // idle and while the pool is short).
+    scratch_used_frame = frame_tick;
 
     image.flags &= ~ImageFlagBits::CpuModified;
 
@@ -3219,8 +3245,10 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         runtime.TransitionImageLayout(image);
         return;
     }
-    if (True(image.flags & ImageFlagBits::AsynchronousDecode) && ::Eden::AstcPolicy::InBackground()) {
-        QueueAsyncDecode(image, image_id);
+    if (True(image.flags & ImageFlagBits::AsynchronousDecode) &&
+        ::Eden::AstcPolicy::InBackground() && QueueAsyncDecode(image, image_id)) {
+        // Queued band by band; a layout that cannot be cut that way (a 3D, MSAA or linear image)
+        // takes the synchronous upload below instead.
         return;
     }
 
@@ -4195,117 +4223,213 @@ void TextureCache<P>::ReportGpuOnlyGuest(bool discard, bool report) {
 }
 
 template <class P>
-void TextureCache<P>::QueueAsyncDecode(Image& image, ImageId image_id) {
-    UNIMPLEMENTED_IF(False(image.flags & ImageFlagBits::Converted));
-    LOG_DEBUG(HW_GPU, "Queuing async texture decode {:#x}", image.gpu_addr);
-
-    if constexpr (std::is_same_v<Runtime, Vulkan::TextureCacheRuntime>) {
-        if (image.info.type == ImageType::e2D && image.info.resources.layers > 1 && image.guest_size_bytes >= LayerUploadMinSize) {
-            image.flags |= ImageFlagBits::IsDecoding;
-            const s32 layers = image.info.resources.layers;
-            ImageInfo layer_info = image.info;
-            layer_info.resources.layers = 1;
-            const size_t layer_out = MapSizeBytes(image) / layers;
-            // A layer's own sizes, not a share of the whole image's estimates: a decode that
-            // wrote past its buffer corrupted the heap (TextureDecoder "mutex lock failed").
-            const size_t layer_in = (std::max<size_t>)(image.unswizzled_size_bytes / layers,
-                                                       CalculateUnswizzledSizeBytes(layer_info));
-            const bool zero = False(image.flags & ImageFlagBits::ZeroFilled);
-            image.flags |= ImageFlagBits::ZeroFilled;
-            for (s32 layer = 0; layer < layers; ++layer) {
-                ++async_decodes_queued;
-                auto layer_decode = std::make_unique<AsyncDecodeContext>();
-                auto* layer_ptr = layer_decode.get();
-                layer_decode->image_id = image_id;
-                async_decodes.push_back(std::move(layer_decode));
-                const GPUVAddr layer_addr = image.gpu_addr + u64(layer) * image.info.layer_stride;
-                std::vector<u8> layer_input(layer_in, 0);
-                Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead> layer_swizzle(
-                    *gpu_memory, layer_addr, image.info.layer_stride, &swizzle_data_buffer);
-                auto layer_copies = UnswizzleImage(*gpu_memory, layer_addr, layer_info, layer_swizzle,
-                                                   layer_input);
-                auto zero_copies = layer_copies;
-                ConvertedLayout(layer_info, zero_copies);
-                const size_t out = zero_copies.empty() ? layer_out :
-                    (std::max<size_t>)(layer_out, zero_copies.back().buffer_offset + zero_copies.back().buffer_size);
-                if (out > layer_out) {
-                    static std::atomic<u32> reported{};
-                    if (reported.fetch_add(1) < 8) {
-                        LOG_WARNING(HW_GPU, "Layer decode at {:#x} needs {} bytes, {} estimated", layer_addr, out, layer_out);
-                    }
-                }
-                if (zero) {
-                    for (auto& copy : zero_copies) copy.image_subresource.base_layer = layer;
-                    std::vector<BufferImageCopy> zero_bands;
-                    if (out > UploadSliceBytes &&
-                        SplitConvertedCopies(layer_info, zero_copies, UploadSliceBytes, zero_bands)) {
-                        UploadCopyGroups(image, {}, zero_bands, true);
-                    } else {
-                        auto zero_staging = runtime.UploadStagingBuffer(out);
-                        std::memset(zero_staging.mapped_span.data(), 0, out);
-                        image.UploadMemory(zero_staging, zero_copies);
-                    }
-                }
-                auto layer_func = [layer_out = out, layer, copies = layer_copies, info = layer_info,
-                                   input = std::move(layer_input), async_decode = layer_ptr]() mutable {
-                    async_decode->decoded_data.resize_destructive(layer_out);
-                    std::span copies_span{copies.data(), copies.size()};
-                    ConvertImage(input, info, async_decode->decoded_data, copies_span);
-                    for (auto& copy : copies) copy.image_subresource.base_layer = layer;
-                    async_decode->copies = std::move(copies);
-                    async_decode->complete.store(true, std::memory_order_release);
-                };
-                texture_decode_worker.QueueWork(std::move(layer_func));
+typename TextureCache<P>::DecodeBandPlan TextureCache<P>::PlanDecodeBand(
+    const ImageInfo& info, GPUVAddr base_addr, u64 guest_bytes, u64& offset, UnswizzlePlan& plan,
+    size_t& output_bytes) {
+    // A band is a guest byte range whose unswizzled bytes and converted bytes both fit
+    // UploadSliceBytes. PlanUnswizzleImageRows cuts its runs on block rows, so a range that is
+    // too large is halved until its plan fits (the same search UploadConvertedInChunks makes); a
+    // single block row that cannot be cut under the bound is unplannable, and the image goes the
+    // synchronous way.
+    while (offset < guest_bytes) {
+        size_t size = static_cast<size_t>((std::min)(u64{UploadSliceBytes}, guest_bytes - offset));
+        for (;;) {
+            const std::array range{std::pair<u64, u64>{offset, offset + size}};
+            plan = PlanUnswizzleImageRows(base_addr, info, range);
+            if (!plan.layout_valid) {
+                return DecodeBandPlan::Unplannable;
             }
-            if (zero) runtime.InsertUploadMemoryBarrier();
-            return;
+            boost::container::small_vector<BufferImageCopy, 16> layout{plan.copies.begin(),
+                                                                       plan.copies.end()};
+            ConvertedLayout(info, layout);
+            output_bytes =
+                layout.empty() ? 0 : layout.back().buffer_offset + layout.back().buffer_size;
+            if ((output_bytes <= UploadSliceBytes && plan.total_host_bytes <= UploadSliceBytes) ||
+                size <= 64_KiB) {
+                break;
+            }
+            size = (std::max)(size / 2, size_t{64_KiB});
         }
-    }
-    image.flags |= ImageFlagBits::IsDecoding;
-    ++async_decodes_queued;
-    auto decode = std::make_unique<AsyncDecodeContext>();
-    auto* decode_ptr = decode.get();
-    decode->image_id = image_id;
-    async_decodes.push_back(std::move(decode));
-
-    std::vector<u8> local_unswizzle_data_buffer(image.unswizzled_size_bytes, 0);
-    Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead> swizzle_data(*gpu_memory, image.gpu_addr, image.guest_size_bytes, &swizzle_data_buffer);
-    auto copies = UnswizzleImage(*gpu_memory, image.gpu_addr, image.info, swizzle_data, local_unswizzle_data_buffer);
-    auto converted_layout = copies;
-    ConvertedLayout(image.info, converted_layout);
-    const size_t out_size = converted_layout.empty() ? MapSizeBytes(image) :
-        (std::max<size_t>)(MapSizeBytes(image), converted_layout.back().buffer_offset +
-                                                converted_layout.back().buffer_size);
-    if (False(image.flags & ImageFlagBits::ZeroFilled)) {
-        // Until the decode lands (a second or more while title 1 streams ~40 textures a second)
-        // a new image showed whatever its memory last held, often other textures. Zero blocks
-        // read as opaque black (BC1) or transparent (BC3) instead.
-        image.flags |= ImageFlagBits::ZeroFilled;
-        auto zero_copies = copies;
-        ConvertedLayout(image.info, zero_copies);
-        std::vector<BufferImageCopy> zero_bands;
-        if (out_size > UploadSliceBytes &&
-            SplitConvertedCopies(image.info, zero_copies, UploadSliceBytes, zero_bands)) {
-            UploadCopyGroups(image, {}, zero_bands, true);
-        } else {
-            auto staging = runtime.UploadStagingBuffer(out_size);
-            std::memset(staging.mapped_span.data(), 0, out_size);
-            image.UploadMemory(staging, zero_copies);
+        offset += size;
+        if (plan.copies.empty()) {
+            continue; // padding between levels or layers
         }
-        runtime.InsertUploadMemoryBarrier();
+        if (output_bytes > UploadSliceBytes || plan.total_host_bytes > UploadSliceBytes) {
+            return DecodeBandPlan::Unplannable;
+        }
+        return DecodeBandPlan::Planned;
     }
+    return DecodeBandPlan::Done;
+}
 
-    auto func = [out_size, copies, info = image.info,
-                 input = std::move(local_unswizzle_data_buffer),
-                 async_decode = decode_ptr]() mutable {
-        async_decode->decoded_data.resize_destructive(out_size);
+template <class P>
+bool TextureCache<P>::StartDecodeBand(AsyncDecodeContext& decode) {
+    UnswizzlePlan plan;
+    size_t output_bytes = 0;
+    switch (PlanDecodeBand(decode.info, decode.base_addr, decode.guest_bytes, decode.offset, plan,
+                           output_bytes)) {
+    case DecodeBandPlan::Unplannable:
+        // Every context is probed before it is queued, so the layout cannot change under this
+        // one: leave the rest of the image to its zero fill rather than write a band that cannot
+        // be held, and say so.
+        LOG_ERROR(HW_GPU, "Async decode at {:#x}: the band at {} cannot be planned",
+                  decode.base_addr, decode.offset);
+        decode.offset = decode.guest_bytes;
+        return false;
+    case DecodeBandPlan::Done:
+        return false;
+    case DecodeBandPlan::Planned:
+        break;
+    }
+    // One band at a time on the shared pair: the worker is a single thread, so the GPU thread
+    // only touches decode_input/decode_output here, while no band is in flight.
+    decode_band = &decode;
+    decode_input.resize_destructive(plan.total_host_bytes);
+    ExecuteUnswizzlePlan(*gpu_memory, plan,
+                         std::span<u8>(decode_input.data(), decode_input.size()));
+    decode.complete.store(false, std::memory_order_relaxed);
+    auto func = [this, out_bytes = output_bytes, copies = plan.copies, info = decode.info,
+                 base_layer = decode.base_layer, async_decode = &decode]() mutable {
+        decode_output.resize_destructive(out_bytes);
         std::span copies_span{copies.data(), copies.size()};
-        ConvertImage(input, info, async_decode->decoded_data, copies_span);
-
+        ConvertImage(std::span<const u8>(decode_input.data(), decode_input.size()), info,
+                     std::span<u8>(decode_output.data(), decode_output.size()), copies_span);
+        if (base_layer != 0) {
+            for (auto& copy : copies) copy.image_subresource.base_layer += base_layer;
+        }
         async_decode->copies = std::move(copies);
         async_decode->complete.store(true, std::memory_order_release);
     };
     texture_decode_worker.QueueWork(std::move(func));
+    return true;
+}
+
+template <class P>
+void TextureCache<P>::ReleaseDecodeBuffers() {
+    if (decode_band != nullptr) {
+        return; // the worker reads decode_input and writes decode_output
+    }
+    decode_input.release();
+    decode_output.release();
+}
+
+template <class P>
+void TextureCache<P>::UploadDecodeZeroFill(Image& image, const ImageInfo& info, GPUVAddr base_addr,
+                                           u64 guest_bytes, s32 base_layer) {
+    // Until the decode lands (a second or more while title 1 streams ~40 textures a second) a new
+    // image showed whatever its memory last held, often other textures. Zero blocks read as
+    // opaque black (BC1) or transparent (BC3) instead. The copies come from the same row plan the
+    // bands decode, so the zeros cover exactly what the bands will overwrite, layer included.
+    const std::array range{std::pair<u64, u64>{0, guest_bytes}};
+    const UnswizzlePlan plan = PlanUnswizzleImageRows(base_addr, info, range);
+    if (!plan.layout_valid) {
+        return; // the probe already sent this image to the synchronous upload
+    }
+    std::vector<BufferImageCopy> copies(plan.copies.begin(), plan.copies.end());
+    ConvertedLayout(info, copies);
+    for (auto& copy : copies) copy.image_subresource.base_layer += base_layer;
+    const size_t bytes =
+        copies.empty() ? 0 : copies.back().buffer_offset + copies.back().buffer_size;
+    if (bytes == 0) {
+        return;
+    }
+    std::vector<BufferImageCopy> bands;
+    if (bytes > UploadSliceBytes && SplitConvertedCopies(info, copies, UploadSliceBytes, bands)) {
+        UploadCopyGroups(image, {}, bands, true);
+    } else {
+        auto staging = runtime.UploadStagingBuffer(bytes);
+        std::memset(staging.mapped_span.data(), 0, bytes);
+        image.UploadMemory(staging, copies);
+    }
+}
+
+template <class P>
+bool TextureCache<P>::QueueAsyncDecode(Image& image, ImageId image_id) {
+    UNIMPLEMENTED_IF(False(image.flags & ImageFlagBits::Converted));
+    LOG_DEBUG(HW_GPU, "Queuing async texture decode {:#x}", image.gpu_addr);
+
+    if constexpr (std::is_same_v<Runtime, Vulkan::TextureCacheRuntime>) {
+        if (image.info.type == ImageType::e2D && image.info.resources.layers > 1 &&
+            image.guest_size_bytes >= LayerUploadMinSize) {
+            const s32 layers = image.info.resources.layers;
+            ImageInfo layer_info = image.info;
+            layer_info.resources.layers = 1;
+            // Each layer's own guest extent, not a share of the whole image's estimates: a decode
+            // that wrote past its buffer corrupted the heap (TextureDecoder "mutex lock failed").
+            // The layout is probed before anything is queued or zeroed (it depends on the layer's
+            // sizes alone, not on which layer or its contents); a layout that cannot be cut into
+            // bands takes the synchronous upload, which handles the image whole.
+            const u64 layer_bytes = CalculateGuestSizeInBytes(layer_info);
+            u64 probe_offset = 0;
+            UnswizzlePlan probe_plan;
+            size_t probe_bytes = 0;
+            const DecodeBandPlan probe = PlanDecodeBand(layer_info, image.gpu_addr, layer_bytes,
+                                                        probe_offset, probe_plan, probe_bytes);
+            if (probe == DecodeBandPlan::Unplannable) {
+                return false;
+            }
+            if (probe != DecodeBandPlan::Planned) {
+                return true; // no layer holds texture data: nothing to decode
+            }
+            image.flags |= ImageFlagBits::IsDecoding;
+            const bool zero = False(image.flags & ImageFlagBits::ZeroFilled);
+            image.flags |= ImageFlagBits::ZeroFilled;
+            for (s32 layer = 0; layer < layers; ++layer) {
+                const GPUVAddr layer_addr = image.gpu_addr + u64(layer) * image.info.layer_stride;
+                if (zero) {
+                    UploadDecodeZeroFill(image, layer_info, layer_addr, layer_bytes, layer);
+                }
+                ++async_decodes_queued;
+                auto decode = std::make_unique<AsyncDecodeContext>();
+                decode->image_id = image_id;
+                decode->info = layer_info;
+                decode->base_addr = layer_addr;
+                decode->guest_bytes = layer_bytes;
+                decode->base_layer = layer;
+                async_decodes.push_back(std::move(decode));
+                if (decode_band == nullptr) {
+                    StartDecodeBand(*async_decodes.back());
+                }
+            }
+            if (zero) runtime.InsertUploadMemoryBarrier();
+            return true;
+        }
+    }
+    // A single image (or a layered one under the layer path's size): the same bands over the
+    // whole guest extent, layers included.
+    const ImageInfo info = image.info;
+    const u64 guest_bytes = image.guest_size_bytes;
+    {
+        u64 offset = 0;
+        UnswizzlePlan plan;
+        size_t out_bytes = 0;
+        switch (PlanDecodeBand(info, image.gpu_addr, guest_bytes, offset, plan, out_bytes)) {
+        case DecodeBandPlan::Unplannable:
+            return false;
+        case DecodeBandPlan::Done:
+            return true; // nothing to decode
+        case DecodeBandPlan::Planned:
+            break;
+        }
+    }
+    image.flags |= ImageFlagBits::IsDecoding;
+    if (False(image.flags & ImageFlagBits::ZeroFilled)) {
+        image.flags |= ImageFlagBits::ZeroFilled;
+        UploadDecodeZeroFill(image, info, image.gpu_addr, guest_bytes, 0);
+        runtime.InsertUploadMemoryBarrier();
+    }
+    ++async_decodes_queued;
+    auto decode = std::make_unique<AsyncDecodeContext>();
+    decode->image_id = image_id;
+    decode->info = info;
+    decode->base_addr = image.gpu_addr;
+    decode->guest_bytes = guest_bytes;
+    decode->base_layer = 0;
+    async_decodes.push_back(std::move(decode));
+    if (decode_band == nullptr) {
+        StartDecodeBand(*async_decodes.back());
+    }
+    return true;
 }
 
 template <class P>
@@ -4326,43 +4450,78 @@ template <class P>
 void TextureCache<P>::TickAsyncDecode() {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureCache};
     bool has_uploads{};
-    auto i = async_decodes.begin();
-    while (i != async_decodes.end()) {
-        auto* async_decode = i->get();
-        // After this the context is the GPU thread's alone: the decode thread's store was
-        // its last touch of it.
-        if (!async_decode->complete.load(std::memory_order_acquire)) {
-            ++i;
-            continue;
-        }
-        if (async_decode->cancelled) {
-            i = async_decodes.erase(i);
-            continue;
-        }
-        Image& image = slot_images[async_decode->image_id];
-        if (async_decode->decoded_data.size() > MapSizeBytes(image)) {
-            LOG_ERROR(HW_GPU, "Async decode of {} bytes for a {}-byte image at {:#x}, dropped",
-                      async_decode->decoded_data.size(), MapSizeBytes(image), image.gpu_addr);
-            i = async_decodes.erase(i);
-            continue;
-        }
-        std::vector<BufferImageCopy> bands;
-        if (async_decode->decoded_data.size() > UploadSliceBytes &&
-            SplitConvertedCopies(image.info, async_decode->copies, UploadSliceBytes, bands)) {
-            UploadCopyGroups(image, async_decode->decoded_data, bands, false);
+    // The band in flight (the decode worker is a single thread, so there is at most one): upload
+    // its converted bytes, then start the same decode's next band or the next queued decode's.
+    // After this the context is the GPU thread's alone: the decode thread's store of `complete`
+    // was its last touch of it.
+    AsyncDecodeContext* const band = decode_band;
+    if (band != nullptr && band->complete.load(std::memory_order_acquire)) {
+        decode_band = nullptr;
+        if (band->cancelled) {
+            // The image is gone: drop the result without touching its slot.
+            for (auto it = async_decodes.begin(); it != async_decodes.end(); ++it) {
+                if (it->get() == band) {
+                    async_decodes.erase(it);
+                    break;
+                }
+            }
         } else {
-            auto staging = runtime.UploadStagingBuffer(async_decode->decoded_data.size());
-            std::memcpy(staging.mapped_span.data(), async_decode->decoded_data.data(),
-                        async_decode->decoded_data.size());
-            image.UploadMemory(staging, async_decode->copies);
+            Image& image = slot_images[band->image_id];
+            const size_t bytes = decode_output.size();
+            if (bytes > UploadSliceBytes) {
+                // The band pair is sized by the same conversion math that fills it, so this is a
+                // broken estimate rather than a large image: drop the band instead of uploading
+                // past the staging buffer.
+                LOG_ERROR(HW_GPU, "Async decode band of {} bytes for the image at {:#x}, dropped",
+                          bytes, image.gpu_addr);
+            } else if (bytes != 0) {
+                auto staging = runtime.UploadStagingBuffer(bytes);
+                std::memcpy(staging.mapped_span.data(), decode_output.data(), bytes);
+                image.UploadMemory(staging, band->copies);
+                has_uploads = true;
+            }
+            if (!StartDecodeBand(*band)) {
+                // The decode is done: its image decodes again only when no context of it is left.
+                if (std::none_of(async_decodes.begin(), async_decodes.end(),
+                                 [&](const auto& other) {
+                                     return other.get() != band &&
+                                            other->image_id == band->image_id && !other->cancelled;
+                                 })) {
+                    image.flags &= ~ImageFlagBits::IsDecoding;
+                }
+                for (auto it = async_decodes.begin(); it != async_decodes.end(); ++it) {
+                    if (it->get() == band) {
+                        async_decodes.erase(it);
+                        break;
+                    }
+                }
+            }
         }
+    }
+    // Nothing converting: start the next decode in queue order, dropping the cancelled ones.
+    while (decode_band == nullptr && !async_decodes.empty()) {
+        AsyncDecodeContext* const next = async_decodes.front().get();
+        if (next->cancelled) {
+            async_decodes.erase(async_decodes.begin());
+            continue;
+        }
+        if (StartDecodeBand(*next)) {
+            break;
+        }
+        // Done (or a band that could not be planned): its image decodes again when none of its
+        // contexts is left.
         if (std::none_of(async_decodes.begin(), async_decodes.end(), [&](const auto& other) {
-                return other.get() != async_decode && other->image_id == async_decode->image_id &&
+                return other.get() != next && other->image_id == next->image_id &&
                        !other->cancelled;
-            }))
-            image.flags &= ~ImageFlagBits::IsDecoding;
-        has_uploads = true;
-        i = async_decodes.erase(i);
+            })) {
+            slot_images[next->image_id].flags &= ~ImageFlagBits::IsDecoding;
+        }
+        async_decodes.erase(async_decodes.begin());
+    }
+    if (async_decodes.empty()) {
+        // Nothing is decoding: the shared band pair gives its memory back (the next decode grows
+        // it again) instead of keeping up to 2x32 MiB for the session.
+        ReleaseDecodeBuffers();
     }
     if (has_uploads) {
         runtime.InsertUploadMemoryBarrier();
