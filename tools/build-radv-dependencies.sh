@@ -53,6 +53,8 @@ python3 "$root/tools/patch-radv-longlived.py"
 python3 "$root/tools/patch-radv-pipeline-oom.py"
 # After the allocation patches: it splits their p30/p31 report and retries a refused allocation.
 python3 "$root/tools/patch-radv-memory-report.py"
+# After patch-radv-trim.py, whose radv_ps5_trim_untrack and radv_ps5_eden_trim it extends.
+python3 "$root/tools/patch-radv-retire.py"
 # ProsperoEden's patch-radv-transfer-split.py (splitting before transfers and barriers) is not
 # taken: with it, Mario Kart World hung the GPU under memory pressure (PR #77).
 bash "$vulkan/tools/build-radv.sh" release
@@ -63,6 +65,8 @@ python3 "$root/tools/patch-radv-disk-cache.py" --digest \
     > "$vulkan/.deps/native/radv-release/EDEN_DISK_CACHE_SHA256"
 python3 "$root/tools/patch-radv-memory-report.py" --digest \
     > "$vulkan/.deps/native/radv-release/EDEN_MEMORY_REPORT_SHA256"
+python3 "$root/tools/patch-radv-retire.py" --digest \
+    > "$vulkan/.deps/native/radv-release/EDEN_RETIRE_SHA256"
 python3 "$root/tools/patch-radv-pieces.py" --digest \
     > "$vulkan/.deps/native/radv-release/EDEN_MEMORY_PIECES_SHA256"
 python3 "$root/tools/patch-radv-trim.py" --digest \
