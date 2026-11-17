@@ -7,7 +7,9 @@
 #pragma once
 
 #include <algorithm>
+#include <bitset>
 #include <numeric>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
@@ -17,6 +19,7 @@
 #include <optional>
 #include <bit>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include "common/container/unordered_map.h"
 #include <boost/container/small_vector.hpp>
@@ -51,6 +54,17 @@
 #include "image_pages.h"
 #include "common/scope_exit.h"
 namespace Vulkan { class TextureCacheRuntime; }
+
+// PS5 port: gives the guest slots that cover [host, host + bytes) whole back to the zero block
+// (src/guest_memory_service.inc). Absent elsewhere: the weak symbol stays null.
+#if defined(__GNUC__) || defined(__clang__)
+extern "C" std::size_t eden_guest_memory_discard(const void* host, std::size_t bytes,
+                                                 std::uint64_t* by_state) noexcept
+    __attribute__((weak));
+#else
+static constexpr std::size_t (*eden_guest_memory_discard)(const void*, std::size_t,
+                                                          std::uint64_t*) noexcept = nullptr;
+#endif
 
 namespace VideoCommon {
 
@@ -1109,6 +1123,30 @@ void TextureCache<P>::TickFrame() {
     ::Eden::AstcPolicy::Frame();
     TickAsyncDecode();
     TickAsyncUnswizzle();
+    {
+        static const bool gpu_only_report = [] {
+            const char* const value = std::getenv("EDEN_NX2_GPU_ONLY_REPORT");
+            return value != nullptr && value[0] == '1';
+        }();
+        static const bool gpu_only_discard = [] {
+            const char* const value = std::getenv("EDEN_NX2_GPU_ONLY_DISCARD");
+            return value != nullptr && value[0] == '1' && eden_guest_memory_discard != nullptr;
+        }();
+        static auto last_report = std::chrono::steady_clock::now();
+        static auto last_discard = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        const bool report_now = gpu_only_report && now - last_report >= std::chrono::seconds(20);
+        const bool discard_now = gpu_only_discard && now - last_discard >= std::chrono::seconds(5);
+        if (report_now || discard_now) {
+            if (report_now) {
+                last_report = now;
+            }
+            if (discard_now) {
+                last_discard = now;
+            }
+            ReportGpuOnlyGuest(discard_now, report_now);
+        }
+    }
     if (frame_tick % 600 == 0 && !uploaded_ranges.empty()) {
         for (const auto& [address, size] : uploaded_ranges) {
             device_memory.HintCold(address, size);
@@ -3590,6 +3628,169 @@ u64 TextureCache<P>::ImageAllocationBytes(const Image& image) const {
         }
     }
     return ImageMemoryBytes(image);
+}
+
+template <class P>
+void TextureCache<P>::ReportGpuOnlyGuest(bool discard, bool report) {
+    // An image the GPU wrote and the CPU has not written since has its real contents in the host
+    // image; its guest pages are a second copy. Counted by the host pages behind them, once
+    // however many images alias them, and by the 2 MiB slots the guest's memory is backed in.
+    // Caller holds mutex (TickFrame).
+    if (gpu_memory == nullptr) {
+        return;
+    }
+    constexpr u64 SlotBytes = u64{2} << 20;
+    constexpr u64 PageBytes = 4096;
+    constexpr size_t PagesPerSlot = SlotBytes / PageBytes;
+    std::unordered_map<u64, std::bitset<PagesPerSlot>> gpu_only_slots;
+    std::unordered_set<u64> other_slots; // slots also behind a CPU-written or GPU-untouched image
+    // The guest addresses of the pages behind each slot, from the same page walk: a CPU write
+    // there may be collected and not yet applied when the slot is discarded (see below).
+    std::unordered_map<u64, std::pair<DAddr, DAddr>> slot_cpu_range;
+    size_t gpu_images{}, rt_images{}, cpu_images{}, unmapped_pages{};
+    u64 gpu_bytes{}, rt_bytes{}, cpu_bytes{}, host_bytes{};
+    const auto walk = [&](const Image& image, const auto& visit) {
+        const u64 size = Common::AlignUp(image.guest_size_bytes, PageBytes);
+        for (u64 offset = 0; offset < size; offset += PageBytes) {
+            const std::optional<DAddr> daddr = gpu_memory->GpuToCpuAddress(image.gpu_addr + offset);
+            u8* const pointer = daddr ? device_memory.GetPointer<u8>(*daddr) : nullptr;
+            if (pointer == nullptr) {
+                ++unmapped_pages;
+                continue;
+            }
+            const u64 host = reinterpret_cast<u64>(pointer);
+            visit(host / SlotBytes, (host % SlotBytes) / PageBytes, *daddr);
+        }
+    };
+    for (const auto [image_id, image] : slot_images) {
+        if (True(image->flags & ImageFlagBits::Unbacked)) {
+            // No host image holds its contents (never uploaded or downloaded), so a slot it lies
+            // on is not one whose guest copy these caches can give back. Not walked: these are
+            // the images too large to back.
+            continue;
+        }
+        const bool gpu = True(image->flags & ImageFlagBits::GpuModified);
+        const bool cpu = True(image->flags & ImageFlagBits::CpuModified);
+        // An image the game has read back (a CPU read flushed it, or a DMA copy took it out) keeps
+        // its guest pages: discarding them only made the next read download it again, a GPU wait
+        // each time (Ocarina: ~100k reads of GPU-written memory, 2 GB discarded again in 23 min).
+        const bool read_back = image->info.forced_flushed || image->info.dma_downloaded;
+        // The guest pages are only a copy while the caches will write them back: DownloadMemory
+        // skips images it cannot download (a CPU read would find zeroes), and the collector may
+        // drop a bad-overlap image without its write-back. Both keep their guest copy.
+        const bool write_back = gpu && !cpu && !read_back && IsDownloadable(*image) &&
+                                False(image->flags & ImageFlagBits::BadOverlap) &&
+                                True(image->flags & ImageFlagBits::Tracked);
+        host_bytes += ImageMemoryBytes(*image);
+        if (write_back) {
+            ++gpu_images;
+            gpu_bytes += image->guest_size_bytes;
+            if (image->info.type != ImageType::Buffer &&
+                (VideoCore::Surface::GetFormatType(image->info.format) !=
+                     VideoCore::Surface::SurfaceType::ColorTexture ||
+                 image->info.num_samples > 1 || image->info.resources.levels == 1)) {
+                ++rt_images;
+                rt_bytes += image->guest_size_bytes;
+            }
+            walk(*image, [&](u64 slot, u64 page, DAddr daddr) {
+                gpu_only_slots[slot].set(page);
+                auto [it, is_new] = slot_cpu_range.try_emplace(slot, daddr, daddr + 1);
+                if (!is_new) {
+                    it->second.first = (std::min)(it->second.first, daddr);
+                    it->second.second = (std::max)(it->second.second, daddr + 1);
+                }
+            });
+        } else {
+            if (cpu && gpu) {
+                ++cpu_images;
+                cpu_bytes += image->guest_size_bytes;
+            }
+            walk(*image, [&](u64 slot, u64, DAddr) { other_slots.insert(slot); });
+        }
+    }
+    u64 pages{}, whole_slots{}, clean_slots{}, clean_pages{};
+    // Slots wholly behind GPU-only images and behind no other image: their guest bytes are a copy
+    // the caches write back before anything reads them.
+    std::array<std::uint64_t, 5> by_state{}; // zero, own, shared, fine, packed
+    u64 discarded_slots{}, given_back{}, kept_written{};
+    for (const auto& [slot, covered] : gpu_only_slots) {
+        pages += covered.count();
+        whole_slots += covered.all() ? 1 : 0;
+        if (other_slots.contains(slot)) {
+            continue;
+        }
+        ++clean_slots;
+        clean_pages += covered.count();
+        if (!discard || !covered.all() || eden_guest_memory_discard == nullptr) {
+            continue;
+        }
+        const auto cpu_range = slot_cpu_range.find(slot);
+        if (cpu_range == slot_cpu_range.end() ||
+            cpu_range->second.first >= cpu_range->second.second) {
+            continue; // no guest address to hold a CPU write to it: leave the slot alone
+        }
+        const DAddr begin = cpu_range->second.first;
+        const DAddr end = cpu_range->second.second;
+        bool written = false;
+        {
+            // A CPU write collected from here on stores its bytes once the slot is zeroed, and one
+            // collected before it is in the ranges looked at: either the write is seen, or it is
+            // held until the zeroing has ended (DownloadLanding, as the collector's write-backs).
+            const VideoCore::DownloadLanding landing{
+                begin, end, VideoCore::DownloadLanding::Source::TextureCache};
+            if (pending_cpu_writes) {
+                pending_cpu_writes([&](DAddr addr, size_t size) {
+                    written |= addr < end && begin < addr + size;
+                });
+            }
+            if (!written) {
+                ++discarded_slots;
+                given_back += eden_guest_memory_discard(
+                    reinterpret_cast<const void*>(slot * SlotBytes), SlotBytes, by_state.data());
+            }
+        }
+        kept_written += written ? 1 : 0;
+    }
+    if (discard) {
+        static u64 total_given_back{};
+        static u64 passes{};
+        total_given_back += given_back;
+        ++passes;
+        if (given_back != 0 || kept_written != 0 || report) {
+            std::fprintf(stderr,
+                         "EDEN_GPU_ONLY_DISCARD %llu slots: %llu MiB given back now (%llu MiB in %llu "
+                         "passes); found zero %llu own %llu shared %llu fine %llu packed %llu; "
+                         "%llu slots held by pending CPU writes\n",
+                         static_cast<unsigned long long>(discarded_slots),
+                         static_cast<unsigned long long>(given_back >> 20),
+                         static_cast<unsigned long long>(total_given_back >> 20),
+                         static_cast<unsigned long long>(passes),
+                         static_cast<unsigned long long>(by_state[0]),
+                         static_cast<unsigned long long>(by_state[1]),
+                         static_cast<unsigned long long>(by_state[2]),
+                         static_cast<unsigned long long>(by_state[3]),
+                         static_cast<unsigned long long>(by_state[4]),
+                         static_cast<unsigned long long>(kept_written));
+        }
+    }
+    if (!report) {
+        return;
+    }
+    std::fprintf(stderr,
+                 "EDEN_GPU_ONLY_GUEST %zu GPU-only images (%llu MiB guest size, %zu of them %llu MiB "
+                 "render-target-like) behind %llu MiB of guest pages in %zu 2 MiB slots: %llu slots "
+                 "(%llu MiB) wholly covered, %llu slots with no other image (%llu MiB of pages); "
+                 "%zu images %llu MiB the CPU wrote after the GPU; host images hold %llu MiB; "
+                 "%zu pages unmapped\n",
+                 gpu_images, static_cast<unsigned long long>(gpu_bytes >> 20), rt_images,
+                 static_cast<unsigned long long>(rt_bytes >> 20),
+                 static_cast<unsigned long long>((pages * PageBytes) >> 20), gpu_only_slots.size(),
+                 static_cast<unsigned long long>(whole_slots),
+                 static_cast<unsigned long long>((whole_slots * SlotBytes) >> 20),
+                 static_cast<unsigned long long>(clean_slots),
+                 static_cast<unsigned long long>((clean_pages * PageBytes) >> 20), cpu_images,
+                 static_cast<unsigned long long>(cpu_bytes >> 20),
+                 static_cast<unsigned long long>(host_bytes >> 20), unmapped_pages);
 }
 
 template <class P>

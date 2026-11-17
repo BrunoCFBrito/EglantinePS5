@@ -115,6 +115,16 @@ bool LockSlot(SparseRange& range, std::size_t slot, bool count_wait = false) noe
     if (waited && count_wait) counters.waits.fetch_add(1, std::memory_order_relaxed);
     return waited;
 }
+// Locks a slot only if no one holds it: the graphics caches' discard runs on the thread that
+// draws, and a write fault holds a slot's lock while it waits for a block (WaitForBlock, up to
+// 2 s), so it must never be waited for there. False means the slot was left alone this pass.
+bool TryLockSlot(SparseRange& range, std::size_t slot) noexcept {
+    auto& state = range.state[slot];
+    std::uint8_t value = state.load(std::memory_order_relaxed);
+    if (value & SlotLock) return false;
+    return state.compare_exchange_strong(value, value | SlotLock, std::memory_order_acquire,
+                                         std::memory_order_relaxed);
+}
 std::size_t FineKept(SparseRange& range, std::size_t slot) noexcept {
     return range.fine[slot] & 0xff;
 }
@@ -2335,6 +2345,40 @@ void GuestMemoryFreedPart(std::uint64_t offset, std::size_t bytes) noexcept {
         UnlockSlot(*range, slot, state);
         at = slot_end;
     }
+}
+
+// The graphics caches hold the real contents of [host, host + bytes): images only the GPU wrote,
+// whose guest pages are a second copy nothing reads before the caches write it back (a CPU read
+// downloads them first; a CPU write gets a fresh zeroed block). Every slot the range covers whole
+// goes back to the zero block, as a slot the guest's kernel clears; by_state[s] counts the slots
+// found in state s (Zero, Own, Shared, Fine, Packed). Bytes given back.
+extern "C" std::size_t eden_guest_memory_discard(const void* host, std::size_t bytes,
+                                                 std::uint64_t* by_state) noexcept {
+    SparseRange* const range = guest_range.load(std::memory_order_acquire);
+    if (range == nullptr || range->state == nullptr || !range->promote || bytes < SparseSlot) return 0;
+    const auto at = reinterpret_cast<std::uintptr_t>(host);
+    const std::uintptr_t begin = range->begin.load(std::memory_order_relaxed);
+    if (at < begin || at >= range->end) return 0;
+    const std::uint64_t offset = at - begin;
+    const std::uint64_t end = std::min<std::uint64_t>(offset + bytes, range->end - begin);
+    const std::uint64_t first = (offset + SparseSlot - 1) / SparseSlot;
+    const std::uint64_t last = end / SparseSlot; // exclusive
+    const std::size_t before = guest_committed.load(std::memory_order_relaxed);
+    for (std::uint64_t slot = first; slot < last; ++slot) {
+        const auto index = static_cast<std::size_t>(slot);
+        // Never wait for a slot: a write fault holds one's lock while it waits for a block (up to
+        // 2 s, WaitForBlock), and the caller is the thread that draws. A slot left locked is kept.
+        if (!TryLockSlot(*range, index)) continue;
+        const std::uint8_t state = SlotState(*range, index);
+        if (by_state != nullptr && state <= SlotPacked) ++by_state[state];
+        if (state != SlotZero) {
+            ReturnSlot(*range, index);
+            counters.returns_clear.fetch_add(1, std::memory_order_relaxed);
+        }
+        UnlockSlot(*range, index, SlotZero);
+    }
+    const std::size_t after = guest_committed.load(std::memory_order_relaxed);
+    return before > after ? before - after : 0;
 }
 
 // Host memory behind [offset, offset + bytes) of the guest's memory (the memory report splits it

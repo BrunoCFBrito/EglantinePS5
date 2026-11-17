@@ -659,6 +659,11 @@ private:
     /// The image's allocation size where the runtime reports one, else ImageMemoryBytes.
     u64 ImageAllocationBytes(const Image& image) const;
 
+    /// EDEN_NX2_GPU_ONLY_REPORT=1: the guest RAM behind images only the GPU wrote, every 20 s.
+    /// EDEN_NX2_GPU_ONLY_DISCARD=1 (PS5 port, every 5 s): the 2 MiB slots those images cover whole,
+    /// and no other image, go back to the guest memory service's zero block. Caller holds mutex.
+    void ReportGpuOnlyGuest(bool discard = false, bool report = true);
+
     void QueueAsyncDecode(Image& image, ImageId image_id);
     void TickAsyncDecode();
 
