@@ -99,6 +99,10 @@ if [[ -f $radv_release/lib/libvulkan_radeon.ps5.a ]]; then
         step "RADV: the pipeline-lifetime heap allocation changed"
         bash tools/build-radv-dependencies.sh
         rm -f build/radv-isolated/libvulkan_radeon.ps5.a
+    elif ! python3 -B tools/patch-radv-pipeline-oom.py --check "$radv_release/EDEN_PIPELINE_OOM_SHA256"; then
+        step "RADV: failed pipeline creation handling changed"
+        bash tools/build-radv-dependencies.sh
+        rm -f build/radv-isolated/libvulkan_radeon.ps5.a
     elif ! python3 -B tools/patch-radv-wsi.py --check "$radv_release/EDEN_WSI_SHA256"; then
         step "RADV: the display code's adaptation changed"
         bash tools/build-radv-dependencies.sh

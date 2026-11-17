@@ -47,8 +47,10 @@ python3 "$root/tools/patch-radv-pieces.py"
 python3 "$root/tools/patch-radv-trim.py"
 python3 "$root/tools/patch-radv-alloc-report.py"
 python3 "$root/tools/patch-radv-gs-compute.py"
-# Pipeline-lifetime objects come from the emulator's shared long-lived heap arenas.
+# The pipeline-lifetime allocation patches: the shared long-lived heap first, then the fail-soft
+# pipeline creation whose checks sit on the allocations it introduces.
 python3 "$root/tools/patch-radv-longlived.py"
+python3 "$root/tools/patch-radv-pipeline-oom.py"
 # After the allocation patches: it splits their p30/p31 report and retries a refused allocation.
 python3 "$root/tools/patch-radv-memory-report.py"
 # ProsperoEden's patch-radv-transfer-split.py (splitting before transfers and barriers) is not
@@ -71,3 +73,5 @@ python3 "$root/tools/patch-radv-gs-compute.py" --digest \
     > "$vulkan/.deps/native/radv-release/EDEN_GS_COMPUTE_SHA256"
 python3 "$root/tools/patch-radv-longlived.py" --digest \
     > "$vulkan/.deps/native/radv-release/EDEN_LONG_LIVED_SHA256"
+python3 "$root/tools/patch-radv-pipeline-oom.py" --digest \
+    > "$vulkan/.deps/native/radv-release/EDEN_PIPELINE_OOM_SHA256"
