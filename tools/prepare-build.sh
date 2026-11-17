@@ -87,6 +87,10 @@ if [[ -f $radv_release/lib/libvulkan_radeon.ps5.a ]]; then
         step "RADV: driver memory from 2 MiB pieces changed"
         bash tools/build-radv-dependencies.sh
         rm -f build/radv-isolated/libvulkan_radeon.ps5.a
+    elif ! python3 -B tools/patch-radv-alloc-report.py --check "$radv_release/EDEN_ALLOC_REPORT_SHA256"; then
+        step "RADV: the allocation refusal report changed"
+        bash tools/build-radv-dependencies.sh
+        rm -f build/radv-isolated/libvulkan_radeon.ps5.a
     elif ! python3 -B tools/patch-radv-gs-compute.py --check "$radv_release/EDEN_GS_COMPUTE_SHA256"; then
         step "RADV: geometry-shader compute passes for dropped draws changed"
         bash tools/build-radv-dependencies.sh
