@@ -391,6 +391,9 @@ void Fsr3FrameGen::Generate(const Device& device, Scheduler& scheduler, VkImage 
                                                       DescriptorBankInfo{.textures = 3, .images = 1});
     }
     const VkDescriptorSet set = m_interp_allocator.Commit();
+    if (set == VK_NULL_HANDLE) {
+        return; // no memory for descriptors: this frame is not interpolated
+    }
     std::vector<VkDescriptorImageInfo> image_infos;
     image_infos.reserve(4);
     std::vector<VkWriteDescriptorSet> updates{

@@ -368,6 +368,9 @@ std::optional<std::pair<VkBuffer, VkDeviceSize>> VertexRepackPass::Assemble(VkBu
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, read_barrier);
         const auto set = descriptor_allocator.Commit();
+        if (set == VK_NULL_HANDLE) {
+            return; // no memory for descriptors: skip the repack
+        }
         device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, data);
         cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
         cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
@@ -416,6 +419,9 @@ std::pair<VkBuffer, VkDeviceSize> Uint8Pass::Assemble(u32 num_vertices, VkBuffer
             .dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT,
         };
         const VkDescriptorSet set = descriptor_allocator.Commit();
+        if (set == VK_NULL_HANDLE) {
+            return; // no memory for descriptors: skip the pass
+        }
         device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptor_data);
         cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
         cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
@@ -476,6 +482,9 @@ std::pair<VkBuffer, VkDeviceSize> QuadIndexedPass::Assemble(
         };
         const std::array<u32, 3> push_constants{base_vertex, index_shift, is_strip ? 1u : 0u};
         const VkDescriptorSet set = descriptor_allocator.Commit();
+        if (set == VK_NULL_HANDLE) {
+            return; // no memory for descriptors: skip the pass
+        }
         device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptor_data);
         cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
         cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
@@ -527,6 +536,9 @@ void ConditionalRenderingResolvePass::Resolve(VkBuffer dst_buffer, VkBuffer src_
             .compare_to_zero = compare_to_zero ? 1U : 0U,
         };
         const VkDescriptorSet set = descriptor_allocator.Commit();
+        if (set == VK_NULL_HANDLE) {
+            return; // no memory for descriptors: skip the resolve
+        }
         device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptor_data);
 
         cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
@@ -603,6 +615,9 @@ void QueriesPrefixScanPass::Run(VkBuffer accumulation_buffer, VkBuffer dst_buffe
                 .buffer_offset = static_cast<u32>(used_offset),
             };
             const VkDescriptorSet set = descriptor_allocator.Commit();
+            if (set == VK_NULL_HANDLE) {
+                return; // no memory for descriptors: skip the scan
+            }
             device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptor_data);
 
             cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -747,6 +762,9 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
                     .level_extent = level_extent,
                 };
                 const VkDescriptorSet set = descriptor_allocator.Commit();
+                if (set == VK_NULL_HANDLE) {
+                    return; // no memory for descriptors: skip the decode
+                }
                 device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptor_data);
                 cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
                 cmdbuf.PushConstants(*layout, VK_SHADER_STAGE_COMPUTE_BIT, uniforms);
@@ -792,6 +810,9 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
                 .level_extent = level_extent,
             };
             const VkDescriptorSet set = descriptor_allocator.Commit();
+            if (set == VK_NULL_HANDLE) {
+                return; // no memory for descriptors: skip the decode
+            }
             device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptor_data);
             cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
             cmdbuf.PushConstants(*layout, VK_SHADER_STAGE_COMPUTE_BIT, uniforms);
@@ -881,6 +902,9 @@ void BcEncoderPass::Encode(VkImageView source, u32 width, u32 height, u32 layers
     const VkPipeline vk_pipeline = *pipeline;
     scheduler.Record([this, vk_pipeline, uniforms, layers, descriptor_data](vk::CommandBuffer cmdbuf) {
         const VkDescriptorSet set = descriptor_allocator.Commit();
+        if (set == VK_NULL_HANDLE) {
+            return; // no memory for descriptors: skip the encode
+        }
         device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptor_data);
         cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, vk_pipeline);
         cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
@@ -1064,7 +1088,8 @@ void BlockLinearUnswizzle3DPass::UnswizzleChunk(
                       image_width, image_height
                       ](vk::CommandBuffer cmdbuf) {
 
-        if (dst_image == VK_NULL_HANDLE || out_buffer == VK_NULL_HANDLE) {
+        if (dst_image == VK_NULL_HANDLE || out_buffer == VK_NULL_HANDLE ||
+            set == VK_NULL_HANDLE) {
             return;
         }
 

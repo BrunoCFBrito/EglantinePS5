@@ -390,6 +390,9 @@ public:
                                        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                                    0, read_depth, {}, init_motion);
             const VkDescriptorSet set = descriptor_allocator.Commit();
+            if (set == VK_NULL_HANDLE) {
+                return; // no memory for descriptors: skip this pass
+            }
             device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptors);
             cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
             cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
@@ -453,6 +456,9 @@ public:
             cmd.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                 0, sample_color, {}, prepare);
             const VkDescriptorSet set = descriptor_allocator.Commit();
+            if (set == VK_NULL_HANDLE) {
+                return; // no memory for descriptors: skip this pass
+            }
             device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptors);
             cmd.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
             cmd.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
@@ -474,6 +480,9 @@ public:
             cmd.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                 0, before);
             const VkDescriptorSet set = descriptor_allocator.Commit();
+            if (set == VK_NULL_HANDLE) {
+                return; // no memory for descriptors: skip this pass
+            }
             device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptors);
             cmd.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
             cmd.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
@@ -533,6 +542,9 @@ public:
             cmd.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                 0, inputs, {}, output);
             const VkDescriptorSet set = descriptor_allocator.Commit();
+            if (set == VK_NULL_HANDLE) {
+                return; // no memory for descriptors: skip this pass
+            }
             device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptors);
             cmd.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
             cmd.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
@@ -601,6 +613,9 @@ public:
             cmd.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, inputs, {}, prepare);
             const VkDescriptorSet set = descriptor_allocator.Commit();
+            if (set == VK_NULL_HANDLE) {
+                return; // no memory for descriptors: skip this pass
+            }
             device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptors);
             cmd.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
             cmd.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});

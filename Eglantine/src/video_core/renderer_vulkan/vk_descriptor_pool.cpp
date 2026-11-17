@@ -5,17 +5,25 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
+#include <cstddef>
 #include <mutex>
 #include <span>
 #include <vector>
 
 #include "common/common_types.h"
+#include "common/logging.h"
 #include <ranges>
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
+
+// The guest memory service (PS5 port) makes room on demand: it trims the driver's unused blocks,
+// then packs guest memory the game has not written for a while. Absent elsewhere. Returns the
+// bytes it gave back. (Same hook the device-memory allocator uses on VK_ERROR_OUT_OF_DEVICE_MEMORY.)
+extern "C" [[gnu::weak]] std::size_t eden_memory_recover(std::size_t bytes) noexcept;
 
 namespace Vulkan {
 
@@ -59,6 +67,11 @@ static DescriptorBankInfo MakeBankInfo(std::span<const Shader::Info> infos) {
     return bank;
 }
 
+[[nodiscard]] static bool IsOutOfMemory(VkResult result) {
+    return result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY ||
+           result == VK_ERROR_OUT_OF_POOL_MEMORY || result == VK_ERROR_FRAGMENTED_POOL;
+}
+
 static void AllocatePool(const Device& device, DescriptorBank& bank) {
     std::array<VkDescriptorPoolSize, 8> pool_sizes;
     size_t pool_cursor{};
@@ -80,14 +93,25 @@ static void AllocatePool(const Device& device, DescriptorBank& bank) {
     add(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, info.images);
     add(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, info.sampled_images);
     add(VK_DESCRIPTOR_TYPE_SAMPLER, info.samplers);
-    bank.pools.push_back(device.GetLogical().CreateDescriptorPool({
+    const VkDescriptorPoolCreateInfo pool_ci{
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
         .maxSets = sets_per_pool,
         .poolSizeCount = static_cast<u32>(pool_cursor),
         .pPoolSizes = std::data(pool_sizes),
-    }));
+    };
+    try {
+        bank.pools.push_back(device.GetLogical().CreateDescriptorPool(pool_ci));
+    } catch (const vk::Exception& exception) {
+        if (!IsOutOfMemory(exception.GetResult()) || &eden_memory_recover == nullptr) {
+            throw;
+        }
+        // The pool the CPU shares with the GPU is empty (Ocarina, 58 min in): cold guest memory
+        // goes out, from this thread, and the pool is asked for once more.
+        static_cast<void>(eden_memory_recover(std::size_t{64} << 20));
+        bank.pools.push_back(device.GetLogical().CreateDescriptorPool(pool_ci));
+    }
 }
 
 DescriptorAllocator::DescriptorAllocator(const Device& device_, MasterSemaphore& master_semaphore_,
@@ -96,7 +120,24 @@ DescriptorAllocator::DescriptorAllocator(const Device& device_, MasterSemaphore&
       layout{layout_} {}
 
 VkDescriptorSet DescriptorAllocator::Commit() {
-    const size_t index = CommitResource();
+    size_t index;
+    try {
+        index = CommitResource();
+    } catch (const vk::Exception& exception) {
+        if (!IsOutOfMemory(exception.GetResult())) {
+            throw;
+        }
+        // No memory for more descriptor sets: this draw or dispatch goes without its own
+        // (every caller skips it) instead of the session ending on the worker thread.
+        static std::atomic<u32> refused{};
+        const u32 count = refused.fetch_add(1, std::memory_order_relaxed) + 1;
+        if ((count & (count - 1)) == 0) {
+            LOG_ERROR(Render_Vulkan, "No memory for descriptor sets ({}): {} draws or dispatches "
+                                     "skipped so far",
+                      static_cast<int>(exception.GetResult()), count);
+        }
+        return VK_NULL_HANDLE;
+    }
     return sets[index / SETS_GROW_RATE][index % SETS_GROW_RATE];
 }
 

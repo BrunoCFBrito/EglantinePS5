@@ -1369,6 +1369,9 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                 return;
             }
             const VkDescriptorSet descriptor_set{descriptor_allocator.Commit()};
+            if (descriptor_set == VK_NULL_HANDLE) {
+                return; // no memory for its descriptors: the emulated mesh draw is skipped
+            }
             device.GetLogical().UpdateDescriptorSet(descriptor_set, *descriptor_update_template,
                                                     descriptor_data);
             mesh_descriptor_set = descriptor_set;
@@ -1428,6 +1431,9 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             // 2. Distribution: each task's first mesh workgroup, the draw's place in the output
             //    arena, and the mesh dispatch and draw arguments.
             const VkDescriptorSet distribution_set{distribution_allocator.Commit()};
+            if (distribution_set == VK_NULL_HANDLE) {
+                return; // no memory for its descriptors: the task and mesh dispatches are skipped
+            }
             std::array<VkDescriptorBufferInfo, 4> buffer_infos{};
             std::array<VkWriteDescriptorSet, 4> writes{};
             for (u32 binding = 0; binding < 4; ++binding) {
@@ -1577,6 +1583,9 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                                                     0, descriptor_data);
         } else if (update_descriptors) {
             const VkDescriptorSet descriptor_set{descriptor_allocator.Commit()};
+            if (descriptor_set == VK_NULL_HANDLE) {
+                return; // no memory for descriptors: the draw keeps the last ones bound
+            }
             const vk::Device& dev{device.GetLogical()};
             dev.UpdateDescriptorSet(descriptor_set, *descriptor_update_template, descriptor_data);
             cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout, 0,

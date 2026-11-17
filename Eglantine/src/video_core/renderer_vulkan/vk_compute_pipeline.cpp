@@ -831,6 +831,9 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                                                     0, descriptor_data);
         } else {
             const VkDescriptorSet descriptor_set{descriptor_allocator.Commit()};
+            if (descriptor_set == VK_NULL_HANDLE) {
+                return; // no memory for descriptors: the dispatch keeps the last ones bound
+            }
             const vk::Device& dev{device.GetLogical()};
             dev.UpdateDescriptorSet(descriptor_set, *descriptor_update_template, descriptor_data);
             cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline_layout, 0,

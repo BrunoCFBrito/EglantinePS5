@@ -801,6 +801,10 @@ void BlitImageHelper::BlitColor(const Framebuffer* dst_framebuffer, VkImageView 
         TransitionImageLayout(cmdbuf, src_image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         BeginRenderPass(cmdbuf, render_pass, framebuffer, render_area);
         const VkDescriptorSet descriptor_set = one_texture_descriptor_allocator.Commit();
+        if (descriptor_set == VK_NULL_HANDLE) {
+            cmdbuf.EndRenderPass(); // no memory for descriptors: skip the blit
+            return;
+        }
         // The source was just transitioned: describe it in that layout.
         UpdateOneTextureDescriptorSet(device, descriptor_set, src_sampler, src_image_view,
                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
@@ -847,6 +851,9 @@ void BlitImageHelper::TemporalUpscale(const Framebuffer* dst_framebuffer,
     scheduler.Record([this, dst_region, pipeline, layout, sampler, views,
                       push_constants](vk::CommandBuffer cmdbuf) {
         const VkDescriptorSet descriptor_set = temporal_upscale_descriptor_allocator.Commit();
+        if (descriptor_set == VK_NULL_HANDLE) {
+            return; // no memory for descriptors: skip the upscale
+        }
         UpdateTemporalUpscaleDescriptorSet(device, descriptor_set, sampler, views);
         cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
         cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, descriptor_set,
@@ -873,6 +880,9 @@ void BlitImageHelper::TemporalSharpen(const Framebuffer* dst_framebuffer, VkImag
     scheduler.Record([this, dst_region, pipeline, layout, sampler, source,
                       push_constants](vk::CommandBuffer cmdbuf) {
         const VkDescriptorSet descriptor_set = one_texture_descriptor_allocator.Commit();
+        if (descriptor_set == VK_NULL_HANDLE) {
+            return; // no memory for descriptors: skip the sharpen
+        }
         UpdateOneTextureDescriptorSet(device, descriptor_set, sampler, source);
         cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
         cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, descriptor_set,
@@ -902,10 +912,16 @@ void BlitImageHelper::BlitImpl(const Framebuffer* dst_framebuffer,
         VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
         if (blit_stencil) {
             descriptor_set = two_textures_descriptor_allocator.Commit();
+            if (descriptor_set == VK_NULL_HANDLE) {
+                return; // no memory for descriptors: skip the blit
+            }
             UpdateTwoTexturesDescriptorSet(device, descriptor_set, sampler, src_view,
                                            src_stencil_view);
         } else {
             descriptor_set = one_texture_descriptor_allocator.Commit();
+            if (descriptor_set == VK_NULL_HANDLE) {
+                return; // no memory for descriptors: skip the blit
+            }
             UpdateOneTextureDescriptorSet(device, descriptor_set, sampler, src_view);
         }
         cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
@@ -1228,10 +1244,18 @@ void BlitImageHelper::CopyMSAAImpl(VkRenderPass renderpass, VkPipeline pipeline,
                 VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
                 if (src_stencil_handle != VK_NULL_HANDLE) {
                     descriptor_set = two_textures_descriptor_allocator.Commit();
+                    if (descriptor_set == VK_NULL_HANDLE) {
+                        cmdbuf.EndRenderPass(); // no memory for descriptors: skip the copy
+                        return;
+                    }
                     UpdateTwoTexturesDescriptorSet(device, descriptor_set, sampler, src_view_handle,
                                                    src_stencil_handle);
                 } else {
                     descriptor_set = one_texture_descriptor_allocator.Commit();
+                    if (descriptor_set == VK_NULL_HANDLE) {
+                        cmdbuf.EndRenderPass(); // no memory for descriptors: skip the copy
+                        return;
+                    }
                     UpdateOneTextureDescriptorSet(device, descriptor_set, sampler, src_view_handle);
                 }
                 cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
@@ -1368,6 +1392,9 @@ void BlitImageHelper::Convert(VkPipeline pipeline, const Framebuffer* dst_frameb
             .tex_offset = {0.0f, 0.0f},
         };
         const VkDescriptorSet descriptor_set = one_texture_descriptor_allocator.Commit();
+        if (descriptor_set == VK_NULL_HANDLE) {
+            return; // no memory for descriptors: skip the conversion
+        }
         UpdateOneTextureDescriptorSet(device, descriptor_set, sampler, src_view);
 
         cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
@@ -1414,6 +1441,9 @@ void BlitImageHelper::ConvertDepthStencil(VkPipeline pipeline, const Framebuffer
             .tex_offset = {0.0f, 0.0f},
         };
         const VkDescriptorSet descriptor_set = two_textures_descriptor_allocator.Commit();
+        if (descriptor_set == VK_NULL_HANDLE) {
+            return; // no memory for descriptors: skip the conversion
+        }
         UpdateTwoTexturesDescriptorSet(device, descriptor_set, sampler, src_depth_view,
                                        src_stencil_view);
         cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);

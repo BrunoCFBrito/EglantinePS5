@@ -174,6 +174,9 @@ public:
         const void* const descriptor_data{queue.UpdateData()};
         scheduler_.Record([this, descriptor_data, groups_x, groups_y](vk::CommandBuffer cmdbuf) {
             const VkDescriptorSet set = descriptor_allocator.Commit();
+            if (set == VK_NULL_HANDLE) {
+                return; // no memory for descriptors: skip this pass
+            }
             device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptor_data);
             cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
             cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
