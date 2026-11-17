@@ -253,26 +253,16 @@ StagingReleased StagingBufferPool::ReleaseCompleted() {
 }
 
 StagingReleased StagingBufferPool::ReleaseMemory() {
-    // Waits for the GPU so the buffers it was still reading are idle too. Those handed out in
-    // the current tick may feed commands not recorded yet (the caller's input while it asks for
-    // its output): they move to the tick after Finish, so they are neither freed nor handed out
-    // again.
+    // Waits for the submitted ticks only (#1997, Lichii). This runs while a draw or dispatch is
+    // being set up, and Scheduler::Finish submits the open command buffer: the draw's index,
+    // vertex and descriptor binds recorded so far would go into that submission. Buffers handed
+    // out in the open tick stay busy anyway (their tick has not been submitted), so they are
+    // neither freed nor handed out again.
     const u64 current_tick = scheduler.CurrentTick();
-    scheduler.Finish();
-    const u64 next_tick = scheduler.CurrentTick();
-    for (StagingBuffersCache* const cache : {&device_local_cache, &upload_cache, &download_cache}) {
-        for (StagingBuffers& staging : *cache) {
-            for (StagingBuffer& entry : staging.entries) {
-                if (!entry.deferred && entry.tick >= current_tick) {
-                    entry.tick = next_tick;
-                }
-            }
-        }
-    }
-    for (u64& sync_tick : sync_ticks) {
-        if (sync_tick >= current_tick) {
-            sync_tick = next_tick;
-        }
+    if (current_tick > 0) {
+        // Scheduler::Wait flushes when asked for a tick at or after the open one; ask only for
+        // the last submitted tick.
+        scheduler.Wait(current_tick - 1);
     }
     return ReleaseIdleBuffers();
 }
@@ -541,10 +531,10 @@ std::optional<StagingBufferRef> StagingBufferPool::TryCreateStagingBuffer(size_t
     StagingReleased released;
     if (!buffer) {
         // No memory left for it (#262: a 128 MiB upload on an 8 GB laptop with Intel UHD). Free
-        // the idle staging buffers and try again, then let ReleaseMemory wait for the GPU and
-        // free the ones it was still reading too. Buffers handed out in the current tick may
-        // feed commands not recorded yet (the caller's input while it asks for its output):
-        // ReleaseMemory moves them past the Finish, so they are neither freed nor handed out.
+        // the idle staging buffers and try again, then let ReleaseMemory wait for the submitted
+        // ticks and free the ones the GPU was still reading too. Buffers handed out in the open
+        // tick may feed commands not recorded yet and are left busy, so they are neither freed
+        // nor handed out again.
         released += ReleaseCompleted();
         buffer = memory_allocator.TryCreateBuffer(buffer_ci, usage);
         if (!buffer) {
@@ -577,10 +567,11 @@ std::optional<StagingBufferRef> StagingBufferPool::TryCreateStagingBuffer(size_t
         if (logged++ == 0) {
             LogMemoryTrace(device);
         }
-        // The GPU is idle after ReleaseMemory, so the stream buffer after its last range is
-        // free. The ranges before it may hold data for commands not recorded yet, so it does
-        // not wrap. A deferred upload cannot use it (FreeDeferred looks the buffer up in the
-        // upload cache), so only a non-deferred upload is served from the tail.
+        // The submitted ticks are done after ReleaseMemory, so the stream buffer after its last
+        // range is free. The ranges the open tick handed out may hold data for commands not
+        // recorded yet, so it does not wrap. A deferred upload cannot use it (FreeDeferred looks
+        // the buffer up in the upload cache), so only a non-deferred upload is served from the
+        // tail.
         if (usage == MemoryUsage::Upload && !deferred && iterator + size < stream_buffer_size) {
             if (logged <= 32) {
                 LOG_ERROR(Render_Vulkan,
