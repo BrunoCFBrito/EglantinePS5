@@ -2396,6 +2396,19 @@ extern "C" void eden_guest_memory_urgent(void) noexcept {
 }
 [[maybe_unused]] void WakeSwapper() noexcept { eden_guest_memory_urgent(); }
 
+// One round of making memory for a block outside a fault handler (a page-table slot, a thread's
+// stack, the driver's ring): the same steps a fault takes, at a 10 ms pace, while the caller asks
+// again for up to 15 s (src/memory_pages.cpp, src/direct_memory.c).
+void MakeMemoryForBlock(unsigned round) noexcept {
+    eden_guest_memory_urgent();
+    RecoverForFault();
+#ifdef PS5_NATIVE
+    if (round % 25 == 24) (void)TrimHeapForFault(); // throttled to once per 250 ms inside
+#endif
+    const timespec pause{0, 10'000'000};
+    nanosleep(&pause, nullptr);
+}
+
 // All the memory the swap has given back so far: progress a thread waiting for memory can see.
 extern "C" std::uint64_t eden_guest_memory_given_back(void) noexcept {
     return swap_given_back.load(std::memory_order_relaxed);

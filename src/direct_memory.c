@@ -21,6 +21,7 @@
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <time.h>
 
 int __real_sceKernelAllocateDirectMemory(int64_t, int64_t, size_t, size_t, int, int64_t *);
 int __real_sceKernelReleaseDirectMemory(int64_t, size_t);
@@ -95,13 +96,39 @@ static int eden_direct_driver_keeps(size_t size, const void *caller) {
   return 0;
 }
 
+/* src/guest_memory_service.inc: cold guest memory out now, if the swap is free (bytes given back);
+ * wake the swapper. Weak: absent in builds without the service. */
+extern size_t eden_memory_recover_try(size_t want) __attribute__((weak));
+extern void eden_guest_memory_urgent(void) __attribute__((weak));
+
+/* A block that stays (a thread's stack, the driver's zero block, ring and marker page) the pool
+ * refused: memory is made and it is asked again, up to 8 times. A refused stack ended the app
+ * (std::thread throws; memory audit, 2026-11-15). Only these: the driver and the heap first ask for
+ * one large range and fall back to pieces when it is refused, and a retry here would hold every such
+ * request up. One thread at a time makes memory here; the others ask again after it. The swap's own
+ * blocks never come this way (eden_direct_low), so it cannot recurse. */
+static atomic_int eden_direct_making;
+static int eden_direct_high_take(size_t size, size_t alignment, int type, int64_t *start) {
+  int result = eden_direct_high(size, alignment, type, start);
+  for (unsigned round = 0; result != 0 && round < 8 && eden_memory_recover_try != NULL; ++round) {
+    if (eden_guest_memory_urgent != NULL) eden_guest_memory_urgent();
+    if (atomic_fetch_add_explicit(&eden_direct_making, 1, memory_order_acq_rel) == 0)
+      (void)eden_memory_recover_try(size + ((size_t)16 << 20));
+    atomic_fetch_sub_explicit(&eden_direct_making, 1, memory_order_acq_rel);
+    const struct timespec pause = {0, 10000000};
+    nanosleep(&pause, NULL);
+    result = eden_direct_high(size, alignment, type, start);
+  }
+  return result;
+}
+
 int __wrap_sceKernelAllocateDirectMemory(int64_t from, int64_t to, size_t size, size_t alignment, int type,
                                          int64_t *start) {
   /* A thread's stack or the driver's zero block, asked for anywhere in the pool; and the
    * driver's command ring and marker page. */
   if (from == 0 && start && to >= sceKernelGetDirectMemorySize() &&
       (size == EDEN_DIRECT_SMALL || eden_direct_driver_keeps(size, __builtin_return_address(0))))
-    return eden_direct_high(size, alignment, type, start);
+    return eden_direct_high_take(size, alignment, type, start);
   return __real_sceKernelAllocateDirectMemory(from, to, size, alignment, type, start);
 }
 

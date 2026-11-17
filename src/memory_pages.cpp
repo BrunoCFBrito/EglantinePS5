@@ -859,6 +859,13 @@ static void ReportSparseCommitFailure(const SparseRange& range, std::size_t slot
     Report(line);
 }
 
+namespace {
+// guest_memory_service.inc: one round of making memory for a block of 2 MiB (cold guest memory
+// packed or out, the swapper woken, the heap's empty arenas back). The include below defines it in
+// this translation unit's unnamed namespace.
+void MakeMemoryForBlock(unsigned round) noexcept;
+} // namespace
+
 void CommitSparsePage(std::uintptr_t page) noexcept {
     SparseRange* range = SparseRangeOf(page);
     if (range == nullptr) return; // dense: already writable
@@ -866,24 +873,40 @@ void CommitSparsePage(std::uintptr_t page) noexcept {
     const std::size_t slot = (page - begin) / SparseSlot;
     if (range->owned[slot].load(std::memory_order_acquire)) return;
     if (range->state != nullptr) {
-        // A range with slot states commits under the slot's lock (guest_memory_service.inc).
-        if (!ServiceCommit(*range, slot)) {
-            ReportSparseCommitFailure(*range, slot);
-            Report("EDEN_SPARSE_TABLES commit failed: out of memory\n");
-            std::abort();
+        // A range with slot states commits under the slot's lock (guest_memory_service.inc). No
+        // block for it: memory is made (cold guest slots out, the swapper woken, the heap's empty
+        // arenas) and the slot asked for again, for up to 15 s. It ended the app at once before
+        // (memory audit, 2026-11-15): there is no table to continue without.
+        for (unsigned round = 0;; ++round) {
+            if (ServiceCommit(*range, slot)) return;
+            if (round == 0) Report("EDEN_SPARSE_TABLES no block for a table slot: making memory\n");
+            if (round >= 1500) break;
+            MakeMemoryForBlock(round);
         }
-        return;
-    }
-    const std::lock_guard lock{sparse_mutex};
-    if (range->owned[slot].load(std::memory_order_relaxed)) return;
-    if (!OwnSlot(begin + slot * SparseSlot, &range->physical[slot])) {
-        // Out of memory in the middle of a guest mapping: there is no table to continue with.
         ReportSparseCommitFailure(*range, slot);
         Report("EDEN_SPARSE_TABLES commit failed: out of memory\n");
         std::abort();
     }
-    (range->guest ? guest_committed : sparse_committed).fetch_add(SparseSlot, std::memory_order_relaxed);
-    range->owned[slot].store(true, std::memory_order_release);
+    for (unsigned round = 0;; ++round) {
+        {
+            const std::lock_guard lock{sparse_mutex};
+            if (range->owned[slot].load(std::memory_order_relaxed)) return;
+            if (OwnSlot(begin + slot * SparseSlot, &range->physical[slot])) {
+                (range->guest ? guest_committed : sparse_committed).fetch_add(SparseSlot, std::memory_order_relaxed);
+                range->owned[slot].store(true, std::memory_order_release);
+                return;
+            }
+        }
+        // Outside sparse_mutex: making memory packs guest slots and trims the heap, and a table
+        // completion may need this lock meanwhile.
+        if (round == 0) Report("EDEN_SPARSE_TABLES no block for a table slot: making memory\n");
+        if (round >= 1500) break;
+        MakeMemoryForBlock(round);
+    }
+    // Out of memory in the middle of a guest mapping: there is no table to continue with.
+    ReportSparseCommitFailure(*range, slot);
+    Report("EDEN_SPARSE_TABLES commit failed: out of memory\n");
+    std::abort();
 }
 
 // Eden gives back a table page once a guest unmapped all of it, and expects zeroes there
