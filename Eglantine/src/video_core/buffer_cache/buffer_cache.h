@@ -18,6 +18,7 @@
 #include <memory>
 #include <numeric>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 #include <vector>
 #include <fmt/ranges.h>
@@ -116,6 +117,71 @@ void BufferCache<P>::RunGarbageCollector(bool aggressive_gc) {
     }
 }
 
+namespace buffer_delete {
+// EDEN_NX2_BC_DELETE_FRAMES=<n> (default 2): frames a deleted buffer waits at least, on top of
+// the GPU finishing its last submission; "old" keeps the fixed TICKS_TO_DESTROY-frame ring.
+inline int BufferDeleteFrames() {
+    static const int frames = [] {
+        const char* value = std::getenv("EDEN_NX2_BC_DELETE_FRAMES");
+        if (value == nullptr) {
+            return 2;
+        }
+        if (std::string_view{value} == "old") {
+            return -1;
+        }
+        return static_cast<int>(std::strtol(value, nullptr, 10));
+    }();
+    return frames;
+}
+} // namespace buffer_delete
+
+template <class P>
+void BufferCache<P>::QueueDeletedBuffer(Buffer&& buffer) {
+    if constexpr (requires(Runtime& r) { r.CurrentTick(); r.IsFree(u64{}); r.IsFreeNow(u64{}); }) {
+        if (buffer_delete::BufferDeleteFrames() >= 0) {
+            const u64 bytes = buffer.SizeBytes();
+            pending_buffer_delete_bytes += bytes;
+            pending_buffer_deletes.push_back(PendingBufferDelete{
+                .frame = frame_tick,
+                .tick = runtime.CurrentTick(),
+                .bytes = bytes,
+                .buffer = std::move(buffer),
+            });
+            // An area load is one frame of several seconds that deletes ~1 GiB of buffers (1.2 GiB
+            // held at the Castle Town peak on the BC-250). Past 128 MiB pending, free the ones from
+            // earlier submissions the GPU has finished, without waiting for the frame to end.
+            if (pending_buffer_delete_bytes > (u64{128} << 20)) {
+                const u64 current = runtime.CurrentTick();
+                while (!pending_buffer_deletes.empty()) {
+                    PendingBufferDelete& front = pending_buffer_deletes.front();
+                    if (front.tick >= current || !runtime.IsFreeNow(front.tick)) {
+                        break;
+                    }
+                    pending_buffer_delete_bytes -= front.bytes;
+                    pending_buffer_deletes.pop_front();
+                }
+            }
+            return;
+        }
+    }
+    delayed_destruction_ring.Push(std::move(buffer));
+}
+
+template <class P>
+void BufferCache<P>::ReleaseDeletedBuffers() {
+    if constexpr (requires(Runtime& r) { r.CurrentTick(); r.IsFree(u64{}); }) {
+        const u64 min_frames = static_cast<u64>((std::max)(buffer_delete::BufferDeleteFrames(), 0));
+        while (!pending_buffer_deletes.empty()) {
+            PendingBufferDelete& front = pending_buffer_deletes.front();
+            if (frame_tick < front.frame + min_frames || !runtime.IsFree(front.tick)) {
+                break;
+            }
+            pending_buffer_delete_bytes -= front.bytes;
+            pending_buffer_deletes.pop_front();
+        }
+    }
+}
+
 template <class P>
 void BufferCache<P>::TickFrame() {
     // Homebrew console apps don't create or bind any channels, so this will be nullptr.
@@ -173,8 +239,11 @@ void BufferCache<P>::TickFrame() {
                          static_cast<unsigned long long>(total >> 20),
                          static_cast<unsigned long long>((largest.empty() ? 0 : largest.front().first) >> 20));
         }
-        LOG_INFO(HW_GPU, "Buffer cache: {} buffers {} MiB; largest {}", count, total >> 20,
-                 fmt::join(largest.begin(), largest.begin() + std::min<size_t>(6, largest.size()), ", "));
+        LOG_INFO(HW_GPU,
+                 "Buffer cache: {} buffers {} MiB; {} deleted pending {} MiB; largest {}", count,
+                 total >> 20, pending_buffer_deletes.size(), pending_buffer_delete_bytes >> 20,
+                 fmt::join(largest.begin(), largest.begin() + std::min<size_t>(6, largest.size()),
+                           ", "));
     }
 
     // Calculate hits and shots and move hit bits to the right
@@ -213,6 +282,7 @@ void BufferCache<P>::TickFrame() {
     }
     ++frame_tick;
     delayed_destruction_ring.Tick();
+    ReleaseDeletedBuffers();
 
     // Pages draws wrote: their early downloads, now that the frame's work is recorded.
     RecordEarlyDownloads();
@@ -3938,6 +4008,10 @@ bool BufferCache<P>::RecoverAllocationFailure(u64 size) {
             // copies land before their buffers are destroyed.
             runtime.Finish();
             delayed_destruction_ring.Clear();
+            // The finish above also covered the submissions of the buffers the delete queue
+            // holds: under exhaustion they are what the retry allocates from.
+            pending_buffer_deletes.clear();
+            pending_buffer_delete_bytes = 0;
         });
         if (!recovered) {
             return false;
@@ -4419,7 +4493,7 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
 #ifdef YUZU_LEGACY
     if (!do_not_mark || !immediately_free)
 #endif
-        delayed_destruction_ring.Push(std::move(slot_buffers[buffer_id]));
+        QueueDeletedBuffer(std::move(slot_buffers[buffer_id]));
 
     slot_buffers.erase(buffer_id);
 

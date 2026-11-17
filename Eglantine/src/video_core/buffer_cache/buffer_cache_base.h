@@ -11,6 +11,7 @@
 #include <array>
 #include <bit>
 #include <chrono>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -775,6 +776,18 @@ private:
     static constexpr size_t TICKS_TO_DESTROY = 8;
 #endif
     DelayedDestructionRing<Buffer, TICKS_TO_DESTROY> delayed_destruction_ring;
+    /// A deleted buffer freed once the GPU finished the submission it was last used in and at
+    /// least EDEN_NX2_BC_DELETE_FRAMES frames went by (instead of TICKS_TO_DESTROY frames).
+    struct PendingBufferDelete {
+        u64 frame;
+        u64 tick;
+        u64 bytes;
+        Buffer buffer;
+    };
+    std::deque<PendingBufferDelete> pending_buffer_deletes;
+    u64 pending_buffer_delete_bytes = 0;
+    void ReleaseDeletedBuffers();
+    void QueueDeletedBuffer(Buffer&& buffer);
 
     const Tegra::Engines::Maxwell3D::DrawManager::IndirectParams* current_draw_indirect{};
 

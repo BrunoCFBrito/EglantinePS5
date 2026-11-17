@@ -330,6 +330,27 @@ struct BufferCacheTestAccess {
     static void NextFrame(Cache& cache) {
         cache.native_indirect_uniforms_this_frame.clear();
     }
+    /// A deleted buffer and its release (EDEN_NX2_BC_DELETE_FRAMES), without a frame running.
+    template <class C>
+    static void QueueDelete(C& cache, Buffer&& buffer) {
+        cache.QueueDeletedBuffer(std::move(buffer));
+    }
+    template <class C>
+    static void ReleaseDeletes(C& cache) {
+        cache.ReleaseDeletedBuffers();
+    }
+    template <class C>
+    static size_t PendingDeletes(const C& cache) {
+        return cache.pending_buffer_deletes.size();
+    }
+    template <class C>
+    static u64 PendingDeleteBytes(const C& cache) {
+        return cache.pending_buffer_delete_bytes;
+    }
+    template <class C>
+    static void SetFrameTick(C& cache, u64 tick) {
+        cache.frame_tick = tick;
+    }
     static u32 CpuMarks(Cache& cache) {
         return cache.memory_tracker.cpu_marks;
     }
@@ -2241,4 +2262,55 @@ TEST_CASE("Async read-back counts the reading thread's and the GPU side's waits 
     REQUIRE(counters.reader_waits.load() - reader_waits == 1);
     REQUIRE(counters.gpu_side_waits.load() - gpu_side_waits == 1);
     REQUIRE(f.runtime.host_read_waits == 2);
+}
+
+TEST_CASE("Deleted buffers wait for the GPU and two frames, and free finished ones past 128 MiB",
+          "[buffer_ports]") {
+    // EDEN_NX2_BC_DELETE_FRAMES=old keeps the fixed TICKS_TO_DESTROY ring: not what this tests.
+    if (VideoCommon::buffer_delete::BufferDeleteFrames() != 2) {
+        SKIP("expects the default EDEN_NX2_BC_DELETE_FRAMES=2");
+    }
+    BasicFixture<KeepRuntime, KeepCache> f;
+    // Deleted at frame 0 in tick 5, which the GPU has not run: two frames passing is not enough.
+    f.runtime.tick = 5;
+    f.runtime.completed_tick = 4;
+    Access::QueueDelete(*f.cache, Buffer{f.runtime, 0x10000, 0x1000, false});
+    REQUIRE(Access::PendingDeletes(*f.cache) == 1);
+    REQUIRE(Access::PendingDeleteBytes(*f.cache) == 0x1000);
+    // TickFrame's second call: frame_tick reaches 2, the first frame the two-frame wait allows.
+    Access::SetFrameTick(*f.cache, 2);
+    Access::ReleaseDeletes(*f.cache);
+    REQUIRE(Access::PendingDeletes(*f.cache) == 1);
+    // The GPU ran tick 5: the buffer goes.
+    f.runtime.completed_tick = 5;
+    Access::ReleaseDeletes(*f.cache);
+    REQUIRE(Access::PendingDeletes(*f.cache) == 0);
+    REQUIRE(Access::PendingDeleteBytes(*f.cache) == 0);
+    // The opposite: the GPU ran the deletion's tick at once, but carries the buffer two frames.
+    f.runtime.tick = 6;
+    f.runtime.completed_tick = 6;
+    Access::QueueDelete(*f.cache, Buffer{f.runtime, 0x10000, 0x1000, false});
+    Access::SetFrameTick(*f.cache, 3);
+    Access::ReleaseDeletes(*f.cache);
+    REQUIRE(Access::PendingDeletes(*f.cache) == 1);
+    Access::SetFrameTick(*f.cache, 4);
+    Access::ReleaseDeletes(*f.cache);
+    REQUIRE(Access::PendingDeletes(*f.cache) == 0);
+    // Past 128 MiB pending mid-frame, the finished ones go without waiting for the frame to end
+    // (an area load is one frame); those of the running tick stay.
+    f.runtime.tick = 6;
+    f.runtime.completed_tick = 6;
+    Access::QueueDelete(*f.cache, Buffer{f.runtime, 0x10000, 64 << 20, false});
+    f.runtime.tick = 8;
+    Access::QueueDelete(*f.cache, Buffer{f.runtime, 0x10000, 64 << 20, false});
+    REQUIRE(Access::PendingDeletes(*f.cache) == 2);
+    Access::QueueDelete(*f.cache, Buffer{f.runtime, 0x10000, 1 << 20, false});
+    REQUIRE(Access::PendingDeletes(*f.cache) == 2);
+    REQUIRE(Access::PendingDeleteBytes(*f.cache) == (u64{65} << 20));
+    Access::SetFrameTick(*f.cache, 100);
+    Access::ReleaseDeletes(*f.cache);
+    REQUIRE(Access::PendingDeletes(*f.cache) == 2);
+    f.runtime.completed_tick = 8;
+    Access::ReleaseDeletes(*f.cache);
+    REQUIRE(Access::PendingDeletes(*f.cache) == 0);
 }
