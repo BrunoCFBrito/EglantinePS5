@@ -401,14 +401,18 @@ for relative, replacements in edits.items():
     text = path.read_text()
     if MARK in text:
         continue
+    original = text
     for old, new in replacements:
-        if old not in text and new in text:
-            continue  # already applied (a file patched before this script marked it)
+        # Most replacements keep their anchor inside the new text, so the
+        # anchor alone cannot tell a patched file from a pristine one.
+        if new in text:
+            continue  # already applied (the .c files carry no MARK)
         if text.count(old) != 1:
             raise SystemExit(f'{relative}: pinned anchor changed ({text.count(old)}x): {old.strip().splitlines()[0]!r}')
         text = text.replace(old, new)
-    path.write_text(text)
-    changed = True
+    if text != original:
+        path.write_text(text)
+        changed = True
 if changed:
     receipt = root.parent / 'mihawk-vulkan-review/.deps/native/radv-release/PROVENANCE.txt'
     if source.resolve() == (root.parent / 'mihawk-vulkan-review/.deps/work/radv-src').resolve() and receipt.exists():
