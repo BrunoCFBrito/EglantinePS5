@@ -165,13 +165,23 @@ std::uintptr_t SlotAddress(SparseRange& range, std::size_t slot) noexcept {
 //   EDEN_GUEST_SWAP=2        also write cold slots to the file while the pool is low
 //   EDEN_GUEST_SWAP_FILE     the file (default /data/eglantineps5/guest-swap.bin, internal SSD)
 //   EDEN_GUEST_SWAP_MIB      the most that may be in the file (default 2048)
-//   EDEN_GUEST_SWAP_COLD_S   how long a slot stays untouched to count as cold (default 30)
-//   EDEN_GUEST_SWAP_LOW_MIB  the pool's largest free block under which cold slots go out (default 1024)
-//   EDEN_GUEST_SWAP_AHEAD_MIB=<n>  also send cold slots out while the pool's largest free block is
-//                            under n MiB, before it is low: Ocarina's pool fell 2.4 GiB -> 0.2 GiB
+//   EDEN_GUEST_SWAP_COLD_S   how long a slot stays untouched to count as cold (default 30); a slot
+//                            that came back waits twice as long each time it does (2^k x cold)
+//   EDEN_GUEST_SWAP_LOW_MIB  the pool's largest free block under which cold slots start going out
+//                            (default 1024; with AHEAD, the higher of the two is the start mark)
+//   EDEN_GUEST_SWAP_STOP_MIB the largest free block above which they stop going out (default: the
+//                            start mark + 1024); the two marks are the hysteresis that keeps the
+//                            swap from running at a pool that merely sits near one mark
+//   EDEN_GUEST_SWAP_AHEAD_MIB=<n>  start sending cold slots out while the pool's largest free block
+//                            is under n MiB, before it is low: Ocarina's pool fell 2.4 GiB -> 0.2 GiB
 //                            within 20 s at its first 3D frame, faster than cold slots leave.
+//   EDEN_GUEST_SWAP_RESERVE_MIB  blocks kept aside for reading slots back (default 32, at most 64),
+//                            so a read-back never waits for the pool, the packer or the heap
 //   EDEN_GUEST_SWAP_ALL_POOLS=1  arm every Own slot, not only the game's pool (the default, 0,
 //                            arms only the game's pool, whose place the core reports)
+// A slot is copied into a bounce buffer under its lock and written to the file without it: a guest
+// write that faults during the write cancels the trip and keeps the slot's block instead of waiting
+// for the file (2026-11-17: 337-447 ms per slot with the lock held was the 2-3 fps collapse).
 // The real GPU never sees this memory: no mapping of it has GPU flags and no Vulkan import takes it.
 // The emulated GPU, the JIT and the emulator read it with the processor, and those faults come here.
 // A system call given a pointer into a Probe or Out slot is the one path that does not fault here;
@@ -184,11 +194,15 @@ constexpr std::size_t SwapOutPerTick = 64;     // at most 64 slots (128 MiB) a t
 constexpr std::uint64_t SwapBackInPerTick = 8; // more reads back than this in a tick: a thrash guard
 constexpr std::uint32_t SwapMostPlaces = 4096; // 8 GiB of file
 constexpr std::size_t SwapAges = 8;
+constexpr unsigned SwapBackoffMax = 4;         // a slot that came back waits COLD_S << min(times, 4)
 std::atomic<int> swap_mode{0}; // 0 off, 1 measure (arm/touch), 2 file
 std::atomic<std::uint32_t> swap_tick{SwapRearmTicks + 1};
 std::uint32_t swap_cold_ticks = 15;       // EDEN_GUEST_SWAP_COLD_S, 30 s by default
 std::uint32_t swap_low_bytes_mib = 1024;  // EDEN_GUEST_SWAP_LOW_MIB
 std::size_t swap_ahead_bytes = 0;         // EDEN_GUEST_SWAP_AHEAD_MIB, 0 = only while low
+std::size_t swap_stop_bytes = std::size_t{2048} << 20; // EDEN_GUEST_SWAP_STOP_MIB, never the start + 256
+std::atomic<bool> swap_wanted{false};     // the watermarks: on under the start mark, off above the stop
+std::size_t swap_reserve_target = 16;     // EDEN_GUEST_SWAP_RESERVE_MIB / 2 MiB (32 MiB, at most 64)
 bool swap_all_pools = false;              // EDEN_GUEST_SWAP_ALL_POOLS=1: every Own slot, not only the game's pool
 std::atomic<std::uint64_t> swap_pool_first{0}, swap_pool_end{0}; // the game's pool, in slots
 std::atomic<std::size_t> swap_pool_largest{0}; // the pool's largest free block at the last tick
@@ -200,9 +214,24 @@ bool swap_checked = false; // the self-test ran this process
 std::uint32_t swap_free[SwapMostPlaces];
 std::uint32_t swap_free_count = 0, swap_next_place = 0;
 std::atomic_flag swap_lock = ATOMIC_FLAG_INIT;
+// Blocks kept for reading slots back, outside the pool's free space: a read-back that waits for
+// the pool, the packer or the heap was the 953 ms case in the 2026-11-17 logs. FillSwapReserve keeps
+// them (ReserveKeeper, every 100 ms), TakeSwapBlock takes one per SwapIn.
+constexpr std::size_t SwapReserveBlocks = 32; // 64 MiB at most
+std::int64_t swap_reserve[SwapReserveBlocks];
+std::atomic<std::size_t> swap_reserve_count{0};
+std::atomic<std::uint64_t> swap_reserve_used{0};
+std::atomic_flag swap_reserve_lock = ATOMIC_FLAG_INIT;
+// The slot's bytes, copied under its lock and written to the file after it is let go (SwapOut).
+// One writer only: the swapper thread, or the self-test before the swapper starts.
+#ifdef PS5_NATIVE
+alignas(64) std::uint8_t swap_bounce[SparseSlot];
+#endif
 struct SwapCounters {
     std::atomic<std::uint64_t> armed{0}, touched{0}, out{0}, in{0}, out_ns{0}, in_ns{0}, in_most_ns{0}, failures{0};
-    std::atomic<std::uint64_t> age[SwapAges]{}; // touches by how long the slot was armed: under 2^n ticks
+    std::atomic<std::uint64_t> copy_ns{0};        // how long the bounce copy held the slot's lock
+    std::atomic<std::uint64_t> cancelled{0};      // trips called off by a touch during the file write
+    std::atomic<std::uint64_t> age[SwapAges]{};   // touches by how long the slot was armed: under 2^n ticks
     std::atomic<std::uint64_t> returned_armed{0}; // slots given back while they were Probe
 };
 SwapCounters swap_counters;
@@ -715,6 +744,48 @@ void EmptyReserve() noexcept {
     reserve_count.store(0, std::memory_order_relaxed);
     reserve_lock.clear(std::memory_order_release);
 }
+// A block from the swap-in reserve (TakeSwapBlock): the blocks kept for reading slots back.
+bool SwapReserveBlock(std::int64_t* physical) noexcept {
+    Spin(swap_reserve_lock);
+    const std::size_t count = swap_reserve_count.load(std::memory_order_relaxed);
+    const bool ok = count > 0;
+    if (ok) {
+        *physical = swap_reserve[count - 1];
+        swap_reserve_count.store(count - 1, std::memory_order_relaxed);
+    }
+    swap_reserve_lock.clear(std::memory_order_release);
+    if (ok) swap_reserve_used.fetch_add(1, std::memory_order_relaxed);
+    return ok;
+}
+// Keeps the swap-in reserve full while the swap writes to the file: at most two blocks a call, so
+// the keeper (every 100 ms) never holds the pool for long. An overwritten block needs no zeroes.
+void FillSwapReserve() noexcept {
+    if (swap_mode.load(std::memory_order_relaxed) != 2 || swap_reserve_target == 0) return;
+    for (unsigned taken = 0; taken < 2; ++taken) {
+        Spin(swap_reserve_lock);
+        const bool full = swap_reserve_count.load(std::memory_order_relaxed) >= swap_reserve_target;
+        swap_reserve_lock.clear(std::memory_order_release);
+        if (full) return;
+        std::int64_t physical = -1;
+        if (eden_direct_low(SparseSlot, SparseSlot, 12, &physical) != 0) return;
+        Spin(swap_reserve_lock);
+        const std::size_t count = swap_reserve_count.load(std::memory_order_relaxed);
+        if (count < swap_reserve_target) {
+            swap_reserve[count] = physical;
+            swap_reserve_count.store(count + 1, std::memory_order_relaxed);
+            physical = -1;
+        }
+        swap_reserve_lock.clear(std::memory_order_release);
+        if (physical >= 0 && sceKernelReleaseDirectMemory(physical, SparseSlot) != 0) std::abort();
+    }
+}
+void EmptySwapReserve() noexcept {
+    Spin(swap_reserve_lock);
+    for (std::size_t i = 0; i < swap_reserve_count.load(std::memory_order_relaxed); ++i)
+        if (sceKernelReleaseDirectMemory(swap_reserve[i], SparseSlot) != 0) std::abort();
+    swap_reserve_count.store(0, std::memory_order_relaxed);
+    swap_reserve_lock.clear(std::memory_order_release);
+}
 #endif
 
 // One more slot shows `physical`; the first one makes it a shared block. False when the table is full.
@@ -1180,10 +1251,13 @@ bool ArmSlot(SparseRange& range, std::size_t slot, bool at_once = false) noexcep
 }
 
 // Probe -> Own: the first touch, read or write, of an armed slot. The access repeats and succeeds.
+// A touch that comes while SwapOut is writing the slot to the file calls the trip off (the swapper
+// sees the flag cleared and its file place goes back), so no guest thread waits for the disk.
 bool TouchProbe(SparseRange& range, std::size_t slot) noexcept {
     const int saved = errno;
     const bool ok = mprotect(reinterpret_cast<void*>(SlotAddress(range, slot)), SparseSlot, PROT_READ | PROT_WRITE) == 0;
     errno = saved;
+    range.swap_writing[slot].store(0, std::memory_order_release);
     if (!ok) return false;
     const std::uint32_t now = swap_tick.load(std::memory_order_relaxed), ticks = now - range.swap[slot];
     std::size_t bucket = 0;
@@ -1194,12 +1268,12 @@ bool TouchProbe(SparseRange& range, std::size_t slot) noexcept {
     return true;
 }
 
-// A 2 MiB block for a slot that comes back: its own slot's packed cache first, then the pool, then
-// the guest's reserve. Nothing here allocates.
+// A 2 MiB block for a slot that comes back: the swap's own reserve first (kept for exactly this),
+// then the unpack keep, the pool, and the guest's reserve. Nothing here allocates.
 bool TakeSwapBlock(std::int64_t* physical) noexcept {
 #ifdef PS5_NATIVE
-    return UnpackBlock(physical) || eden_direct_low(SparseSlot, SparseSlot, 12, physical) == 0 ||
-           ReserveBlock(physical);
+    return SwapReserveBlock(physical) || UnpackBlock(physical) ||
+           eden_direct_low(SparseSlot, SparseSlot, 12, physical) == 0 || ReserveBlock(physical);
 #else
     (void)physical;
     return false;
@@ -1230,27 +1304,60 @@ bool GetBlockForSwap(std::int64_t* physical) noexcept {
 #endif
 }
 
-// Probe -> Out: the slot's bytes go to the swap file and its block back to the pool. The slot is
-// locked and protected read-only while it is written, so a reader waits for the lock and a writer
-// faults and waits; a Probe slot touched meanwhile is made Own only once this is over (the fault
-// waits for the lock and finds it Out). The mapping goes away whole and the address space is
-// reserved at once, as the heap gives a block back.
+// Probe -> Out: the slot's bytes go to the swap file and its block back to the pool. The copy is
+// made into the bounce buffer under the slot's lock (a millisecond); the file write runs after the
+// lock is let go, so no guest thread waits for the disk. The slot stays readable while the write
+// runs; a write that faults meanwhile clears the slot's writing flag (TouchProbe) and makes it Own,
+// and this trip is called off: its file place goes back and the slot keeps its block. Otherwise the
+// mapping goes away whole, the address space is reserved at once, and the block goes back as the
+// heap gives one.
 bool SwapOut(SparseRange& range, std::size_t slot) noexcept {
 #ifdef PS5_NATIVE
     LockSlot(range, slot);
     std::uint32_t place = 0;
-    if (SlotState(range, slot) != SlotProbe || swap_fd < 0 || !TakeSwapPlace(&place)) {
+    if (SlotState(range, slot) != SlotProbe || swap_fd < 0 ||
+        range.swap_writing[slot].load(std::memory_order_relaxed) != 0 || !TakeSwapPlace(&place)) {
         UnlockSlot(range, slot, SlotState(range, slot));
         return false;
     }
     const std::uintptr_t at = SlotAddress(range, slot);
     const std::uint64_t start = NowNs();
     if (mprotect(reinterpret_cast<void*>(at), SparseSlot, PROT_READ) != 0) std::abort();
-    if (!SwapWrite(reinterpret_cast<const void*>(at), place)) {
-        if (mprotect(reinterpret_cast<void*>(at), SparseSlot, PROT_NONE) != 0) std::abort();
+    std::memcpy(swap_bounce, reinterpret_cast<const void*>(at), SparseSlot);
+    swap_counters.copy_ns.fetch_add(NowNs() - start, std::memory_order_relaxed);
+    range.swap_writing[slot].store(1, std::memory_order_release);
+    UnlockSlot(range, slot, SlotProbe);
+    if (!SwapWrite(swap_bounce, place)) {
+        LockSlot(range, slot);
+        const std::uint8_t state = SlotState(range, slot);
+        range.swap_writing[slot].store(0, std::memory_order_release);
+        if (state == SlotProbe) {
+            if (mprotect(reinterpret_cast<void*>(at), SparseSlot, PROT_NONE) != 0) std::abort();
+            swap_counters.failures.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            swap_counters.cancelled.fetch_add(1, std::memory_order_relaxed);
+        }
         GiveSwapPlace(place);
-        swap_counters.failures.fetch_add(1, std::memory_order_relaxed);
-        UnlockSlot(range, slot, SlotProbe);
+        UnlockSlot(range, slot, state);
+        return false;
+    }
+    LockSlot(range, slot);
+    const std::uint8_t state = SlotState(range, slot);
+    // A touch during the write cancelled it: the fault handler and TouchProbe cleared the writing
+    // flag. A write can also slip in without faulting while the scanner has the slot lent as Own
+    // (LendArmedSlot), so what the file now holds is checked against the slot's bytes before its
+    // block goes away: if the guest changed them, the trip is called off and the place goes back.
+    const bool writing = range.swap_writing[slot].exchange(0, std::memory_order_acq_rel) != 0;
+    bool same = state == SlotProbe && writing;
+    if (same) {
+        if (mprotect(reinterpret_cast<void*>(at), SparseSlot, PROT_READ) != 0) std::abort();
+        same = std::memcmp(swap_bounce, reinterpret_cast<const void*>(at), SparseSlot) == 0;
+    }
+    if (!same) {
+        if (state == SlotProbe && mprotect(reinterpret_cast<void*>(at), SparseSlot, PROT_NONE) != 0) std::abort();
+        GiveSwapPlace(place);
+        swap_counters.cancelled.fetch_add(1, std::memory_order_relaxed);
+        UnlockSlot(range, slot, state);
         return false;
     }
     const std::int64_t block = range.physical[slot];
@@ -1307,6 +1414,10 @@ bool SwapIn(SparseRange& range, std::size_t slot) noexcept {
     }
     range.physical[slot] = physical;
     range.swap[slot] = swap_tick.load(std::memory_order_relaxed);
+    // It came back: the next trip needs twice as long untouched (SwapTick), so a region the game
+    // reads once per area is not sent out again on the next tick and read back a minute later.
+    if (range.swap_times[slot].load(std::memory_order_relaxed) < 255)
+        range.swap_times[slot].fetch_add(1, std::memory_order_relaxed);
     GiveSwapPlace(place);
     guest_committed.fetch_add(SparseSlot, std::memory_order_relaxed);
     const std::uint64_t took = NowNs() - start;
@@ -1669,11 +1780,16 @@ bool AddStates(SparseRange& range) noexcept {
     auto* fine_after = fine ? new (std::nothrow) std::uint32_t[slots]() : nullptr;
     auto* aliases = fine_after && range.guest ? new (std::nothrow) std::uintptr_t[slots * AliasesPerSlot]() : nullptr;
     auto* swap = fine_after ? new (std::nothrow) std::uint32_t[slots]() : nullptr;
-    if (fine_after == nullptr || swap == nullptr || (range.guest && aliases == nullptr)) {
+    auto* swap_writing = fine_after ? new (std::nothrow) std::atomic<std::uint8_t>[slots]() : nullptr;
+    auto* swap_times = fine_after ? new (std::nothrow) std::atomic<std::uint8_t>[slots]() : nullptr;
+    if (fine_after == nullptr || swap == nullptr || swap_writing == nullptr || swap_times == nullptr ||
+        (range.guest && aliases == nullptr)) {
         delete[] state;
         delete[] fine;
         delete[] fine_after;
         delete[] swap;
+        delete[] swap_writing;
+        delete[] swap_times;
         delete[] aliases;
         return false;
     }
@@ -1681,8 +1797,13 @@ bool AddStates(SparseRange& range) noexcept {
     range.fine_after = fine_after;
     range.aliases = aliases;
     range.swap = swap;
-    for (std::size_t slot = 0; slot < slots; ++slot)
+    range.swap_writing = swap_writing;
+    range.swap_times = swap_times;
+    for (std::size_t slot = 0; slot < slots; ++slot) {
         state[slot].store(range.owned[slot].load(std::memory_order_relaxed) ? SlotOwn : SlotZero, std::memory_order_relaxed);
+        swap_writing[slot].store(0, std::memory_order_relaxed);
+        swap_times[slot].store(0, std::memory_order_relaxed);
+    }
     range.state = state;
     return true;
 }
@@ -1704,6 +1825,7 @@ void ReserveKeeper() {
         if (scanner_stop) break;
         lock.unlock();
         FillReserve();
+        FillSwapReserve();
         lock.lock();
     }
 }
@@ -2548,16 +2670,31 @@ std::thread swapper;
     const std::size_t largest = swap_pool_largest.load(std::memory_order_relaxed);
     return largest != 0 && largest < (static_cast<std::size_t>(swap_low_bytes_mib) << 20);
 }
-// Memory should leave now: the pool is low, or the caller wants headroom before it is, or an
-// allocation is failing right now.
+// Memory should leave now: the pool is under the start mark (LOW_MIB, or AHEAD_MIB when set), or
+// the caller wants headroom before it is, or an allocation is failing right now. The two marks are
+// a band: the swap starts under the start mark and stops only above the stop mark (start + 1024
+// MiB unless EDEN_GUEST_SWAP_STOP_MIB), so a pool that sits between them does not keep sending
+// slots out and reading them straight back (2026-11-17: 917 outs / 349 backs by 00:13).
 [[maybe_unused]] bool SwapWanted() noexcept {
-    if (swap_mode.load(std::memory_order_relaxed) < 2) return false;
-    if (NowNs() < swap_urgent_until_ns.load(std::memory_order_relaxed)) return true;
-    if (memory_waiters.load(std::memory_order_acquire) != 0) return true;
+    if (swap_mode.load(std::memory_order_relaxed) < 2) {
+        swap_wanted.store(false, std::memory_order_relaxed);
+        return false;
+    }
+    if (NowNs() < swap_urgent_until_ns.load(std::memory_order_relaxed) ||
+        memory_waiters.load(std::memory_order_acquire) != 0) {
+        swap_wanted.store(true, std::memory_order_relaxed);
+        return true;
+    }
     const std::size_t largest = swap_pool_largest.load(std::memory_order_relaxed);
-    if (largest == 0) return false;
-    if (largest < (static_cast<std::size_t>(swap_low_bytes_mib) << 20)) return true;
-    return swap_ahead_bytes != 0 && largest < swap_ahead_bytes;
+    // No measurement this tick: keep the last decision (the pool's figure is read just before).
+    if (largest == 0) return swap_wanted.load(std::memory_order_relaxed);
+    const std::size_t start = std::max<std::size_t>(static_cast<std::size_t>(swap_low_bytes_mib) << 20,
+                                                    swap_ahead_bytes);
+    bool wanted = swap_wanted.load(std::memory_order_relaxed);
+    if (largest < start) wanted = true;
+    else if (largest > swap_stop_bytes) wanted = false;
+    swap_wanted.store(wanted, std::memory_order_relaxed);
+    return wanted;
 }
 
 // An allocation is failing (headless/heap_arenas.inc): the swapper ticks at once and sends what
@@ -2624,6 +2761,19 @@ void ReadSwapSwitches() noexcept {
     swap_ahead_bytes = 0;
     if (const char* mib = std::getenv("EDEN_GUEST_SWAP_AHEAD_MIB"))
         swap_ahead_bytes = static_cast<std::size_t>(std::strtoul(mib, nullptr, 10)) << 20;
+    // The band: start under the higher of LOW and AHEAD, stop above the stop mark (default start +
+    // 1024 MiB, never closer than 256 MiB above the start so the two marks cannot flap).
+    const std::size_t start_bytes =
+        std::max<std::size_t>(static_cast<std::size_t>(swap_low_bytes_mib) << 20, swap_ahead_bytes);
+    std::size_t stop_bytes = start_bytes + (std::size_t{1024} << 20);
+    if (const char* mib = std::getenv("EDEN_GUEST_SWAP_STOP_MIB"))
+        stop_bytes = static_cast<std::size_t>(std::strtoul(mib, nullptr, 10)) << 20;
+    swap_stop_bytes = std::max(stop_bytes, start_bytes + (std::size_t{256} << 20));
+    swap_wanted.store(false, std::memory_order_relaxed);
+    swap_reserve_target = 16; // 32 MiB, half the array; EDEN_GUEST_SWAP_RESERVE_MIB sets it (at most 64)
+    if (const char* mib = std::getenv("EDEN_GUEST_SWAP_RESERVE_MIB"))
+        swap_reserve_target = std::min<std::size_t>(SwapReserveBlocks,
+                                                    std::strtoul(mib, nullptr, 10) / (SparseSlot >> 20));
     const char* all = std::getenv("EDEN_GUEST_SWAP_ALL_POOLS");
     swap_all_pools = all != nullptr && all[0] == '1';
 #endif
@@ -2653,21 +2803,29 @@ void SwapReport(SparseRange& range) noexcept {
     // Places in use are the slots that are Out: the free-list counters are the swapper's, not read
     // from this thread.
     const std::size_t places_used = out;
-    char line[640];
+    char line[768];
     const int length = std::snprintf(line, sizeof(line),
         "EDEN_SWAP mode=%d file=%s armed=%zuMiB out=%zuMiB in_file=%zuMiB places=%zu/%u "
-        "went_out=%llu avg_out_ms=%llu came_in=%llu avg_in_ms=%llu most_in_ms=%llu failures=%llu "
+        "went_out=%llu cancelled=%llu avg_out_ms=%llu copy_ms=%llu came_in=%llu avg_in_ms=%llu most_in_ms=%llu failures=%llu "
         "touches=%llu returned_armed=%llu untouched_30s=%zuMiB _60s=%zuMiB _120s=%zuMiB _300s=%zuMiB "
-        "pool_largest=%zuMiB ahead=%zuMiB all_pools=%d\n",
+        "pool_largest=%zuMiB low=%zuMiB stop=%zuMiB ahead=%zuMiB reserve=%zuMiB/%zuMiB used=%llu all_pools=%d\n",
         mode, swap_path, probe * (SparseSlot >> 20), out * (SparseSlot >> 20), places_used * (SparseSlot >> 20),
         places_used, static_cast<unsigned>(swap_places), (unsigned long long)outs,
-        (unsigned long long)(outs != 0 ? c.out_ns.load() / outs / 1000000 : 0), (unsigned long long)ins,
+        (unsigned long long)c.cancelled.load(),
+        (unsigned long long)(outs != 0 ? c.out_ns.load() / outs / 1000000 : 0),
+        (unsigned long long)(outs + c.cancelled.load() != 0
+                                 ? c.copy_ns.load() / (outs + c.cancelled.load()) / 1000000
+                                 : 0),
+        (unsigned long long)ins,
         (unsigned long long)(ins != 0 ? c.in_ns.load() / ins / 1000000 : 0),
         (unsigned long long)(c.in_most_ns.load() / 1000000), (unsigned long long)c.failures.load(),
         (unsigned long long)c.touched.load(), (unsigned long long)c.returned_armed.load(),
         untouched[0] * (SparseSlot >> 20), untouched[1] * (SparseSlot >> 20), untouched[2] * (SparseSlot >> 20),
         untouched[3] * (SparseSlot >> 20), swap_pool_largest.load(std::memory_order_relaxed) >> 20,
-        swap_ahead_bytes >> 20, swap_all_pools ? 1 : 0);
+        static_cast<std::size_t>(swap_low_bytes_mib), swap_stop_bytes >> 20, swap_ahead_bytes >> 20,
+        swap_reserve_count.load(std::memory_order_relaxed) * (SparseSlot >> 20),
+        swap_reserve_target * (SparseSlot >> 20),
+        (unsigned long long)swap_reserve_used.load(std::memory_order_relaxed), swap_all_pools ? 1 : 0);
     if (length > 0) Report(line);
 }
 
@@ -2779,7 +2937,12 @@ void SwapReport(SparseRange& range) noexcept {
     for (std::size_t slot = static_cast<std::size_t>(first); slot < end; ++slot) {
         if (SlotState(range, slot) != SlotProbe) continue;
         const std::uint32_t age = now - range.swap[slot];
-        if (age >= swap_cold_ticks) cold.emplace_back(-static_cast<std::int64_t>(age), slot);
+        // A slot that came back waits twice as long each time (2^k x cold): the game re-touched it
+        // after all, so the next trip must clear a much longer quiet spell (2026-11-17: 36% of the
+        // slots sent out came back, most of them within a minute).
+        const std::uint64_t cold_ticks = static_cast<std::uint64_t>(swap_cold_ticks)
+            << std::min<unsigned>(range.swap_times[slot].load(std::memory_order_relaxed), SwapBackoffMax);
+        if (age >= cold_ticks) cold.emplace_back(-static_cast<std::int64_t>(age), slot);
     }
     if (!wanted) return;
     // Many reads back in the last tick: what went out came straight back. One tick of rest, unless
@@ -3022,24 +3185,30 @@ void ServiceStart(SparseRange& range) noexcept {
         swap_urgent_wake.store(false, std::memory_order_relaxed);
         swap_given_back.store(0, std::memory_order_relaxed);
         swapped_to_file.store(0, std::memory_order_relaxed);
+        swap_reserve_used.store(0, std::memory_order_relaxed);
         for (auto& word : swap_ever_out) word.store(0, std::memory_order_relaxed);
         for (auto* counter : {&swap_counters.armed, &swap_counters.touched, &swap_counters.out, &swap_counters.in,
                               &swap_counters.out_ns, &swap_counters.in_ns, &swap_counters.in_most_ns,
-                              &swap_counters.failures, &swap_counters.returned_armed})
+                              &swap_counters.failures, &swap_counters.cancelled, &swap_counters.copy_ns,
+                              &swap_counters.returned_armed})
             counter->store(0, std::memory_order_relaxed);
         for (auto& age : swap_counters.age) age.store(0, std::memory_order_relaxed);
+        if (swap_mode.load(std::memory_order_relaxed) == 2)
+            for (std::size_t i = 0; i < SwapReserveBlocks / 2; ++i) FillSwapReserve(); // the read-back reserve
         try {
             swapper = std::thread(SwapLoop, &range);
         } catch (...) {
             swap_mode.store(1, std::memory_order_relaxed);
             Report("EDEN_SWAP no thread for the swapper: measuring only from now on\n");
         }
-        char swap_line[256];
+        char swap_line[320];
         const int swap_length = std::snprintf(swap_line, sizeof(swap_line),
-            "EDEN_SWAP on: mode=%d file=%s places=%u cold=%us low=%uMiB ahead=%zuMiB all_pools=%d\n",
+            "EDEN_SWAP on: mode=%d file=%s places=%u cold=%us low=%uMiB stop=%zuMiB ahead=%zuMiB reserve=%zuMiB"
+            " all_pools=%d\n",
             swap_mode.load(std::memory_order_relaxed), swap_path, static_cast<unsigned>(swap_places),
             static_cast<unsigned>(swap_cold_ticks * SwapTickMs / 1000), static_cast<unsigned>(swap_low_bytes_mib),
-            swap_ahead_bytes >> 20, swap_all_pools ? 1 : 0);
+            swap_stop_bytes >> 20, swap_ahead_bytes >> 20, swap_reserve_target * (SparseSlot >> 20),
+            swap_all_pools ? 1 : 0);
         if (swap_length > 0) Report(swap_line);
     }
 #endif
@@ -3072,6 +3241,7 @@ void ServiceStop(SparseRange& range) noexcept {
     // Packed data goes with the range (ReleaseServiceBlocks drops what is still packed after this).
 #ifdef PS5_NATIVE
     EmptyReserve();
+    EmptySwapReserve();
     CloseSwapFile();
 #endif
 }

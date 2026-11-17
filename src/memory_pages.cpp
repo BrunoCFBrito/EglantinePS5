@@ -307,8 +307,12 @@ struct SparseRange {
     // (guest_memory_service.inc, AliasesPerSlot entries each; src/host_memory.cpp, Window64).
     std::uintptr_t* aliases = nullptr;
     // The swap (guest_memory_service.inc): per slot, the swap tick it was last touched (Own) or
-    // armed (Probe), or its place in the swap file while it is Out.
+    // armed (Probe), or its place in the swap file while it is Out. swap_writing says its bytes are
+    // being written to the file (a touch then cancels the trip); swap_times how often it came back
+    // (the cold age it must reach doubles each time).
     std::uint32_t* swap = nullptr;
+    std::atomic<std::uint8_t>* swap_writing = nullptr;
+    std::atomic<std::uint8_t>* swap_times = nullptr;
 };
 std::array<SparseRange, 64> sparse_ranges;
 std::mutex sparse_mutex;
@@ -602,6 +606,10 @@ void ReleaseSparse(SparseRange& range) {
     range.aliases = nullptr;
     delete[] range.swap;
     range.swap = nullptr;
+    delete[] range.swap_writing;
+    range.swap_writing = nullptr;
+    delete[] range.swap_times;
+    range.swap_times = nullptr;
     range.begin.store(0, std::memory_order_release);
     delete[] range.owned;
     delete[] range.physical;
