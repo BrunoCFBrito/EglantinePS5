@@ -170,13 +170,13 @@ std::uintptr_t SlotAddress(SparseRange& range, std::size_t slot) noexcept {
 //   EDEN_GUEST_SWAP_AHEAD_MIB=<n>  also send cold slots out while the pool's largest free block is
 //                            under n MiB, before it is low: Ocarina's pool fell 2.4 GiB -> 0.2 GiB
 //                            within 20 s at its first 3D frame, faster than cold slots leave.
-//   EDEN_GUEST_SWAP_ALL_POOLS=0  arm only the game's pool (needs the core's eden_guest_swap_pool);
-//                            default 1 arms every Own slot (see the risk note in ServiceStart)
+//   EDEN_GUEST_SWAP_ALL_POOLS=1  arm every Own slot, not only the game's pool (the default, 0,
+//                            arms only the game's pool, whose place the core reports)
 // The real GPU never sees this memory: no mapping of it has GPU flags and no Vulkan import takes it.
 // The emulated GPU, the JIT and the emulator read it with the processor, and those faults come here.
 // A system call given a pointer into a Probe or Out slot is the one path that does not fault here;
-// the fork this comes from copies IPC buffers in the core (its patch 0125), which this tree does
-// not have yet, so EDEN_GUEST_SWAP defaults to off.
+// the core copies IPC read buffers while this runs (hle_ipc.cpp, eden_guest_swap_active) and says
+// where the game's pool lies (kernel.cpp, eden_guest_swap_pool); until it has, nothing is armed.
 constexpr unsigned SwapTickMs = 2000;
 constexpr std::uint32_t SwapRearmTicks = 8;    // a touched slot stays Own this long (16 s)
 constexpr std::size_t SwapArmShare = 8;        // an eighth of the slots is looked at each tick
@@ -189,7 +189,7 @@ std::atomic<std::uint32_t> swap_tick{SwapRearmTicks + 1};
 std::uint32_t swap_cold_ticks = 15;       // EDEN_GUEST_SWAP_COLD_S, 30 s by default
 std::uint32_t swap_low_bytes_mib = 1024;  // EDEN_GUEST_SWAP_LOW_MIB
 std::size_t swap_ahead_bytes = 0;         // EDEN_GUEST_SWAP_AHEAD_MIB, 0 = only while low
-bool swap_all_pools = true;               // EDEN_GUEST_SWAP_ALL_POOLS=0: only the game's pool
+bool swap_all_pools = false;              // EDEN_GUEST_SWAP_ALL_POOLS=1: every Own slot, not only the game's pool
 std::atomic<std::uint64_t> swap_pool_first{0}, swap_pool_end{0}; // the game's pool, in slots
 std::atomic<std::size_t> swap_pool_largest{0}; // the pool's largest free block at the last tick
 std::uint32_t swap_places = 1024;              // places in the file (EDEN_GUEST_SWAP_MIB / 2 MiB)
@@ -2452,7 +2452,7 @@ void ReadSwapSwitches() noexcept {
     if (const char* mib = std::getenv("EDEN_GUEST_SWAP_AHEAD_MIB"))
         swap_ahead_bytes = static_cast<std::size_t>(std::strtoul(mib, nullptr, 10)) << 20;
     const char* all = std::getenv("EDEN_GUEST_SWAP_ALL_POOLS");
-    swap_all_pools = all == nullptr || all[0] != '0';
+    swap_all_pools = all != nullptr && all[0] == '1';
 #endif
 }
 
@@ -2832,10 +2832,9 @@ void ServiceStart(SparseRange& range) noexcept {
 #ifdef PS5_NATIVE
     keeper = std::thread(ReserveKeeper);
     // A check that failed leaves the swap off; in measure mode a drive that cannot be written does
-    // not. The core's IPC buffers are not copied around Probe/Out slots in this tree (the fork's
-    // patch 0125 is not here), so all pools are armed by default and a game that passes such a
-    // pointer straight to a system call can see EFAULT: EDEN_GUEST_SWAP_ALL_POOLS=0 waits for a
-    // core that says where the game's pool lies (eden_guest_swap_pool).
+    // not. The core copies IPC read buffers around Probe/Out slots (hle_ipc.cpp) and says where
+    // the game's pool lies (kernel.cpp), so only that pool is armed by default;
+    // EDEN_GUEST_SWAP_ALL_POOLS=1 arms every Own slot instead, to measure them.
     if (swap_mode.load(std::memory_order_relaxed) != 0 && (!swap_checked || std::strcmp(swap_refused, "ok") != 0)) {
         if (!swap_checked) Report("EDEN_SWAP the self-test did not run: the swap stays off\n");
         swap_mode.store(0, std::memory_order_relaxed);
@@ -2948,15 +2947,15 @@ void ReleaseServiceBlocks(SparseRange& range) noexcept {
 } // namespace
 
 // Whether a slot may be without a mapping (Probe, Out): a system call must not be given a pointer
-// into the guest's memory then. The fork's core copies IPC buffers while this is true (its patch
-// 0125); this tree has no such hook yet, which is why EDEN_GUEST_SWAP is off by default.
+// into the guest's memory then. The core copies IPC read buffers while this is true (hle_ipc.cpp,
+// CopiedIfSwapping).
 extern "C" bool eden_guest_swap_active(void) noexcept {
     return swap_mode.load(std::memory_order_relaxed) != 0;
 }
 
-// Where the game's pool lies in the guest's backing, when the guest's kernel says so (the fork's
-// patch 0182). Whole slots only: a slot it shares with the applets' pool stays unarmed unless
-// EDEN_GUEST_SWAP_ALL_POOLS=1 (the default here).
+// Where the game's pool lies in the guest's backing, when the guest's kernel says so (kernel.cpp,
+// InitializeMemoryLayout). Whole slots only: a slot it shares with the applets' pool stays unarmed
+// unless EDEN_GUEST_SWAP_ALL_POOLS=1.
 extern "C" void eden_guest_swap_pool(std::uint64_t offset, std::uint64_t bytes) noexcept {
     swap_pool_first.store((offset + SparseSlot - 1) / SparseSlot, std::memory_order_relaxed);
     swap_pool_end.store((offset + bytes) / SparseSlot, std::memory_order_relaxed);
