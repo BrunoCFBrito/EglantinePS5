@@ -30,6 +30,12 @@ EDEN_NX2_FENCE_BATCH=1
 #EDEN_NX2_FRAMES_AHEAD=1
 
 # --- Workarounds / Debug ---
+# Report a smaller total memory size to the game (MiB) while the pool, SetHeapSize and every map
+# keep the real 9,809 MiB: the title sizes its heap, and the SDK its freed-page cache, from this
+# figure only. 9216 is the 9 GiB hardware/native-runner value. The report is lifted back to the
+# pool for the rest of the session once used memory comes within 64 MiB of it. Off unless set.
+#EDEN_NX2_REPORTED_TOTAL_MIB=9216
+
 # Terrain/indirect drawing fix for Donkey Kong Bananza: enabled by default. Set to 0 only to leave to GPU.
 #EDEN_NX2_RESETFIX=0
 

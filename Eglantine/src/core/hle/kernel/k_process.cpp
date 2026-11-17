@@ -9,6 +9,8 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
+#include <cstdlib>
 #include <random>
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -907,6 +909,63 @@ size_t KProcess::GetUsedUserPhysicalMemorySize(KernelCore& kernel) const {
     return norm_size + other_size + sec_size;
 }
 
+namespace {
+// EDEN_NX2_REPORTED_TOTAL_MIB=<MiB>: the total memory size svcGetInfo reports to the guest, when it
+// is smaller than the process's real pool. The resource limit, SetHeapSize and every map keep the
+// pool, so nothing that fitted before is refused; the figure only changes what the title budgets
+// its heap and its freed-page cache from. Unset or 0 reports the pool itself.
+size_t GetReportedTotalMemoryCap() {
+    static const size_t cap = [] {
+        const char* value = std::getenv("EDEN_NX2_REPORTED_TOTAL_MIB");
+        if (value == nullptr || *value == '\0') {
+            return size_t{0};
+        }
+        return static_cast<size_t>(std::strtoull(value, nullptr, 10)) << 20;
+    }();
+    return cap;
+}
+} // namespace
+
+size_t KProcess::GetReportedTotalMemorySize(size_t real_total, size_t used_size,
+                                            bool non_system) const {
+    // Report a smaller total while the pool stays as it is (BananaNative's rule, dm/host/hle_svc.c:
+    // "only the report changes ... a memory read whose used memory comes within 64 MiB of the
+    // reported total lifts it to the pool for the session"). The report must never fall below live
+    // usage: a game that sizes a heap from the total would otherwise be handed a figure it has
+    // already passed, so once used memory is within the margin the real total is reported for the
+    // rest of the session.
+    const size_t cap = GetReportedTotalMemoryCap();
+    if (cap == 0 || cap >= real_total) {
+        return real_total;
+    }
+    constexpr size_t LiftMargin = 64 * 1024 * 1024;
+    if (m_reported_total_lifted.load(std::memory_order_relaxed)) {
+        return real_total;
+    }
+    if (used_size + LiftMargin > cap) {
+        if (!m_reported_total_lifted.exchange(true, std::memory_order_relaxed)) {
+            std::fprintf(stderr,
+                         "EDEN_SVC_MEMORY reported_total lifted %lluMiB -> %lluMiB: used %lluMiB "
+                         "is within 64MiB of the report (%s), so the pool is reported for the rest "
+                         "of the session\n",
+                         static_cast<unsigned long long>(cap >> 20),
+                         static_cast<unsigned long long>(real_total >> 20),
+                         static_cast<unsigned long long>(used_size >> 20),
+                         non_system ? "TotalNonSystemMemorySize" : "TotalMemorySize");
+        }
+        return real_total;
+    }
+    if (!m_reported_total_logged.exchange(true, std::memory_order_relaxed)) {
+        std::fprintf(stderr,
+                     "EDEN_SVC_MEMORY reported_total=%lluMiB of pool=%lluMiB used=%lluMiB "
+                     "(EDEN_NX2_REPORTED_TOTAL_MIB; SetHeapSize and maps keep the pool)\n",
+                     static_cast<unsigned long long>(cap >> 20),
+                     static_cast<unsigned long long>(real_total >> 20),
+                     static_cast<unsigned long long>(used_size >> 20));
+    }
+    return cap;
+}
+
 size_t KProcess::GetTotalUserPhysicalMemorySize(KernelCore& kernel) const {
     // Get the amount of free and used size.
     const size_t free_size =
@@ -924,9 +983,10 @@ size_t KProcess::GetTotalUserPhysicalMemorySize(KernelCore& kernel) const {
     // NOTE: These function calls will recalculate, introducing a race...it is unclear why Nintendo
     // does it this way.
     if (used_size + free_size > max_size) {
-        return max_size;
+        return this->GetReportedTotalMemorySize(max_size, used_size, false);
     } else {
-        return free_size + this->GetUsedUserPhysicalMemorySize(kernel);
+        return this->GetReportedTotalMemorySize(
+            free_size + this->GetUsedUserPhysicalMemorySize(kernel), used_size, false);
     }
 }
 
@@ -950,13 +1010,19 @@ size_t KProcess::GetTotalNonSystemUserPhysicalMemorySize(KernelCore& kernel) con
     const size_t other_size = m_code_size + m_main_thread_stack_size;
     const size_t sec_size = this->GetRequiredSecureMemorySize();
     const size_t used_size = norm_size + other_size + sec_size;
+    // The non-system total excludes the secure resource, and so does UsedNonSystemMemorySize; the
+    // margin is checked against the figure the guest compares the total with.
+    const size_t non_system_used_size = norm_size + other_size;
 
     // NOTE: These function calls will recalculate, introducing a race...it is unclear why Nintendo
     // does it this way.
     if (used_size + free_size > max_size) {
-        return max_size - this->GetRequiredSecureMemorySizeNonDefault();
+        return this->GetReportedTotalMemorySize(
+            max_size - this->GetRequiredSecureMemorySizeNonDefault(), non_system_used_size, true);
     } else {
-        return free_size + this->GetUsedNonSystemUserPhysicalMemorySize(kernel);
+        return this->GetReportedTotalMemorySize(
+            free_size + this->GetUsedNonSystemUserPhysicalMemorySize(kernel), non_system_used_size,
+            true);
     }
 }
 

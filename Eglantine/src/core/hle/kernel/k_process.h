@@ -121,6 +121,10 @@ private:
 
     std::atomic<s64> m_cpu_time{};
     std::atomic_bool m_mkw_dynamic_fps_patch_applied{};
+    // EDEN_NX2_REPORTED_TOTAL_MIB: whether the reported total has been lifted back to the real pool
+    // because used memory came within 64 MiB of it, and whether the boot line has been printed.
+    mutable std::atomic_bool m_reported_total_lifted{};
+    mutable std::atomic_bool m_reported_total_logged{};
     std::atomic<s64> m_num_process_switches{};
     std::atomic<s64> m_num_thread_switches{};
     std::atomic<s64> m_num_fpu_switches{};
@@ -569,6 +573,11 @@ public:
     void DoWorkerTaskImpl(KernelCore& kernel);
 
 private:
+    /// Applies EDEN_NX2_REPORTED_TOTAL_MIB to a total memory size (svcGetInfo TotalMemorySize and
+    /// TotalNonSystemMemorySize): report the cap, but never below live usage plus 64 MiB, and lift
+    /// the report to the real pool for the rest of the session once used memory comes that close.
+    size_t GetReportedTotalMemorySize(size_t real_total, size_t used_size, bool non_system) const;
+
     void ChangeState(KernelCore& kernel, State new_state) {
         if (m_state != new_state) {
             m_state = new_state;
