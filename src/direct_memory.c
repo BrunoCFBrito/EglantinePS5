@@ -21,6 +21,7 @@
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <time.h>
 
 int __real_sceKernelAllocateDirectMemory(int64_t, int64_t, size_t, size_t, int, int64_t *);
@@ -40,8 +41,69 @@ static void eden_direct_acquire(void) {
 }
 static void eden_direct_release(void) { atomic_flag_clear_explicit(&eden_direct_lock, memory_order_release); }
 
+/* Who takes and gives back direct memory, by call site, printed with EDEN_MEMORY every 10 s
+ * (eden_direct_report): a pool split into hundreds of holes is made by many small gives back
+ * between blocks that stay. The cost of placing blocks at the top is counted too: every try
+ * there is a call to the system. */
+#define EDEN_DIRECT_SITES 64
+struct eden_direct_site {
+  uintptr_t caller;
+  unsigned long count;
+  unsigned long bytes;
+};
+static struct eden_direct_site eden_direct_takes[EDEN_DIRECT_SITES], eden_direct_gives[EDEN_DIRECT_SITES];
+static atomic_flag eden_direct_sites_lock = ATOMIC_FLAG_INIT;
+static atomic_ulong eden_direct_high_calls, eden_direct_high_tries, eden_direct_high_ns, eden_direct_take_rounds;
+
+static void eden_direct_note(struct eden_direct_site *sites, const void *caller, size_t size) {
+  const uintptr_t at = (uintptr_t)caller;
+  while (atomic_flag_test_and_set_explicit(&eden_direct_sites_lock, memory_order_acquire)) {}
+  for (unsigned i = 0; i < EDEN_DIRECT_SITES; ++i) {
+    if (sites[i].caller == at || sites[i].caller == 0 || i == EDEN_DIRECT_SITES - 1) {
+      sites[i].caller = sites[i].caller == 0 ? at : sites[i].caller; /* the last entry takes the rest */
+      sites[i].count++;
+      sites[i].bytes += size;
+      break;
+    }
+  }
+  atomic_flag_clear_explicit(&eden_direct_sites_lock, memory_order_release);
+}
+
+static unsigned long eden_direct_now_ns(void) {
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  return (unsigned long)now.tv_sec * 1000000000ul + (unsigned long)now.tv_nsec;
+}
+
+static void eden_direct_print(FILE *out, const char *name, struct eden_direct_site *sites) {
+  struct eden_direct_site copy[EDEN_DIRECT_SITES];
+  while (atomic_flag_test_and_set_explicit(&eden_direct_sites_lock, memory_order_acquire)) {}
+  for (unsigned i = 0; i < EDEN_DIRECT_SITES; ++i) copy[i] = sites[i];
+  atomic_flag_clear_explicit(&eden_direct_sites_lock, memory_order_release);
+  for (unsigned shown = 0; shown < 8; ++shown) {
+    unsigned best = EDEN_DIRECT_SITES;
+    for (unsigned i = 0; i < EDEN_DIRECT_SITES; ++i)
+      if (copy[i].count != 0 && (best == EDEN_DIRECT_SITES || copy[i].count > copy[best].count)) best = i;
+    if (best == EDEN_DIRECT_SITES) break;
+    /* Offsets as EDEN_HEAP_SITE prints them (the code is loaded at 0x400000). */
+    fprintf(out, "%s n=%lu MiB=%lu site=%lx\n", name, copy[best].count, copy[best].bytes >> 20,
+            (unsigned long)(copy[best].caller - 0x400000ul));
+    copy[best].count = 0;
+  }
+}
+
+void eden_direct_report(FILE *out) {
+  fprintf(out, "EDEN_DIRECT top_placements=%lu tries=%lu ms=%lu retry_rounds=%lu\n",
+          atomic_load_explicit(&eden_direct_high_calls, memory_order_relaxed),
+          atomic_load_explicit(&eden_direct_high_tries, memory_order_relaxed),
+          atomic_load_explicit(&eden_direct_high_ns, memory_order_relaxed) / 1000000ul,
+          atomic_load_explicit(&eden_direct_take_rounds, memory_order_relaxed));
+  eden_direct_print(out, "EDEN_DIRECT_TAKE", eden_direct_takes);
+  eden_direct_print(out, "EDEN_DIRECT_GIVE", eden_direct_gives);
+}
+
 /* Memory from as high in the pool as there is room; from anywhere when the top has none. */
-int eden_direct_high(size_t size, size_t alignment, int type, int64_t *start) {
+static int eden_direct_high_place(size_t size, size_t alignment, int type, int64_t *start) {
   const int64_t total = sceKernelGetDirectMemorySize();
   const int64_t bytes = (int64_t)size;
   if (bytes <= 0 || total <= 0) return __real_sceKernelAllocateDirectMemory(0, total, size, alignment, type, start);
@@ -59,6 +121,7 @@ int eden_direct_high(size_t size, size_t alignment, int type, int64_t *start) {
   for (unsigned tries = 0; tries < 512 && next >= bytes; ++tries) {
     const int64_t at = (next - bytes) / EDEN_DIRECT_STEP * EDEN_DIRECT_STEP;
     next = at;
+    atomic_fetch_add_explicit(&eden_direct_high_tries, 1, memory_order_relaxed);
     if (__real_sceKernelAllocateDirectMemory(at, at + bytes, size, alignment, type, start) == 0) {
       eden_direct_floor = at;
       eden_direct_release();
@@ -69,8 +132,22 @@ int eden_direct_high(size_t size, size_t alignment, int type, int64_t *start) {
   return __real_sceKernelAllocateDirectMemory(0, total, size, alignment, type, start);
 }
 
+static int eden_direct_high_timed(size_t size, size_t alignment, int type, int64_t *start) {
+  const unsigned long began = eden_direct_now_ns();
+  const int result = eden_direct_high_place(size, alignment, type, start);
+  atomic_fetch_add_explicit(&eden_direct_high_calls, 1, memory_order_relaxed);
+  atomic_fetch_add_explicit(&eden_direct_high_ns, eden_direct_now_ns() - began, memory_order_relaxed);
+  return result;
+}
+
+int eden_direct_high(size_t size, size_t alignment, int type, int64_t *start) {
+  eden_direct_note(eden_direct_takes, __builtin_return_address(0), size);
+  return eden_direct_high_timed(size, alignment, type, start);
+}
+
 /* As the system places it: for what a session takes and gives back. */
 int eden_direct_low(size_t size, size_t alignment, int type, int64_t *start) {
+  eden_direct_note(eden_direct_takes, __builtin_return_address(0), size);
   return __real_sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), size, alignment, type, start);
 }
 
@@ -109,21 +186,23 @@ extern void eden_guest_memory_urgent(void) __attribute__((weak));
  * blocks never come this way (eden_direct_low), so it cannot recurse. */
 static atomic_int eden_direct_making;
 static int eden_direct_high_take(size_t size, size_t alignment, int type, int64_t *start) {
-  int result = eden_direct_high(size, alignment, type, start);
+  int result = eden_direct_high_timed(size, alignment, type, start);
   for (unsigned round = 0; result != 0 && round < 8 && eden_memory_recover_try != NULL; ++round) {
+    atomic_fetch_add_explicit(&eden_direct_take_rounds, 1, memory_order_relaxed);
     if (eden_guest_memory_urgent != NULL) eden_guest_memory_urgent();
     if (atomic_fetch_add_explicit(&eden_direct_making, 1, memory_order_acq_rel) == 0)
       (void)eden_memory_recover_try(size + ((size_t)16 << 20));
     atomic_fetch_sub_explicit(&eden_direct_making, 1, memory_order_acq_rel);
     const struct timespec pause = {0, 10000000};
     nanosleep(&pause, NULL);
-    result = eden_direct_high(size, alignment, type, start);
+    result = eden_direct_high_timed(size, alignment, type, start);
   }
   return result;
 }
 
 int __wrap_sceKernelAllocateDirectMemory(int64_t from, int64_t to, size_t size, size_t alignment, int type,
                                          int64_t *start) {
+  eden_direct_note(eden_direct_takes, __builtin_return_address(0), size);
   /* A thread's stack or the driver's zero block, asked for anywhere in the pool; and the
    * driver's command ring and marker page. */
   if (from == 0 && start && to >= sceKernelGetDirectMemorySize() &&
@@ -135,6 +214,7 @@ int __wrap_sceKernelAllocateDirectMemory(int64_t from, int64_t to, size_t size, 
 int __wrap_sceKernelReleaseDirectMemory(int64_t start, size_t size) {
   const int result = __real_sceKernelReleaseDirectMemory(start, size);
   if (result != 0) return result;
+  eden_direct_note(eden_direct_gives, __builtin_return_address(0), size);
   eden_direct_acquire();
   if (size == EDEN_DIRECT_SMALL && eden_direct_floor != 0 && start >= eden_direct_floor &&
       eden_direct_hole_count < sizeof(eden_direct_holes) / sizeof(eden_direct_holes[0]))

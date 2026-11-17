@@ -530,31 +530,57 @@ extern "C" std::int32_t sceKernelAvailableDirectMemorySize(std::int64_t, std::in
                                                            std::size_t*);
 // The allocated region at or after an offset (flag 1: find the next one).
 struct DirectMemoryRegion { std::int64_t start; std::int64_t end; std::int32_t type; };
+// Who takes and gives back direct memory, by call site (src/direct_memory.c).
+extern "C" void eden_direct_report(FILE* out) __attribute__((weak));
 extern "C" std::int32_t sceKernelDirectMemoryQuery(std::int64_t, int, DirectMemoryRegion*, std::size_t);
 
 // All the pool's free memory and the holes it lies in, from its allocated regions. Against the
-// largest free block it tells how much of the pool is holes between allocations. False: the
-// regions could not be read.
-struct DirectMemoryHoles { std::int64_t free; unsigned holes; unsigned regions; };
+// largest free block it tells how much of the pool is holes between allocations. `usable`: the
+// whole 2 MiB pieces in those holes, what the graphics driver can build a buffer from when no run
+// is long enough (radv_ps5_memory_alloc_pieces). False: the regions could not be read.
+struct DirectMemoryHoles { std::int64_t free; std::int64_t usable; unsigned holes; unsigned regions; };
 static bool ReadDirectMemoryHoles(std::int64_t total, DirectMemoryHoles& out) {
+    constexpr std::int64_t piece = std::int64_t{2} << 20;
     out = {};
+    const auto hole = [&out](std::int64_t from, std::int64_t to) {
+        out.free += to - from;
+        ++out.holes;
+        const std::int64_t first = (from + piece - 1) / piece * piece, last = to / piece * piece;
+        if (last > first) out.usable += last - first;
+    };
     std::int64_t offset = 0;
     DirectMemoryRegion region{};
     while (offset < total && out.regions < 8192 &&
            sceKernelDirectMemoryQuery(offset, 1, &region, sizeof(region)) == 0 && region.end > offset) {
-        if (region.start > offset) {
-            out.free += region.start - offset;
-            ++out.holes;
-        }
+        if (region.start > offset) hole(offset, region.start);
         offset = region.end;
         ++out.regions;
     }
     if (out.regions == 0) return false;
-    if (offset < total) {
-        out.free += total - offset;
-        ++out.holes;
-    }
+    if (offset < total) hole(offset, total);
     return true;
+}
+
+// What "free" means for the caches' pool view (ViewOfPool): the usable pieces above, read again
+// every 500 ms. The largest free block alone stayed far under the short mark once the pool had
+// split into hundreds of holes (Ocarina of Time: 1.6 GiB free, largest block 22 MiB), so the
+// caches gave memory back at their hardest for the rest of the session while the driver could
+// still have used that memory. EDEN_POOL_SHORT_LARGEST=1 restores the largest-block rule.
+static std::size_t UsableFreeMemory(std::int64_t total, std::size_t largest, long long now) {
+    static const bool by_largest = [] {
+        const char* const text = std::getenv("EDEN_POOL_SHORT_LARGEST");
+        return text != nullptr && text[0] == '1';
+    }();
+    if (by_largest) return largest;
+    static std::atomic<long long> read_ns{0};
+    static std::atomic<std::size_t> usable{0};
+    if (now - read_ns.load(std::memory_order_relaxed) >= 500'000'000) {
+        read_ns.store(now, std::memory_order_relaxed);
+        DirectMemoryHoles holes{};
+        usable.store(ReadDirectMemoryHoles(total, holes) ? static_cast<std::size_t>(holes.usable) : 0,
+                     std::memory_order_relaxed);
+    }
+    return std::max(largest, usable.load(std::memory_order_relaxed));
 }
 #endif
 
@@ -608,7 +634,7 @@ static void RefreshFreeMemory() {
     const bool known = total > 0 && sceKernelAvailableDirectMemorySize(0, total, 0x4000, &start, &largest) == 0;
     std::size_t held = 0, target = 0;
     if (eden_guest_memory_reserve) eden_guest_memory_reserve(&held, &target);
-    const PoolView view = ViewOfPool(known, largest, held, target);
+    const PoolView view = ViewOfPool(known, known ? UsableFreeMemory(total, largest, now) : 0, held, target);
     largest_free_block.store(known ? (view.free != 0 ? view.free : 1) : 0, std::memory_order_relaxed);
     graphics_memory_short.store(view.short_memory, std::memory_order_relaxed);
     // The pool, the guest's memory and the heap in stderr.log every 20 s, to see what holds it.
@@ -621,10 +647,12 @@ static void RefreshFreeMemory() {
         DirectMemoryHoles holes{};
         const bool read_holes = total > 0 && ReadDirectMemoryHoles(total, holes);
         std::fprintf(stderr, "EDEN_MEMORY pool largest free block %zu MiB, short=%d; the guest's memory holds %zu MiB"
-                     " (the kernel maps %llu MiB); free %lld MiB in %u holes, %u regions\n",
+                     " (the kernel maps %llu MiB); free %lld MiB (%lld MiB in 2 MiB pieces) in %u holes, %u regions\n",
                      largest >> 20, int(view.short_memory), guest_held >> 20,
                      kernel_memory ? kernel_memory() >> 20 : 0ULL,
-                     read_holes ? static_cast<long long>(holes.free >> 20) : -1LL, holes.holes, holes.regions);
+                     read_holes ? static_cast<long long>(holes.free >> 20) : -1LL,
+                     read_holes ? static_cast<long long>(holes.usable >> 20) : -1LL, holes.holes, holes.regions);
+        if (eden_direct_report) eden_direct_report(stderr);
         std::fprintf(stderr, "EDEN_MEMORY_PARTS t=%lld driver_mib=%llu guest_held_mib=%zu guest_span_mib=%zu\n",
                      now / 1'000'000'000,
                      &eden_radv_private_radv_ps5_allocated_bytes != nullptr
