@@ -124,6 +124,20 @@ public:
 
     bool CanReportMemoryUsage() const;
 
+    /// Images stopped fitting in device memory: keep new textures smaller.
+    void OnDeviceMemoryPressure();
+
+    /// How many times the size cap went down so far (ShrinkOversized looks again after each).
+    u64 SizeCapSteps() const;
+
+    /// The pressure has been gone for a while: new textures may be larger again, up to the
+    /// configured size.
+    void OnDeviceMemoryRelief();
+
+    /// Whether an image made now from `info` would keep fewer levels than one made with
+    /// `host_level_offset` (the size cap went down since).
+    bool TrimsFurther(const VideoCommon::ImageInfo& info, u32 host_level_offset) const;
+
     /// The largest width and height a scaled image may take: the device's 2D image and
     /// framebuffer limits (16384 on AMD).
     u32 GetMaxScaledExtent() const noexcept;

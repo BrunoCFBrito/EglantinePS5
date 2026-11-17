@@ -437,40 +437,104 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
     return device.GetDeviceLocalMemory() < (u64{7} << 30) ? (u64{256} << 20) : (u64{512} << 20);
 }
 
+// Largest side Switch 2 textures keep (see TrimmedHostInfoLevels); lowered while the shared pool
+// is short (TextureCacheRuntime::OnDeviceMemoryPressure, EDEN_NX2_TEX_POOL_MIPS=1).
+std::atomic<u32> g_max_native_texture_side{2048};
+// The size it starts from (EDEN_NX2_TEX_MAX_SIDE), which relief returns it to at most.
+std::atomic<u32> g_configured_native_texture_side{2048};
+// Times the cap went down (TextureCacheRuntime::SizeCapSteps).
+std::atomic<u64> g_texture_side_cuts{0};
+
+// EDEN_NX2_TEX_POOL_MIPS=1: the shared pool decides how large Switch 2 textures may be. Off
+// (unset), textures keep their whole size, as before.
+[[nodiscard]] bool PoolTextureMipsEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_TEX_POOL_MIPS");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
 // The host shape of an image whose decoded copy would not fit in VRAM: a GPU-decoded ASTC array
 // over 1 GiB as RGBA8 (title 1's 8192x8192x68 ASTC 8x8 virtual textures are 24 GB each) keeps only
 // its mip levels from `level_offset` on, so host mip 0 is guest mip `level_offset`. Normalized
 // coordinates and derivative LOD still address it correctly; explicit LODs sample one level lower.
+// `quiet` skips the log lines: TextureCacheRuntime::TrimsFurther asks what a new image would keep.
+[[nodiscard]] ImageInfo TrimmedHostInfoLevels(const Device& device, const ImageInfo& info,
+                                              u32& level_offset, bool quiet = false);
+
 [[nodiscard]] ImageInfo TrimmedHostInfo(const Device& device, const ImageInfo& info, u32& level_offset) {
+    return TrimmedHostInfoLevels(device, info, level_offset);
+}
+
+[[nodiscard]] ImageInfo TrimmedHostInfoLevels(const Device& device, const ImageInfo& info,
+                                              u32& level_offset, bool quiet) {
     level_offset = 0;
-    if (!WillUseAcceleratedAstcDecode(device, info) || info.type != ImageType::e2D) {
-        return info;
-    }
-    const auto decoded_bytes = [&](u32 skip) {
-        u64 bytes = 0;
-        for (s32 level = static_cast<s32>(skip); level < static_cast<s32>(HostMipCount(info));
-             ++level) {
-            bytes += u64{(std::max)(info.size.width >> level, 1U)} *
-                     (std::max)(info.size.height >> level, 1U) * 4;
-        }
-        return bytes * info.resources.layers;
+    const bool is_2d = info.type == ImageType::e2D;
+    const bool decoded_on_gpu = is_2d && WillUseAcceleratedAstcDecode(device, info);
+    const bool transcoded_on_gpu = is_2d && WillUseGpuBcnTranscode(device, info);
+    const u32 levels = HostMipCount(info);
+    const auto host_info = [&] {
+        ImageInfo host = info;
+        host.size.width = (std::max)(info.size.width >> level_offset, 1U);
+        host.size.height = (std::max)(info.size.height >> level_offset, 1U);
+        host.resources.levels -= static_cast<s32>(level_offset);
+        return host;
     };
-    if (decoded_bytes(0) <= (u64{1} << 30)) {
-        return info;
+    // EDEN_NX2_TEX_CAP_ALL=0 keeps the pool's size cap to textures the GPU decodes. By default it
+    // also covers compressed textures the CPU converts or uploads as they are (ASTC decoded on the
+    // CPU, BCn the GPU reads as it is): the PS5 reads BCn itself, so those skipped the cap and
+    // kept their full size however short memory was (Ocarina's towns, 2026-11-15). Render targets
+    // are never compressed, so none is touched.
+    static const bool cap_all = [] {
+        const char* const value = std::getenv("EDEN_NX2_TEX_CAP_ALL");
+        return value == nullptr || value[0] != '0';
+    }();
+    const bool cpu_compressed = PoolTextureMipsEnabled() && cap_all && is_2d &&
+                                info.num_samples == 1 && !decoded_on_gpu && !transcoded_on_gpu &&
+                                (IsPixelFormatASTC(info.format) || IsPixelFormatBCn(info.format));
+    if (PoolTextureMipsEnabled() && (decoded_on_gpu || transcoded_on_gpu || cpu_compressed)) {
+        // Switch 2 textures keep at most g_max_native_texture_side texels a side; a 4K texture is
+        // held from its next mip level on (a quarter of the memory and decode work). The game's
+        // own mips are used, so nothing is resampled. EDEN_NX2_TEX_MAX_SIDE sets the size it
+        // starts from, and EDEN_NS2_FULL_TEXTURES=1 keeps them whole.
+        const u32 max_native_size = g_max_native_texture_side.load(std::memory_order_relaxed);
+        static const bool full_textures = std::getenv("EDEN_NS2_FULL_TEXTURES") != nullptr;
+        if (info.native_tiling && !full_textures) {
+            while (level_offset + 1 < levels &&
+                   (std::max)(info.size.width >> level_offset, info.size.height >> level_offset) >
+                       max_native_size) {
+                ++level_offset;
+            }
+        }
     }
-    const u64 limit = TrimmedAstcArrayLimit(device);
-    while (level_offset + 1 < static_cast<u32>(HostMipCount(info)) &&
-           decoded_bytes(level_offset) > limit) {
-        ++level_offset;
+    if (decoded_on_gpu) {
+        // A decoded ASTC array too large even at the cap keeps only levels from the array limit on.
+        const auto decoded_bytes = [&](u32 skip) {
+            u64 bytes = 0;
+            for (s32 level = static_cast<s32>(skip); level < static_cast<s32>(levels); ++level) {
+                bytes += u64{(std::max)(info.size.width >> level, 1U)} *
+                         (std::max)(info.size.height >> level, 1U) * 4;
+            }
+            return bytes * info.resources.layers;
+        };
+        if (decoded_bytes(level_offset) > (u64{1} << 30)) {
+            const u64 limit = TrimmedAstcArrayLimit(device);
+            while (level_offset + 1 < levels && decoded_bytes(level_offset) > limit) {
+                ++level_offset;
+            }
+            if (!quiet) {
+                LOG_WARNING(Render_Vulkan,
+                            "{}x{}x{} ASTC image would be {} MiB decoded; keeping mip levels {}+ "
+                            "({}x{})",
+                            info.size.width, info.size.height, info.resources.layers,
+                            decoded_bytes(0) >> 20, level_offset,
+                            (std::max)(info.size.width >> level_offset, 1U),
+                            (std::max)(info.size.height >> level_offset, 1U));
+            }
+        }
     }
-    ImageInfo host = info;
-    host.size.width = (std::max)(info.size.width >> level_offset, 1U);
-    host.size.height = (std::max)(info.size.height >> level_offset, 1U);
-    host.resources.levels -= static_cast<s32>(level_offset);
-    LOG_WARNING(Render_Vulkan, "{}x{}x{} ASTC image would be {} MiB decoded; keeping mip levels {}+ ({}x{})",
-                info.size.width, info.size.height, info.resources.layers, decoded_bytes(0) >> 20,
-                level_offset, host.size.width, host.size.height);
-    return host;
+    return level_offset != 0 ? host_info() : info;
 }
 
 [[nodiscard]] bool IsCubeCompatible(const Device& device, const ImageInfo& info) {
@@ -1315,6 +1379,21 @@ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& sched
       resolution{Settings::values.resolution_info} {
     // Before anything below reads astc_recompression (passes, view formats).
     UseBc3ForSwitch2OnSmallCards(device);
+    // EDEN_NX2_TEX_MAX_SIDE=<512..4096> (unset: 2048): the largest side Switch 2 textures keep
+    // from the start. The pool halves it later anyway, but only for textures made after that:
+    // Ocarina's first area loads ran out with the big ones already in. Only used with
+    // EDEN_NX2_TEX_POOL_MIPS=1 (TextureCacheRuntime::OnDeviceMemoryPressure).
+    if (const char* const side = std::getenv("EDEN_NX2_TEX_MAX_SIDE")) {
+        const u32 asked = static_cast<u32>(std::strtoul(side, nullptr, 10));
+        if (asked != 0) {
+            const u32 clamped = std::clamp(asked, 512U, 4096U);
+            g_max_native_texture_side.store(clamped, std::memory_order_relaxed);
+            g_configured_native_texture_side.store(clamped, std::memory_order_relaxed);
+            LOG_INFO(Render_Vulkan,
+                     "EDEN_NX2_TEX_MAX_SIDE: Switch 2 textures keep at most {} texels a side",
+                     clamped);
+        }
+    }
     // Huge ASTC arrays always decode on the GPU (IsHugeAstcArray), whatever the decode setting.
     if (Settings::values.accelerate_astc.GetValue() == Settings::AstcDecodeMode::Gpu ||
         !device.IsOptimalAstcSupported()) {
@@ -2879,6 +2958,52 @@ bool TextureCacheRuntime::IsFree(u64 tick) const noexcept {
     return scheduler.IsFree(tick);
 }
 
+void TextureCacheRuntime::OnDeviceMemoryPressure() {
+    // The pool stayed short (TextureCache::TickFrame, EDEN_NX2_TEX_POOL_MIPS=1): new Switch 2
+    // textures keep one mip level less, down to EDEN_NX2_TEX_MIN_SIDE (unset: 256) texels a side.
+    // The texture cache may make them again smaller after each step (ShrinkOversized).
+    static const u32 MinSide = [] {
+        const char* const value = std::getenv("EDEN_NX2_TEX_MIN_SIDE");
+        const u32 asked =
+            value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 256U;
+        return std::clamp(asked == 0 ? 256U : asked, 128U, 2048U);
+    }();
+    const u32 side = g_max_native_texture_side.load(std::memory_order_relaxed);
+    if (side > MinSide) {
+        const u32 smaller = (std::max)(side / 2, MinSide);
+        g_max_native_texture_side.store(smaller, std::memory_order_relaxed);
+        g_texture_side_cuts.fetch_add(1, std::memory_order_relaxed);
+        LOG_WARNING(Render_Vulkan,
+                    "Out of device memory: Switch 2 textures keep at most {} texels a side",
+                    smaller);
+    }
+}
+
+u64 TextureCacheRuntime::SizeCapSteps() const {
+    return g_texture_side_cuts.load(std::memory_order_relaxed);
+}
+
+bool TextureCacheRuntime::TrimsFurther(const VideoCommon::ImageInfo& info,
+                                       u32 host_level_offset) const {
+    u32 level_offset = 0;
+    (void)TrimmedHostInfoLevels(device, info, level_offset, true);
+    return level_offset > host_level_offset;
+}
+
+void TextureCacheRuntime::OnDeviceMemoryRelief() {
+    // The pool has been normal for a while: new textures may get a mip level back, up to the size
+    // EDEN_NX2_TEX_MAX_SIDE asked for (2048 by default).
+    const u32 side = g_max_native_texture_side.load(std::memory_order_relaxed);
+    const u32 configured = g_configured_native_texture_side.load(std::memory_order_relaxed);
+    if (side < configured) {
+        const u32 raised = (std::min)(side * 2, configured);
+        g_max_native_texture_side.store(raised, std::memory_order_relaxed);
+        LOG_INFO(Render_Vulkan,
+                 "Memory pressure gone: Switch 2 textures keep at most {} texels a side again",
+                 raised);
+    }
+}
+
 u64 TextureCacheRuntime::GetDeviceMemoryBudget() const {
     return device.GetDeviceMemoryBudget();
 }
@@ -3271,7 +3396,22 @@ void Image::UploadMemory(VkBuffer buffer, VkDeviceSize offset,
         return;
     }
     boost::container::small_vector<VideoCommon::BufferImageCopy, 16> host_copies;
-    if (HostMipLevels() < static_cast<u32>(info.resources.levels)) {
+    if (host_level_offset != 0) {
+        // The copies name guest mip levels (UnswizzleImage, ConvertImage, the BC transcode and
+        // DMA all build them from the guest image): the host image holds only the levels from
+        // host_level_offset on (TrimmedLevels), as its own levels 0 and up.
+        host_copies.reserve(copies.size());
+        for (VideoCommon::BufferImageCopy copy : copies) {
+            if (copy.image_subresource.base_level < static_cast<s32>(host_level_offset)) {
+                continue;
+            }
+            copy.image_subresource.base_level -= static_cast<s32>(host_level_offset);
+            host_copies.push_back(copy);
+        }
+        copies = host_copies;
+        if (copies.empty())
+            return;
+    } else if (HostMipLevels() < static_cast<u32>(info.resources.levels)) {
         VideoCommon::AppendHostMipEntries(
             copies, host_copies, HostMipLevels(),
             [](const auto& copy) { return copy.image_subresource.base_level; });
@@ -5270,9 +5410,18 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     Image& image, const StagingBufferRef& map,
     std::span<const VideoCommon::SwizzleParameters> swizzles) {
     const ImageInfo& info = image.info;
-    const u32 width = info.size.width;
-    const u32 height = info.size.height;
-    const u32 levels = static_cast<u32>(HostMipCount(info));
+    // The host image may hold only the guest levels from host_level_offset on (TrimmedHostInfo):
+    // the staging data and swizzles then start at that level, and host level 0 is that level.
+    const u32 skip = image.host_level_offset;
+    const u32 width = (std::max)(info.size.width >> skip, 1U);
+    const u32 height = (std::max)(info.size.height >> skip, 1U);
+    const u32 levels = static_cast<u32>(HostMipCount(info)) - skip;
+    // Each layer of the staging buffer is that guest mip chain tail (TextureCache::
+    // UploadImageContents), so layers step by its size and not by the guest layer stride.
+    const u32 input_layer_stride =
+        skip != 0 ? info.layer_stride - static_cast<u32>(
+                                             VideoCommon::FullUploadSwizzles(info)[skip].buffer_offset)
+                  : info.layer_stride;
     const u32 layers = static_cast<u32>(info.resources.layers);
     // The BC encoder declares layout(rgba8). Identical byte layout is not enough:
     // its storage image view must have the matching R8G8B8A8_UNORM format.
@@ -5508,7 +5657,9 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
             .buffer_row_length = blocks_x * 4,
             .buffer_image_height = blocks_y * 4,
             .image_subresource{
-                .base_level = static_cast<s32>(level),
+                // Guest levels: UploadMemory drops the ones below host_level_offset and renames
+                // the rest as host levels.
+                .base_level = static_cast<s32>(level + skip),
                 .base_layer = 0,
                 .num_layers = static_cast<s32>(layers),
             },
@@ -5523,8 +5674,10 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     // was past the decode, and two textures' blocks met in one buffer (Lichii PR #1796).
     auto output = staging_buffer_pool.Request(total, MemoryUsage::DeviceLocal, true);
 
-    const u64 layer_stride = info.layer_stride;
-    const size_t guest_size = image.guest_size_bytes;
+    const u64 layer_stride = input_layer_stride;
+    const size_t guest_size = skip != 0
+                                  ? static_cast<size_t>(input_layer_stride) * layers
+                                  : image.guest_size_bytes;
     for (u32 base = 0; base < layers; base += batch) {
         const u32 count = (std::min)(batch, layers - base);
         // The swizzles describe one layer's levels and the decoder steps layer_stride per layer
@@ -5541,7 +5694,7 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
                 : (std::min)(static_cast<size_t>(u64{count} * layer_stride),
                              guest_size - (std::min)(guest_size, guest_offset));
         astc_decoder_pass->AssembleInto(
-            batch_info, 0, batch_size,
+            batch_info, skip, batch_size,
             ASTCDecoderPass::Target{
                 .image = *pending.image,
                 .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
