@@ -637,6 +637,9 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
                         ci.arrayLayers, static_cast<u32>(ci.format));
         }
         pressure_events.fetch_add(1, std::memory_order_relaxed);
+        // A driver allocation was refused (see graphics_memory_refusals): the pipeline cache's
+        // on-demand eviction runs when it sees one.
+        ::Eden::Performance::graphics_memory_refusals.fetch_add(1, std::memory_order_relaxed);
         VmaAllocationCreateInfo relaxed = alloc_ci;
         relaxed.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
         result = vmaCreateImage(allocator, &ci, &relaxed, &handle, &allocation, &alloc_info);
@@ -686,6 +689,7 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
     }
     if (result != VK_SUCCESS) {
         failed_images.fetch_add(1, std::memory_order_relaxed);
+        ::Eden::Performance::graphics_memory_refusals.fetch_add(1, std::memory_order_relaxed);
         static u32 failed_logged{};
         if (failed_logged == 0) {
             // What ran out: the device's heaps or the host's commit. Before the error line,
@@ -907,6 +911,9 @@ VkResult MemoryAllocator::AllocateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
             // The texture cache answers each pressure event by keeping more device memory free.
             // Upload and download buffers live in host memory on a discrete GPU, so they only
             // count when the heaps are shared or the buffer asked for device-local memory.
+            // The pipeline cache's on-demand eviction answers the refusal itself, whatever the
+            // usage (see graphics_memory_refusals).
+            ::Eden::Performance::graphics_memory_refusals.fetch_add(1, std::memory_order_relaxed);
             if (device.IsIntegrated() || usage == MemoryUsage::DeviceLocal ||
                 usage == MemoryUsage::Stream) {
                 pressure_events.fetch_add(1, std::memory_order_relaxed);
@@ -919,6 +926,7 @@ VkResult MemoryAllocator::AllocateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
             });
         }
         if (result != VK_SUCCESS) {
+            ::Eden::Performance::graphics_memory_refusals.fetch_add(1, std::memory_order_relaxed);
             return result;
         }
     }
@@ -981,6 +989,7 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
     VkResult created = vmaCreateBufferWithAlignment(allocator, &ci, &alloc_ci, min_alignment, &handle,
                                            &allocation, &alloc_info);
     if (created != VK_SUCCESS) {
+        ::Eden::Performance::graphics_memory_refusals.fetch_add(1, std::memory_order_relaxed);
         VmaAllocationCreateInfo outside_budget = alloc_ci;
         outside_budget.flags &= ~static_cast<VmaAllocationCreateFlags>(VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT);
         created = vmaCreateBufferWithAlignment(allocator, &ci, &outside_budget, min_alignment, &handle,

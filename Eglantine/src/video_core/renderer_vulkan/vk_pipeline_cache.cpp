@@ -2188,8 +2188,16 @@ namespace {
 // holds ~0.45 MB of driver memory, and the first eviction came only at frame 9,000 with up to
 // 2,000 unused prebuilt ones exempt, so Ocarina of Time's 1,805-1,920 pipelines (~850 MiB) were
 // all resident, and untouchable, when the shared pool ran out at the first area load (166 s).
-// Under pressure the age and the prebuilt budget shrink, so what a session no longer uses goes
-// back while the game still needs the pool.
+//
+// That pool then stays under its critical mark for minutes at a time (largest free block 2-70 MiB
+// in the measured runs), and the pressure rules that shrank the age to 240 frames used it as their
+// trigger: 2,137-2,906 pipelines were destroyed over the two runs while the game was still
+// loading, the game rebuilt ~684 of them in 10 s on entering a field (a full GPU-thread
+// translation, ~8.5 ms each) and the GPU thread fell to 1-4 fps. Eviction is therefore on demand
+// (area-load report, 2026-11-17): a pass runs only when the driver refused an allocation since the
+// last frame or the pool's largest free block is under its low mark, takes at most 64 pipelines,
+// waits 300 frames, leaves every pipeline a draw used in the last 600 frames alone, and keeps
+// 1,024 resident. The timed 9,000-frame pass is unchanged.
 struct EvictionLimits {
     /// A pipeline unused for this long is destroyed
     u64 after_frames;
@@ -2199,28 +2207,47 @@ struct EvictionLimits {
     const char* reason;
 };
 
-EvictionLimits CurrentEvictionLimits(bool critical, bool short_memory) {
-    if (critical) {
-        return {.after_frames = 240, .max_unused_prebuilt = 96, .reason = "critical"};
-    }
-    if (short_memory) {
-        return {.after_frames = 1200, .max_unused_prebuilt = 384, .reason = "short"};
-    }
-    // One unused for this long is destroyed; rebuilding it later requires a full GPU-thread shader
-    // translation (~8.5 ms each) plus a driver pipeline cache hit.
-    return {.after_frames = 9000, .max_unused_prebuilt = 2000, .reason = "scheduled"};
+/// The timed pass: one unused for this long is destroyed; rebuilding it later requires a full
+/// GPU-thread shader translation (~8.5 ms each) plus a driver pipeline cache hit.
+constexpr EvictionLimits ScheduledEvictLimits{.after_frames = 9000,
+                                              .max_unused_prebuilt = 2000,
+                                              .reason = "scheduled"};
+/// The on-demand pass: only what a session has not used for 600 frames goes, and the prebuilt
+/// budget is the one the old critical tier had: an evicted pipeline built from the disk cache at
+/// boot is exactly what the game rebuilds when it reaches that content.
+constexpr EvictionLimits PressureEvictLimits{.after_frames = 600,
+                                             .max_unused_prebuilt = 96,
+                                             .reason = "pressure"};
+
+/// An on-demand pass runs in the middle of a frame, so it destroys at most this many pipelines:
+/// each is a driver destroy on the GPU thread, and the game may rebuild it.
+constexpr size_t PressureEvictPassLimit = 64;
+/// The first frame an on-demand pass may run again, so a pool that stays low does not make every
+/// frame walk the whole cache.
+constexpr u64 PressureEvictCooldownFrames = 300;
+/// An on-demand pass never takes the cache below this many pipelines: 1,024 at the measured
+/// ~0.45 MB each is ~460 MiB, the ~400 MiB of driver memory the live set needs resident. Going
+/// lower is what turned an area load into evict/rebuild churn.
+constexpr size_t PressureEvictFloorPipelines = 1024;
+
+/// EDEN_PIPE_EVICT_PRESSURE=0 turns the on-demand pass off; the timed 9,000-frame one stays.
+bool PressureEvictionEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_PIPE_EVICT_PRESSURE");
+        const bool enabled = value == nullptr || value[0] != '0' || value[1] != '\0';
+        if (!enabled) {
+            LOG_INFO(Render_Vulkan,
+                     "EDEN_PIPE_EVICT_PRESSURE=0: pipeline pressure eviction is off");
+        }
+        return enabled;
+    }();
+    return enabled;
 }
 
-/// A pass the pool prompted runs in the middle of a frame, so it evicts at most this many
-/// pipelines: each is a driver destroy on the GPU thread.
-constexpr size_t CriticalEvictPassLimit = 512;
-/// The first frame a critical pass may run again, so a pool that stays critical does not make
-/// every frame walk the whole cache.
-constexpr u64 CriticalEvictCooldownFrames = 300;
-
-/// EDEN_PIPE_EVICT: what a pass evicted and the rules it used, at most every 2 s so a long critical
-/// stretch does not flood the log.
-void ReportPipeEvict(size_t evicted, const EvictionLimits& limits, size_t left) {
+/// EDEN_PIPE_EVICT: what a pass evicted and the rules it used, at most every 2 s so a long low
+/// stretch does not flood the log. `rebuilt` counts the session's evicted pipelines the game has
+/// built again: beside the evictions it makes thrash visible (evicted vs rebuilt).
+void ReportPipeEvict(size_t evicted, const EvictionLimits& limits, size_t left, u64 rebuilt) {
     static std::mutex mutex;
     static u64 total{};
     static bool printed{};
@@ -2234,9 +2261,10 @@ void ReportPipeEvict(size_t evicted, const EvictionLimits& limits, size_t left) 
     printed = true;
     last = now;
     std::fprintf(stderr,
-                 "EDEN_PIPE_EVICT evicted=%zu total=%llu after_frames=%llu max_unused_prebuilt=%zu "
-                 "reason=%s left=%zu\n",
+                 "EDEN_PIPE_EVICT evicted=%zu total=%llu rebuilt=%llu after_frames=%llu "
+                 "max_unused_prebuilt=%zu reason=%s left=%zu\n",
                  evicted, static_cast<unsigned long long>(total),
+                 static_cast<unsigned long long>(rebuilt),
                  static_cast<unsigned long long>(limits.after_frames), limits.max_unused_prebuilt,
                  limits.reason, left);
 }
@@ -2469,6 +2497,13 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
     if (!pipeline) {
         return nullptr;
     }
+    // A key an eviction pass took, built again: count it for EDEN_PIPE_EVICT (evicted vs rebuilt),
+    // so a load that thrashes shows it. Only a lookup that created the entry can be one: an entry
+    // that stayed in the cache was never evicted, and the pool-OOM retry above builds a null entry
+    // the cache kept.
+    if (is_new && evicted_keys.erase(graphics_key.Hash()) != 0) {
+        ++evicted_rebuilds;
+    }
     constexpr auto save_interval = std::chrono::seconds{15};
     if (used_this_session.insert(pipeline.get()).second &&
         std::chrono::steady_clock::now() - used_pipelines_saved > save_interval) {
@@ -2507,26 +2542,39 @@ void PipelineCache::TickFrame() {
            retired_compute_pipelines.front().second->IsBuildTaskDone()) {
         retired_compute_pipelines.pop_front();
     }
-    // The pool's pressure once a frame: the eviction rules below and the pipeline memory gate in
-    // Create*Pipeline read it, here and on the shader workers. The probe behind it takes paths of
-    // this thread's and refreshes at most every 100 ms, so one sample a frame is all the gate can
-    // use and all the eviction rules need.
-    const bool critical = ::Eden::Performance::GraphicsMemoryIsCritical();
-    pool_critical.store(critical, std::memory_order_relaxed);
-    pool_short.store(::Eden::Performance::GraphicsMemoryIsShort(), std::memory_order_relaxed);
+    // The pool's pressure once a frame: the pipeline memory gate in Create*Pipeline reads it, here
+    // and on the shader workers. The probe behind it takes paths of this thread's and refreshes at
+    // most every 100 ms, so one sample a frame is all the gate can use.
+    pool_critical.store(::Eden::Performance::GraphicsMemoryIsCritical(), std::memory_order_relaxed);
+    // The timed pass, unchanged: once every 600 frames, what the session has not used for 9,000.
     constexpr u64 EvictCheckFrames = 600;
     if (frame_count % EvictCheckFrames == 0) {
-        // This pass walks the whole cache with the same pressure rules, so it also serves as the
-        // prompted pass the cooldown would allow.
-        evict_critical_next_frame = frame_count + CriticalEvictCooldownFrames;
         EvictUnusedPipelines(EvictionPass::Scheduled);
-    } else if (critical && frame_count >= evict_critical_next_frame) {
-        // The pool has just turned critical, in the middle of an area load that needs the memory
-        // now (Ocarina of Time's first load ended the session before the scheduled pass, 600
-        // frames away, ever ran). Prompt passes are capped and spaced by the cooldown.
-        evict_critical_next_frame = frame_count + CriticalEvictCooldownFrames;
-        EvictUnusedPipelines(EvictionPass::Critical);
+        return;
     }
+    // The on-demand pass: only a driver allocation refused since the last frame (latched until a
+    // pass can run) or the pool's largest free block under its low mark lets it run. The old rule
+    // read the critical mark, which an area load holds for minutes, and destroyed thousands of
+    // pipelines the game rebuilt (see EvictionLimits). One pass per frame at most, at most every
+    // 300 frames, at most 64 pipelines and never below 1,024 resident (EvictUnusedPipelines).
+    if (!PressureEvictionEnabled()) {
+        return;
+    }
+    const u64 refusals =
+        ::Eden::Performance::graphics_memory_refusals.load(std::memory_order_relaxed);
+    if (refusals != refusals_seen) {
+        refusals_seen = refusals;
+        pressure_refused = true;
+    }
+    if (!pressure_refused && !::Eden::Performance::GraphicsMemoryIsLow()) {
+        return;
+    }
+    if (frame_count < evict_pressure_next_frame) {
+        return;
+    }
+    pressure_refused = false;
+    evict_pressure_next_frame = frame_count + PressureEvictCooldownFrames;
+    EvictUnusedPipelines(EvictionPass::Pressure);
 }
 
 void PipelineCache::EvictUnusedPipelines(EvictionPass pass) {
@@ -2542,48 +2590,92 @@ void PipelineCache::EvictUnusedPipelines(EvictionPass pass) {
         return;
     }
     // Each built pipeline holds ~0.45 MB of driver memory and none was ever destroyed, so it grew
-    // with every place a session went (title 1: 1,500 on its title screen alone). The age and the
-    // prebuilt budget follow the pool (CurrentEvictionLimits): under pressure the memory a session
-    // no longer uses goes back while the game still needs the pool.
-    const EvictionLimits limits{CurrentEvictionLimits(
-        pool_critical.load(std::memory_order_relaxed),
-        pool_short.load(std::memory_order_relaxed))};
+    // with every place a session went (title 1: 1,500 on its title screen alone). The timed pass
+    // keeps the old 9,000-frame rule; the on-demand one is capped, cooled down and floored, and
+    // only runs when the pool prompts it (TickFrame).
+    const EvictionLimits& limits{
+        pass == EvictionPass::Pressure ? PressureEvictLimits : ScheduledEvictLimits};
     if (frame_count <= limits.after_frames) {
         return;
     }
     const u64 cutoff = frame_count - limits.after_frames;
     const u64 tick = scheduler.CurrentTick();
-    // A pass the pool prompted runs in the middle of a frame: it walks and destroys at most
-    // CriticalEvictPassLimit pipelines, and the next one waits for the cooldown.
-    const size_t budget = pass == EvictionPass::Critical
-                              ? CriticalEvictPassLimit
-                              : std::numeric_limits<size_t>::max();
     size_t kept_prebuilt = 0;
     size_t evicted = 0;
-    for (auto it = graphics_cache.begin(); it != graphics_cache.end() && evicted < budget;) {
+    // One pipeline out of the cache: its key hash is remembered so EDEN_PIPE_EVICT can count the
+    // build that follows (a rebuild), and the pointer slots a rebuild can reuse are kept.
+    const auto evict = [&](auto it) {
         GraphicsPipeline* const pipeline = it->second.get();
-        if (pipeline == nullptr || pipeline == current_pipeline || !pipeline->IsBuilt() ||
-            pipeline->LastUse() >= cutoff) {
-            ++it;
-            continue;
-        }
-        // A pipeline built from the disk cache at boot that no draw has used yet stays, up to a
-        // budget: evicting it throws the prebuild away, and the game translates it again on the
-        // GPU thread when it reaches that content (OoT: 1174 of 1346 evicted on the title screen,
-        // 684 rebuilt in 10 s on entering the field). Past the budget they go like the rest, so a
-        // large cache can't hold their driver memory for the whole session.
-        if (!pipeline->WasUsed() && kept_prebuilt < limits.max_unused_prebuilt) {
-            ++kept_prebuilt;
-            ++it;
-            continue;
-        }
         if (used_this_session.erase(pipeline) != 0) {
             used_and_evicted.insert(it->first.Hash());
         }
+        evicted_keys.insert(it->first.Hash());
         evicted_pointer_slots.Remember(it->first.Hash(), pipeline->MappedPointers());
         evicted_pipelines.emplace_back(tick, std::move(it->second));
-        it = graphics_cache.erase(it);
         ++evicted;
+        return graphics_cache.erase(it);
+    };
+    if (pass == EvictionPass::Scheduled) {
+        // The timed pass takes every pipeline past the age, so there is no cap, floor or order.
+        for (auto it = graphics_cache.begin(); it != graphics_cache.end();) {
+            GraphicsPipeline* const pipeline = it->second.get();
+            if (pipeline == nullptr || pipeline == current_pipeline || !pipeline->IsBuilt() ||
+                pipeline->LastUse() >= cutoff) {
+                ++it;
+                continue;
+            }
+            // A pipeline built from the disk cache at boot that no draw has used yet stays, up to a
+            // budget: evicting it throws the prebuild away, and the game translates it again on the
+            // GPU thread when it reaches that content (OoT: 1174 of 1346 evicted on the title
+            // screen, 684 rebuilt in 10 s on entering the field). Past the budget they go like the
+            // rest, so a large cache can't hold their driver memory for the whole session.
+            if (!pipeline->WasUsed() && kept_prebuilt < limits.max_unused_prebuilt) {
+                ++kept_prebuilt;
+                ++it;
+                continue;
+            }
+            it = evict(it);
+        }
+    } else {
+        // The on-demand pass takes the used pipelines a draw has not touched for longest first, and
+        // the unused prebuilt ones past the budget only when no used one is left in the pass: a
+        // pipeline the session has moved past is the cheaper loss, while an evicted prebuilt one is
+        // exactly what the game rebuilds at the next area (see above).
+        struct Candidate {
+            u64 last_use;
+            bool used;
+            GraphicsPipelineCacheKey key;
+        };
+        std::vector<Candidate> candidates;
+        for (auto it = graphics_cache.begin(); it != graphics_cache.end(); ++it) {
+            GraphicsPipeline* const pipeline = it->second.get();
+            if (pipeline == nullptr || pipeline == current_pipeline || !pipeline->IsBuilt() ||
+                pipeline->LastUse() >= cutoff) {
+                continue;
+            }
+            if (!pipeline->WasUsed() && kept_prebuilt < limits.max_unused_prebuilt) {
+                ++kept_prebuilt;
+                continue;
+            }
+            candidates.push_back(
+                {.last_use = pipeline->LastUse(), .used = pipeline->WasUsed(), .key = it->first});
+        }
+        std::ranges::sort(candidates, [](const Candidate& a, const Candidate& b) {
+            if (a.used != b.used) {
+                return a.used;
+            }
+            return a.last_use < b.last_use;
+        });
+        for (const Candidate& candidate : candidates) {
+            if (evicted >= PressureEvictPassLimit ||
+                graphics_cache.size() <= PressureEvictFloorPipelines) {
+                break;
+            }
+            const auto it = graphics_cache.find(candidate.key);
+            if (it != graphics_cache.end()) {
+                evict(it);
+            }
+        }
     }
     if (evicted == 0) {
         return;
@@ -2595,7 +2687,7 @@ void PipelineCache::EvictUnusedPipelines(EvictionPass pass) {
     }
     LOG_INFO(Render_Vulkan, "Evicted {} graphics pipelines unused for {} frames ({}), {} left",
              evicted, limits.after_frames, limits.reason, graphics_cache.size());
-    ReportPipeEvict(evicted, limits, graphics_cache.size());
+    ReportPipeEvict(evicted, limits, graphics_cache.size(), evicted_rebuilds);
 }
 
 /// Returns `pipeline` when it is built or the current draw must wait for it, and nullptr when the

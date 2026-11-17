@@ -589,6 +589,12 @@ inline std::atomic<void (*)()> guest_pool_report{nullptr};
 // caches evict at half the use they were set to. dev-settings graphics_usage=driver restores
 // the driver's count.
 inline std::atomic<unsigned long long (*)()> graphics_memory_free{nullptr};
+// A driver allocation was refused (vulkan_memory_allocator.cpp): VMA's budget check turned the
+// request down and it only went through outside the budget, or the image or buffer could not be
+// made at all after the guest's memory service gave memory back. The pipeline cache latches one
+// until its next on-demand eviction pass (vk_pipeline_cache.cpp): the pool being "critical" is not
+// that trigger, as it lasts minutes in an area load.
+inline std::atomic<unsigned long long> graphics_memory_refusals{0};
 inline std::atomic<bool> graphics_usage_from_pool{true};
 // The pool is short now (the probe above): the texture collector then collects as if past its
 // first mark. Switch 2 titles set the marks near the driver's device memory, which on the console
@@ -608,6 +614,15 @@ inline constexpr std::size_t kCriticalMemory = kShortMemory / 2;
 inline bool GraphicsMemoryIsCritical() {
     const auto free = graphics_memory_free.load(std::memory_order_relaxed);
     return free && free() < kCriticalMemory;
+}
+// The pipeline cache's own on-demand mark: under this much free (half the critical mark) the pool
+// is low enough to run a capped, cooled-down eviction pass, as a refused driver allocation is. The
+// critical mark alone made it evict 2,137-2,906 pipelines over minutes of an area load, ~684 of
+// which the game rebuilt in 10 s at a field entrance (area-load report, 2026-11-17).
+inline constexpr std::size_t kLowMemory = kCriticalMemory / 2;
+inline bool GraphicsMemoryIsLow() {
+    const auto free = graphics_memory_free.load(std::memory_order_relaxed);
+    return free && free() < kLowMemory;
 }
 // GPU thread only (the collector).
 inline bool KeepDirtyTextures() {

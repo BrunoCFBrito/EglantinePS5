@@ -312,28 +312,37 @@ private:
     GraphicsPipelineCacheKey graphics_key{};
     GraphicsPipeline* current_pipeline{};
 
-    /// Why an eviction pass ran. The pool's pressure sets the age and the prebuilt budget, and a
-    /// pass the pool prompted is capped: it runs on the GPU thread in the middle of a frame.
+    /// Why an eviction pass ran. The timed pass is the 9,000-frame one; the on-demand pass runs on
+    /// the GPU thread in the middle of a frame, so it is capped and cooled down (see TickFrame).
     enum class EvictionPass {
-        Scheduled, ///< The 600-frame check
-        Critical,  ///< The pool is critical and the last prompted pass is past its cooldown
+        Scheduled, ///< The 600-frame check (pipelines unused for 9,000 frames)
+        Pressure,  ///< The pool is low or the driver refused an allocation (see TickFrame)
     };
     /// Destroys graphics pipelines unused for a while, once the GPU is done with them.
     void EvictUnusedPipelines(EvictionPass pass);
     /// The pool's pressure, sampled once a frame on the GPU thread (the probe behind it is
-    /// throttled to 100 ms and takes paths of the GPU thread's): the eviction rules above read
-    /// them, and the pipeline memory gate in the .cpp does from any thread.
-    std::atomic<bool> pool_short{false};
+    /// throttled to 100 ms and takes paths of the GPU thread's): the pipeline memory gate in the
+    /// .cpp reads it from any thread.
     std::atomic<bool> pool_critical{false};
     u64 frame_count{};
-    /// The first frame a critical eviction pass may run again (see TickFrame)
-    u64 evict_critical_next_frame{};
+    /// The first frame an on-demand eviction pass may run again (see TickFrame)
+    u64 evict_pressure_next_frame{};
+    /// graphics_memory_refusals' value at the last TickFrame, and whether a refusal since then
+    /// still wants an on-demand pass (it waits for the pass's cooldown to end)
+    u64 refusals_seen{};
+    bool pressure_refused{};
     /// Wait budget of native draws for unbuilt pipelines left in this frame, in microseconds
     /// (native_async_draws = Bounded). Only touched on the GPU thread; reset in TickFrame.
     s64 native_wait_budget_us{8000};
     s64 native_wait_used_us{}; ///< Budget spent since the last 10 s log line.
     std::deque<std::pair<u64, std::unique_ptr<GraphicsPipeline>>> evicted_pipelines; ///< (tick, pipeline)
     std::unordered_set<u64> used_and_evicted; ///< Key hashes of pipelines used this session, evicted since
+    /// Key hashes of pipelines an eviction pass took, until one is built again (a rebuild, counted
+    /// for EDEN_PIPE_EVICT). GPU thread only.
+    std::unordered_set<u64> evicted_keys;
+    /// Rebuilds of evicted pipelines this session: EDEN_PIPE_EVICT prints them beside the
+    /// evictions so a load that thrashes shows it.
+    u64 evicted_rebuilds{};
     VideoCommon::EvictedPointerSlots evicted_pointer_slots;
 
     ::Common::unordered_map<ComputePipelineCacheKey, ComputePipelineCacheEntry> compute_cache;
