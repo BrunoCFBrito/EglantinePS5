@@ -74,6 +74,20 @@ namespace VideoCommon {
     return enabled;
 }
 
+/// EDEN_NX2_TEX_POOL_MIPS=1 (off by default: a visual trade-off): texture quality follows the
+/// shared pool. While the pool is critical or short, new Switch 2 textures keep one mip level
+/// less every 60 (critical) or 240 (short) frames, down to EDEN_NX2_TEX_MIN_SIDE; after 1800
+/// frames of a normal pool they get one level back (TextureCache::TickFrame), textures already
+/// made that the cap would now make smaller are deleted and made again smaller
+/// (TextureCache::ShrinkOversized), and the runtime applies the cap in TrimmedHostInfoLevels.
+[[nodiscard]] inline bool PoolTextureMips() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_TEX_POOL_MIPS");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
 using Tegra::Texture::TICEntry;
 using Tegra::Texture::TSCEntry;
 using VideoCore::Surface::GetFormatType;
@@ -204,6 +218,79 @@ void TextureCache<P>::DeleteSupersededImages() {
         }
         UnregisterImage(image_id);
         DeleteImage(image_id, image.scale_tick > frame_tick + 5);
+    }
+}
+
+template <class P>
+void TextureCache<P>::ShrinkOversized() {
+    // A lower size cap (TextureCacheRuntime::OnDeviceMemoryPressure) only shapes textures made
+    // after it; in a town most were made before it went down and stay whole while they are drawn
+    // (Ocarina, 2026-11-15). While the pool is low or critical, a texture the cap would now make
+    // smaller and that has gone unused for 30 frames is deleted, at most 16 every 10 frames, and
+    // the next draw that needs it makes it again with fewer levels (the game's own mips): once per
+    // cap step, not the churn of evicting what is drawn. Never what the GPU wrote. A full look
+    // after each cap step, then only while it keeps finding some. Off unless
+    // EDEN_NX2_TEX_POOL_MIPS=1, and does nothing until the runtime provides the cap
+    // (PokeDinner-a-Eglantine-Fork b49d7b95).
+    if (!PoolTextureMips()) {
+        return;
+    }
+    if constexpr (requires(const ImageInfo& info) { runtime.TrimsFurther(info, u32{}); }) {
+        constexpr u64 Age = 30;
+        constexpr size_t MaxPerPass = 16;
+        if (!Eden::Performance::GraphicsMemoryIsShort() || frame_tick <= Age ||
+            frame_tick < oversized_next_pass) {
+            return;
+        }
+        oversized_next_pass = frame_tick + 10;
+        // Anything new to find: a cap step happened (the runtime counts refusals and pool steps
+        // alike through OnDeviceMemoryPressure), or the last pass still found some.
+        if constexpr (requires { runtime.SizeCapSteps(); }) {
+            const u64 cap_steps = runtime.SizeCapSteps();
+            if (cap_steps != oversized_seen_cuts) {
+                oversized_seen_cuts = cap_steps;
+                oversized_searching = true;
+            }
+        } else {
+            oversized_searching = true;
+        }
+        if (!oversized_searching) {
+            return;
+        }
+        boost::container::small_vector<ImageId, MaxPerPass> doomed;
+        u64 bytes = 0;
+        lru_cache.ForEachItemBelow(frame_tick - Age, [&](ImageId image_id) {
+            const Image& image = slot_images[image_id];
+            if (True(image.flags & ImageFlagBits::IsDecoding) || IsDownloadable(image)) {
+                return false;
+            }
+            if (!runtime.TrimsFurther(image.info, image.host_level_offset)) {
+                return false;
+            }
+            bytes += ImageMemoryBytes(image);
+            doomed.push_back(image_id);
+            return doomed.size() == MaxPerPass;
+        });
+        oversized_searching = doomed.size() == MaxPerPass;
+        for (const ImageId image_id : doomed) {
+            Image& image = slot_images[image_id];
+            if (True(image.flags & ImageFlagBits::Tracked)) {
+                UntrackImage(image, image_id);
+            }
+            UnregisterImage(image_id);
+            DeleteImage(image_id, image.scale_tick > frame_tick + 5);
+        }
+        oversized_shrunk_images += doomed.size();
+        oversized_shrunk_bytes += bytes;
+        if (!doomed.empty() &&
+            (oversized_shrunk_images == doomed.size() ||
+             (oversized_shrunk_images - doomed.size()) / 256 != oversized_shrunk_images / 256)) {
+            std::fprintf(stderr,
+                         "EDEN_TC_SHRINK %llu textures (%llu MiB at their old size) made again "
+                         "smaller so far\n",
+                         static_cast<unsigned long long>(oversized_shrunk_images),
+                         static_cast<unsigned long long>(oversized_shrunk_bytes >> 20));
+        }
     }
 }
 
@@ -1211,7 +1298,57 @@ void TextureCache<P>::TickFrame() {
     if (std::exchange(reclaim_requested, false)) {
         total_used_memory = (std::max)(total_used_memory, critical_memory + 1_GiB);
     }
+    // EDEN_NX2_TEX_POOL_MIPS=1 (off by default: a visual trade-off, the game's own mips are
+    // dropped from the top): texture quality follows the shared pool. Every 60 frames it stays
+    // critical (240 while it is only short), new Switch 2 textures keep one mip level less, down
+    // to EDEN_NX2_TEX_MIN_SIDE (256 texels a side by default); after 1800 frames of a normal pool
+    // they get one level back, up to EDEN_NX2_TEX_MAX_SIDE. The runtime keeps the cap and applies
+    // it to textures made from then on (PokeDinner-a-Eglantine-Fork da13db13, 829f5196 b49d7b95:
+    // 60 critical / 240 short frames, -1 level each, +1 after 1800 normal frames); textures
+    // already made keep theirs until the collector replaces them (ShrinkOversized below).
+    if (PoolTextureMips()) {
+        if constexpr (requires {
+                          runtime.OnDeviceMemoryPressure();
+                          runtime.OnDeviceMemoryRelief();
+                      }) {
+            static u32 critical_frames = 0, short_frames = 0, normal_frames = 0;
+            const bool critical = Eden::Performance::GraphicsMemoryIsCritical();
+            const bool short_memory = critical || Eden::Performance::GraphicsMemoryIsShort();
+            critical_frames = critical ? critical_frames + 1 : 0;
+            short_frames = short_memory ? short_frames + 1 : 0;
+            normal_frames = short_memory ? 0 : normal_frames + 1;
+            if (critical_frames >= 60 || short_frames >= 240) {
+                critical_frames = short_frames = 0;
+                static u64 logged_side_cuts = 0;
+                runtime.OnDeviceMemoryPressure();
+                // Once the cap is at its floor the call changes nothing: say so only when a step
+                // actually went down (the runtime counts them), so a long critical stretch does
+                // not print a line a second.
+                bool cut = true;
+                if constexpr (requires { runtime.SizeCapSteps(); }) {
+                    const u64 cuts = runtime.SizeCapSteps();
+                    cut = cuts != logged_side_cuts;
+                    logged_side_cuts = cuts;
+                } else {
+                    static u64 next_log = 0;
+                    cut = frame_tick >= next_log;
+                    next_log = frame_tick + 600;
+                }
+                if (cut) {
+                    std::fprintf(stderr,
+                                 "EDEN_TC_MIPS the pool stayed %s: new Switch 2 textures keep "
+                                 "one mip level less\n",
+                                 critical ? "critical" : "short");
+                }
+            }
+            if (normal_frames >= 1800) {
+                normal_frames = 0;
+                runtime.OnDeviceMemoryRelief();
+            }
+        }
+    }
     DeleteSupersededImages();
+    ShrinkOversized();
     if (out_of_memory || total_used_memory > minimum_memory) {
         RunGarbageCollector(out_of_memory);
     }

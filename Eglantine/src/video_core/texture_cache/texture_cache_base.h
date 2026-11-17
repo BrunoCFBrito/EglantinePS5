@@ -190,6 +190,13 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 emergency_last_deletes{};  ///< The counters at the previous frame (for the deltas)
     u64 emergency_last_created{};
     u64 emergency_log_frame{};     ///< Frame of the last EDEN_TC_EMERGENCY line (60-frame limit)
+    /// ShrinkOversized's state: when it may look next, whether it is still finding images, and
+    /// the totals its EDEN_TC_SHRINK line prints.
+    u64 oversized_next_pass{};
+    bool oversized_searching{};
+    u64 oversized_seen_cuts{};
+    u64 oversized_shrunk_images{};
+    u64 oversized_shrunk_bytes{};
     bool reclaim_requested{};     ///< The staging pool was refused: collect aggressively next frame
     bool reclaiming{};            ///< ReclaimMemory is running; a nested allocation must not re-enter
     u64 pressure_margin{};        ///< Extra room under the budget after images did not fit
@@ -526,6 +533,10 @@ private:
 
     /// Deletes images whose memory went entirely to newer images (see ClassifySuperseded).
     void DeleteSupersededImages();
+
+    /// Deletes textures the lowered pool-driven size cap would now make smaller; the next draw
+    /// that needs them makes them again with fewer mip levels (EDEN_NX2_TEX_POOL_MIPS).
+    void ShrinkOversized();
 
     /// Whether the clear being made writes all of an image, bound at gpu_addr as a render target.
     [[nodiscard]] bool ClearOverwritesWhole(const ImageInfo& info, GPUVAddr gpu_addr) const;
