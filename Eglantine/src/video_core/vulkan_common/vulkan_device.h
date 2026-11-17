@@ -284,7 +284,17 @@ public:
         SparsePages,
         DeviceBuffers,
     };
-    static constexpr VkDeviceSize SeparatePoolBlockSize = 16ULL << 20;
+
+    /// The size of the allocator's default blocks (`preferredLargeHeapBlockSize`) and of the
+    /// separate pools other than the device buffers': 16 MiB.
+    static VkDeviceSize DefaultBlockSize();
+
+    /// Block size for a pool of that kind: DefaultBlockSize(), except the device buffers' pool,
+    /// which takes EDEN_PS5_VMA_BUFFER_BLOCK_MIB (2 to 64), 4 MiB otherwise. The buffer cache's
+    /// small buffers come and go all the time: with 8 MiB blocks that pool stayed two thirds
+    /// empty (262 of 392 MiB), and with 16 MiB ones three quarters (410-470 of 544-624 MiB),
+    /// while the pool was critical (Ocarina, 2026-11-16).
+    static VkDeviceSize SeparatePoolBlockSize(SeparatePool kind);
 
     /// The pool of that kind for a memory type, created on first use (null if that failed).
     VmaPool GetSeparatePool(SeparatePool kind, u32 memory_type) const;

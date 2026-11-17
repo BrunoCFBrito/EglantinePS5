@@ -906,6 +906,31 @@ Device::~Device() {
     vmaDestroyAllocator(allocator);
 }
 
+VkDeviceSize Device::DefaultBlockSize() {
+    return VkDeviceSize{16} << 20;
+}
+
+VkDeviceSize Device::SeparatePoolBlockSize(SeparatePool kind) {
+    // The device buffers' pool stayed two thirds empty even with 8 MiB blocks (262 of 392 MiB,
+    // Ocarina 2026-11-16): the buffer cache's small buffers come and go all the time. 4 MiB
+    // blocks returned the space to the driver sooner.
+    if (kind == SeparatePool::DeviceBuffers) {
+        static const VkDeviceSize buffer_bytes = [] {
+            const char* value = std::getenv("EDEN_PS5_VMA_BUFFER_BLOCK_MIB");
+            const unsigned long mib = value != nullptr ? std::strtoul(value, nullptr, 10) : 4;
+            if (mib >= 2 && mib <= 64) {
+                LOG_INFO(Render_Vulkan, "EDEN_PS5_VMA_BUFFER_BLOCK_MIB: {} MiB device buffer blocks",
+                         mib);
+                return static_cast<VkDeviceSize>(mib) << 20;
+            }
+            LOG_INFO(Render_Vulkan, "EDEN_PS5_VMA_BUFFER_BLOCK_MIB out of range (2 to 64): 4 MiB");
+            return VkDeviceSize{4} << 20;
+        }();
+        return buffer_bytes;
+    }
+    return DefaultBlockSize();
+}
+
 VmaPool Device::GetSeparatePool(SeparatePool kind, u32 memory_type) const {
     std::scoped_lock lk{separate_pools_mutex};
     VmaPool& pool = separate_pools[static_cast<u32>(kind)][memory_type];
@@ -913,7 +938,7 @@ VmaPool Device::GetSeparatePool(SeparatePool kind, u32 memory_type) const {
         const VmaPoolCreateInfo ci{
             .memoryTypeIndex = memory_type,
             .flags = 0,
-            .blockSize = SeparatePoolBlockSize,
+            .blockSize = SeparatePoolBlockSize(kind),
             .minBlockCount = 0,
             .maxBlockCount = 0,
             .priority = 0.f,
