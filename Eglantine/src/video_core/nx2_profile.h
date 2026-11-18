@@ -80,6 +80,9 @@ enum class Zone : u32 {
     DrawQueries,          ///< A draw's query segment and counter state
     DrawTail,             ///< A draw's work after it is recorded
     AstcPolicy,           ///< A draw's ASTC decode policy step
+    DeltaTake,            ///< Whether the previous draw is still reusable (TakeReusableDraw)
+    DeltaCheck,           ///< Engine, repack layout and delta-held checks before a delta draw
+    OcarinaTrack,         ///< Per-draw OoT camera/actor tracking
     Count,
 };
 
@@ -96,6 +99,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "present", "worker idle",
     "present wait", "queue submit", "yield to guests", "cache lock", "tick work",
     "draw queries", "draw tail", "astc policy",
+    "delta take", "delta check", "ocarina track",
 };
 
 static_assert(static_cast<size_t>(Zone::Count) <= StutterTrace::ZoneSlots);

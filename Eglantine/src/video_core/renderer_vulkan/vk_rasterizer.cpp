@@ -1113,8 +1113,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
                         regs.rt[0].Address(), regs.rt[0].width, regs.rt[0].height);
         }
     };
-    GraphicsPipeline* const delta_pipeline =
-        fast_draw_on ? TakeReusableDraw(is_indexed, is_indirect) : nullptr;
+    GraphicsPipeline* const delta_pipeline = [&] {
+        Profile::Scope scope{Profile::Zone::DeltaTake};
+        return fast_draw_on ? TakeReusableDraw(is_indexed, is_indirect) : nullptr;
+    }();
     // EDEN_NX2_FAST_DRAW_VERIFY: resolve in full and compare with what the delta path keeps.
     GraphicsPipeline* const verify_pipeline = fast_draw_verify ? delta_pipeline : nullptr;
     GraphicsPipeline* const pipeline{delta_pipeline && !verify_pipeline ? delta_pipeline : [&] {
@@ -1445,8 +1447,12 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     const u64 draw_map_serial = gpu_memory->MapSerial();
     // update engine as channel may be different.
     pipeline->SetEngine(maxwell3d, gpu_memory);
-    const u32 repack_dirty = buffer_cache_runtime.SetVertexRepackLayout(
-        maxwell3d->regs, pipeline->HasDynamicVertexInput());
+    u32 repack_dirty{};
+    {
+        Profile::Scope scope{Profile::Zone::DeltaCheck};
+        repack_dirty = buffer_cache_runtime.SetVertexRepackLayout(maxwell3d->regs,
+                                                                  pipeline->HasDynamicVertexInput());
+    }
     if (repack_dirty) {
         auto& flags = maxwell3d->dirty.flags;
         flags[VideoCommon::Dirty::VertexBuffers] = true;
@@ -1457,8 +1463,11 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             }
         }
     }
-    const bool delta_holds =
-        delta_pipeline != nullptr && DeltaStillHolds(draw_serial, draw_map_serial);
+    bool delta_holds{};
+    if (delta_pipeline != nullptr) {
+        Profile::Scope scope{Profile::Zone::DeltaCheck};
+        delta_holds = DeltaStillHolds(draw_serial, draw_map_serial);
+    }
     const DrawPath path = delta_holds && !verify_pipeline ? DrawPath::Delta : DrawPath::Full;
     SlowDraw::At("engine setup");
     buffer_cache.BeginGraphicsUniforms(path == DrawPath::Delta ? &taken_delta : nullptr);
@@ -1493,9 +1502,12 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     }
 
     SlowDraw::At("pipeline configure");
-    TrackOcarinaCamera();
-    SlowDraw::At("ocarina camera");
-    TrackOcarinaActor(pipeline->ShaderHashes()[1], is_indexed, is_indirect);
+    {
+        Profile::Scope scope{Profile::Zone::OcarinaTrack};
+        TrackOcarinaCamera();
+        SlowDraw::At("ocarina camera");
+        TrackOcarinaActor(pipeline->ShaderHashes()[1], is_indexed, is_indirect);
+    }
     SlowDraw::At("ocarina actor");
     TracePendingCpuWrites(false, pipeline->ShaderHashes());
     TraceRenderState(is_indexed, "configured", texture_cache.GetFramebuffer());

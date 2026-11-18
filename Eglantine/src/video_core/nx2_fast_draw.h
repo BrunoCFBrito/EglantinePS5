@@ -62,6 +62,16 @@ inline constexpr std::array<const char*, static_cast<size_t>(Reason::Count)> rea
 
 inline std::atomic<bool> g_enabled{true};
 
+/// Whether vertex input is dynamic (VK_EXT_vertex_input_dynamic_state): attribute formats are then
+/// in the pipeline key only by type, not by offset or buffer, so those writes are light.
+/// Set by the pipeline cache before the GPU threads run, read on the back.
+inline std::atomic<bool> g_dynamic_vertex_input{};
+
+/// Whether vertex stream strides, enables and divisors are dynamic state too: dynamic vertex
+/// input with extended dynamic state keeps them out of the pipeline key, and UpdateVertexInput
+/// and the vertex buffer binds record them for every draw. Set with g_dynamic_vertex_input.
+inline std::atomic<bool> g_dynamic_vertex_streams{};
+
 /// Any thread: whether fast draws run (always, unless a test turned them off). The rasterizer
 /// latches it per draw (on the thread that draws) and starts with a full resolve when it turns on.
 [[nodiscard]] inline bool Enabled() {
@@ -119,7 +129,7 @@ private:
 /// Light changes since the last draw that can reach texture handles. Written and read on the
 /// thread that runs the 3D engine and the rasterizer (the split's back).
 struct Delta {
-    static constexpr size_t MaxWrites = 16;
+    static constexpr size_t MaxWrites = 32;
 
     std::array<u32, 5> binds{}; ///< Constant buffer slots bound per stage
     /// Constant buffer data written, by GPU address (unmapped addresses included)...
