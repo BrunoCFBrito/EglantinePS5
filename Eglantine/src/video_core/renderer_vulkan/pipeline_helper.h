@@ -476,6 +476,22 @@ inline void ReportBadImageView(bool compute, size_t stage, const char* kind, siz
     return true;
 }
 
+/// Whether a depth-compare sample of image_view is undefined and its handle garbage: its format
+/// has no depth comparison on this device (what the sample returns then differs between vendors)
+/// and it is an integer or block-compressed color texture, or its handle was read from memory (a
+/// handle program). A single-channel color texture with a cbuf handle may be one a game compares
+/// on purpose, and keeps its view.
+[[nodiscard]] inline bool IsUncomparable(const ImageView& image_view, bool read_from_memory) {
+    if (image_view.SupportsDepthComparison()) {
+        return false;
+    }
+    const VideoCore::Surface::PixelFormat format{image_view.format};
+    return read_from_memory || VideoCore::Surface::IsPixelFormatInteger(format) ||
+           VideoCore::Surface::IsPixelFormatASTC(format) ||
+           VideoCore::Surface::IsPixelFormatBCn(format) ||
+           VideoCore::Surface::IsPixelFormatETC2(format);
+}
+
 inline void PushImageDescriptors(TextureCache& texture_cache,
                                  GuestDescriptorQueue& guest_descriptor_queue,
                                  const Shader::Info& info, RescalingPushConstant& rescaling,
@@ -495,7 +511,7 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
     for (const auto& desc : info.texture_descriptors) {
         bool is_rescaled{};
         for (u32 index = 0; index < desc.count; ++index) {
-            const VideoCommon::ImageViewId image_view_id{(views++)->id};
+            VideoCommon::ImageViewId image_view_id{(views++)->id};
             const VideoCommon::SamplerId sampler_id{*(samplers++)};
             ImageView* image_view{texture_cache.TryGetImageView(image_view_id)};
             if (image_view == nullptr) {
@@ -504,7 +520,14 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
                 ReportBadImageView(compute, stage, "texture", descriptor, index, desc.count,
                                    image_view_id,
                                    static_cast<size_t>(views - views_begin) - 1, stage_views);
-                image_view = texture_cache.TryGetImageView(VideoCommon::NULL_IMAGE_VIEW_ID);
+                image_view_id = VideoCommon::NULL_IMAGE_VIEW_ID;
+                image_view = texture_cache.TryGetImageView(image_view_id);
+            }
+            if (image_view != nullptr && desc.is_depth &&
+                image_view_id != VideoCommon::NULL_IMAGE_VIEW_ID &&
+                IsUncomparable(*image_view, desc.handle_program != ~0U)) {
+                image_view_id = VideoCommon::NULL_IMAGE_VIEW_ID;
+                image_view = texture_cache.TryGetImageView(image_view_id);
             }
             if (image_view == nullptr) {
                 // No null view either: emit a null descriptor rather than a wild lookup.

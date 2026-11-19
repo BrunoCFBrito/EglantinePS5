@@ -221,6 +221,10 @@ public:
     void NoteDmaSemaphore(u32 method, u32 argument);
     /// Copies the list's words from memory again, as of suspension count `now`.
     void RefreshSnapshot(CommandList& list, u64 now);
+    /// Waits until the snapshot copier copied everything queued (before work that may change the
+    /// GPU's mappings, and before a channel goes away). RefreshSnapshot copies synchronously in
+    /// this tree, so nothing is ever queued.
+    static void WaitForSnapshotCopies() {}
     /// Copies the list's deferred entries (CommandList::deferred_entries) from memory.
     void RefreshDeferredEntries(CommandList& list);
 
