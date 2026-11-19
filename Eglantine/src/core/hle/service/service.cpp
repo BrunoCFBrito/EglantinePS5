@@ -22,6 +22,8 @@
 #include <algorithm>
 #include <cstdlib>
 #include <fmt/ranges.h>
+#include <atomic>
+
 #include "common/assert.h"
 #include "common/logging.h"
 #include "common/settings.h"
@@ -207,6 +209,13 @@ void ServiceFrameworkBase::InvokeRequest(HLERequestContext& ctx) {
         LOG_INFO(Service, "ipc {}::{} ({})", service_name, ctx.GetCommand(), info->name);
     }
     handler_invoker(this, info->handler_callback, ctx);
+    if (ctx.WroteNullHandle()) {
+        static std::atomic<unsigned> nulls{0};
+        if (nulls.fetch_add(1, std::memory_order_relaxed) % 64 == 0) {
+            LOG_WARNING(Service, "{}::{} hands the guest a null handle (reply object was null)",
+                        service_name, info->name);
+        }
+    }
     if (ipc_trace) {
         // Response layout: [0..1] header, then 'SFCO', version, result.
         const auto* cmd_buf = ctx.CommandBuffer();

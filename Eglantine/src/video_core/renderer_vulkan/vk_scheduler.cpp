@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstdio>
 #include "dev_vulkan.h"
+#include "headless/performance.h"
 #include "hud_gpu_time.h"
 #include "submission_origin.h"
 extern "C" bool eden_vulkan_handoff_enabled();
@@ -164,7 +165,7 @@ void GpuTimeCollect(const Device& device) {
         gpu_time.busy_ns = gpu_time.max_ns = gpu_time.submissions = 0;
         gpu_time.report = now;
     } else if (wall >= 5'000'000'000) {
-        std::printf("EDEN_GPU_TIME wall_ms=%.1f busy_ms=%.1f submissions=%llu max_ms=%.2f cumulative_ns=%llu cumulative_submissions=%llu pending=%llu\n", wall / 1e6,
+        LOG_INFO(HW_GPU, "EDEN_GPU_TIME wall_ms={:.1f} busy_ms={:.1f} submissions={} max_ms={:.2f} cumulative_ns={} cumulative_submissions={} pending={}", wall / 1e6,
                     gpu_time.busy_ns / 1e6, static_cast<unsigned long long>(gpu_time.submissions),
                     gpu_time.max_ns / 1e6, static_cast<unsigned long long>(gpu_time.total_ns),
                     static_cast<unsigned long long>(gpu_time.total_submissions),
@@ -770,6 +771,7 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
             chunk_reserve.emplace_back(std::move(work));
         }
         VideoCommon::Nx2Profile::Report("Vulkan worker");
+        Eden::Performance::PublishRoleCpu(Eden::Performance::CpuRole::VulkanWorker);
     }
 }
 

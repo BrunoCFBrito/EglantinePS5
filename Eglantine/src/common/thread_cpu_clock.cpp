@@ -7,6 +7,11 @@
 #include <windows.h>
 #elif defined(__linux__)
 #include <pthread.h>
+#include <sched.h>
+#include <time.h>
+#elif defined(__PROSPERO__)
+#include <sys/types.h>
+#include <sys/cpuset.h>
 #include <time.h>
 #endif
 
@@ -22,7 +27,7 @@ std::optional<u64> ReadNativeClock(std::intptr_t native_clock) {
     const u64 kernel_ticks = (u64{kernel.dwHighDateTime} << 32) | kernel.dwLowDateTime;
     const u64 user_ticks = (u64{user.dwHighDateTime} << 32) | user.dwLowDateTime;
     return (kernel_ticks + user_ticks) * 100;
-#elif defined(__linux__)
+#elif defined(__linux__) || defined(__PROSPERO__)
     timespec time{};
     if (clock_gettime(static_cast<clockid_t>(native_clock), &time) != 0) {
         return std::nullopt;
@@ -39,8 +44,28 @@ std::optional<u64> ReadNativeClock(std::intptr_t native_clock) {
 std::optional<u64> CurrentThreadCpuTimeNs() {
 #ifdef _WIN32
     return ReadNativeClock(reinterpret_cast<std::intptr_t>(GetCurrentThread()));
-#elif defined(__linux__)
+#elif defined(__linux__) || defined(__PROSPERO__)
     return ReadNativeClock(CLOCK_THREAD_CPUTIME_ID);
+#else
+    return std::nullopt;
+#endif
+}
+
+std::optional<unsigned> CurrentThreadCpuCore() {
+#if defined(__linux__)
+    const int cpu = sched_getcpu();
+    return cpu < 0 ? std::nullopt : std::optional<unsigned>(static_cast<unsigned>(cpu));
+#elif defined(__PROSPERO__)
+    cpuset_t mask{};
+    if (cpuset_getaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, 8, &mask) != 0) {
+        return std::nullopt;
+    }
+    for (unsigned cpu = 0; cpu < 64; ++cpu) {
+        if (CPU_ISSET(cpu, &mask)) {
+            return cpu;
+        }
+    }
+    return std::nullopt;
 #else
     return std::nullopt;
 #endif

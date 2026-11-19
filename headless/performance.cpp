@@ -215,6 +215,9 @@ std::array<unsigned, 5> worker_cpus{};
 bool worker_topology_ready = false;
 // Physical core (x2APIC above the SMT shift) of each allowed CPU, -1 if unknown.
 std::array<int, 64> cpu_core = [] { std::array<int, 64> c{}; c.fill(-1); return c; }();
+// x2APIC id -> OS CPU, filled while the topology probe pins to every CPU (CpuRole lanes).
+std::array<int, 256> apic_to_cpu = [] { std::array<int, 256> a{}; a.fill(-1); return a; }();
+bool apic_map_valid = false;
 // CPUs that are neither pinned nor the GPU thread's SMT sibling.
 unsigned long long secondary_cpus = 0;
 // The process CPU set seen by the topology probe (threads may inherit narrower sets).
@@ -252,6 +255,9 @@ void CheckWorkerTopology() {
         if (!b || ((c >> 8) & 0xff) != 1 || (a & 31) >= 16) break;
         const unsigned core = d >> (a & 31);
         cpu_core[cpu] = static_cast<int>(core);
+        if (d < apic_to_cpu.size()) {
+            apic_to_cpu[d] = static_cast<int>(cpu);
+        }
         if (count == cores.size() ||
             std::find(cores.begin(), cores.begin() + count, core) != cores.begin() + count) continue;
         cores[count] = core;
@@ -287,6 +293,7 @@ void CheckWorkerTopology() {
         }
     }
     worker_topology_ready = count == cores.size();
+    apic_map_valid = worker_topology_ready && !measured;
     topology_allowed = original;
     topology_allowed_valid = true;
     if (worker_topology_ready) {
@@ -1102,6 +1109,197 @@ void SampleCpu(unsigned core, unsigned long long thread, unsigned long long pc, 
         compilation[core].nanoseconds.load(std::memory_order_relaxed)};
     std::lock_guard lock(workers_mutex);
     cpu_samples[core] = sample;
+    if (core < 6) {
+        PublishRoleCpu(static_cast<CpuRole>(static_cast<unsigned>(CpuRole::GuestCore0) + core));
+    }
+}
+
+namespace {
+struct RoleCpuSlot {
+    std::atomic<unsigned long long> cpu_ns{};
+    std::atomic<unsigned long long> cpu_mark{};
+    std::atomic<unsigned long long> wall_mark{};
+    std::atomic<int> lane_min{1 << 30};
+    std::atomic<int> lane_max{-1};
+    std::atomic<int> lane_last{-1};
+    std::atomic<unsigned> migrations{};
+    std::atomic<bool> started{};
+};
+std::array<RoleCpuSlot, static_cast<size_t>(CpuRole::Count)> role_cpu_slots{};
+std::atomic<unsigned long long> role_report_mark{};
+bool RoleCpuEnabled() {
+    static const bool enabled = std::getenv("EDEN_CPU_ROLES") != nullptr;
+    return enabled;
+}
+/// The lane (physical core) the calling thread is running on, or -1 where the console does not
+/// tell the CPUs apart. CpuRole::GuestCore lanes migrate: callers record the range they saw.
+int RunningCpuLane() {
+#ifdef PS5_NATIVE
+    if (!apic_map_valid) {
+        return -1;
+    }
+    unsigned a{}, b{}, c{}, d{};
+    __cpuid_count(0xb, 0, a, b, c, d);
+    if (!b || ((c >> 8) & 0xff) != 1 || (a & 31) >= 16 || d >= apic_to_cpu.size()) {
+        return -1;
+    }
+    const int cpu = apic_to_cpu[d];
+    return cpu < 0 ? -1 : cpu_core[cpu];
+#else
+    return -1;
+#endif
+}
+} // Anonymous namespace
+
+void PublishRoleCpu(CpuRole role) {
+    if (!RoleCpuEnabled()) {
+        return;
+    }
+    const auto index = static_cast<size_t>(role);
+    if (index >= role_cpu_slots.size()) {
+        return;
+    }
+    // The caller's own CPU clock, as SampleCpu reads it: a role publishes for itself only.
+    const long long cpu_now = owner_cpu_clock_valid ? ClockNs(CLOCK_THREAD_CPUTIME_ID) : -1;
+    if (cpu_now < 0) {
+        return;
+    }
+    RoleCpuSlot& slot = role_cpu_slots[index];
+    const u64 now = ClockNs(CLOCK_MONOTONIC);
+    if (!slot.started.exchange(true, std::memory_order_relaxed)) {
+        slot.cpu_mark.store(static_cast<u64>(cpu_now), std::memory_order_relaxed);
+        slot.wall_mark.store(now, std::memory_order_relaxed);
+        role_report_mark.store(now, std::memory_order_relaxed);
+        return;
+    }
+    const u64 last_cpu = slot.cpu_mark.exchange(static_cast<u64>(cpu_now), std::memory_order_relaxed);
+    slot.wall_mark.store(now, std::memory_order_relaxed);
+    if (static_cast<u64>(cpu_now) >= last_cpu) {
+        slot.cpu_ns.fetch_add(static_cast<u64>(cpu_now) - last_cpu, std::memory_order_relaxed);
+    }
+    const int lane = RunningCpuLane();
+    if (lane < 0) {
+        return;
+    }
+    slot.lane_min.store(std::min(slot.lane_min.load(std::memory_order_relaxed), lane),
+                        std::memory_order_relaxed);
+    slot.lane_max.store(std::max(slot.lane_max.load(std::memory_order_relaxed), lane),
+                        std::memory_order_relaxed);
+    const int last = slot.lane_last.exchange(lane, std::memory_order_relaxed);
+    if (last >= 0 && last != lane) {
+        slot.migrations.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void ReportCntpctStats() {
+    static const bool enabled = std::getenv("EDEN_NX2_CNTPCT_STATS") != nullptr;
+    if (!enabled) {
+        return;
+    }
+    static unsigned long long last_reads[6]{}, last_spin[6]{}, last_ns[6]{}, last_svcs[6]{},
+        last_svc_ns[6]{};
+    static u64 last_window = 0;
+    const u64 now = ClockNs(CLOCK_MONOTONIC);
+    const u64 window = last_window == 0 ? 0 : now - last_window;
+    last_window = now;
+    if (window == 0) {
+        for (size_t i = 0; i < cntpct_stats.size(); ++i) {
+            last_reads[i] = cntpct_stats[i].reads.load(std::memory_order_relaxed);
+            last_spin[i] = cntpct_stats[i].spin_reads.load(std::memory_order_relaxed);
+            last_ns[i] = cntpct_stats[i].cntpct_ns.load(std::memory_order_relaxed);
+            last_svcs[i] = cntpct_stats[i].svcs.load(std::memory_order_relaxed);
+            last_svc_ns[i] = cntpct_stats[i].svc_ns.load(std::memory_order_relaxed);
+        }
+        return;
+    }
+    for (size_t i = 0; i < cntpct_stats.size(); ++i) {
+        const auto& stat = cntpct_stats[i];
+        const u64 reads = stat.reads.load(std::memory_order_relaxed);
+        const u64 spin = stat.spin_reads.load(std::memory_order_relaxed);
+        const u64 ns = stat.cntpct_ns.load(std::memory_order_relaxed);
+        const u64 svcs = stat.svcs.load(std::memory_order_relaxed);
+        const u64 svc_ns = stat.svc_ns.load(std::memory_order_relaxed);
+        if (reads == last_reads[i] && svcs == last_svcs[i]) {
+            continue;
+        }
+        std::fprintf(stderr,
+                     "EDEN_NX2_CNTPCT_STATS core=%zu reads_s=%.0f spin_s=%.0f cntpct_ms_s=%.1f "
+                     "svc_s=%.0f svc_ms_s=%.1f\n",
+                     i, static_cast<double>(reads - last_reads[i]) * 1e9 / window,
+                     static_cast<double>(spin - last_spin[i]) * 1e9 / window,
+                     static_cast<double>(ns - last_ns[i]) / 1e6 * 1e9 / window,
+                     static_cast<double>(svcs - last_svcs[i]) * 1e9 / window,
+                     static_cast<double>(svc_ns - last_svc_ns[i]) / 1e6 * 1e9 / window);
+        last_reads[i] = reads;
+        last_spin[i] = spin;
+        last_ns[i] = ns;
+        last_svcs[i] = svcs;
+        last_svc_ns[i] = svc_ns;
+    }
+    // Which syscall the hot core is looping on (top five by calls in this window).
+    static unsigned last_numbers[6][512]{};
+    for (size_t i = 0; i < svc_numbers.size(); ++i) {
+        std::array<std::pair<unsigned, u32>, 512> hits{};
+        size_t count = 0;
+        for (u32 number = 0; number < 512; ++number) {
+            const unsigned now = svc_numbers[i][number].load(std::memory_order_relaxed);
+            const unsigned delta = now - last_numbers[i][number];
+            last_numbers[i][number] = now;
+            if (delta != 0) {
+                hits[count++] = {delta, number};
+            }
+        }
+        if (count == 0) {
+            continue;
+        }
+        const size_t top = std::min<size_t>(count, 5);
+        std::partial_sort(hits.begin(), hits.begin() + top, hits.begin() + count,
+                          [](const auto& a, const auto& b) { return a.first > b.first; });
+        std::string line = "EDEN_NX2_SVC_HOT core=" + std::to_string(i);
+        char text[96];
+        for (size_t k = 0; k < top; ++k) {
+            std::snprintf(text, sizeof(text), " 0x%x=%.0f/s", hits[k].second,
+                          static_cast<double>(hits[k].first) * 1e9 / window);
+            line += text;
+        }
+        std::fprintf(stderr, "%s\n", line.c_str());
+    }
+}
+
+void ReportRoleCpu(unsigned frames) {
+    if (!RoleCpuEnabled()) {
+        return;
+    }
+    const u64 now = ClockNs(CLOCK_MONOTONIC);
+    const u64 mark = role_report_mark.exchange(now, std::memory_order_relaxed);
+    const u64 window = now > mark ? now - mark : 0;
+    if (window == 0) {
+        return;
+    }
+    static constexpr std::array<const char*, static_cast<size_t>(CpuRole::Count)> names{
+        "gpu_command", "gpu_back", "vulkan_worker",
+        "core0", "core1", "core2", "core3", "core4", "core5"};
+    char text[256];
+    std::snprintf(text, sizeof(text), "EDEN_CPU_ROLES window_s=%.3f frames=%u", window / 1e9,
+                  frames);
+    std::string line{text};
+    for (size_t i = 0; i < role_cpu_slots.size(); ++i) {
+        RoleCpuSlot& slot = role_cpu_slots[i];
+        const u64 cpu_ns = slot.cpu_ns.exchange(0, std::memory_order_relaxed);
+        const int lane_min = slot.lane_min.exchange(1 << 30, std::memory_order_relaxed);
+        const int lane_max = slot.lane_max.exchange(-1, std::memory_order_relaxed);
+        const unsigned migrations = slot.migrations.exchange(0, std::memory_order_relaxed);
+        slot.lane_last.store(-1, std::memory_order_relaxed);
+        const double per_s = static_cast<double>(cpu_ns) * 1e9 / static_cast<double>(window) / 1e6;
+        if (lane_max < 0) {
+            std::snprintf(text, sizeof(text), " %s=%.1fms/s lane=?", names[i], per_s);
+        } else {
+            std::snprintf(text, sizeof(text), " %s=%.1fms/s lane=%d..%d migr=%u", names[i], per_s,
+                          lane_min, lane_max, migrations);
+        }
+        line += text;
+    }
+    std::fprintf(stderr, "%s\n", line.c_str());
 }
 
 unsigned BusiestGuestCore() {

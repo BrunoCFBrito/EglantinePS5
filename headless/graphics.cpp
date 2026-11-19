@@ -808,6 +808,8 @@ void GraphicsWindow::OnFrameDisplayed() {
                 interval_hist = {};
 #endif
                 Eden::Performance::ReportVulkan();
+                Eden::Performance::ReportRoleCpu(frame_sample_count);
+                Eden::Performance::ReportCntpctStats();
                 Eden::Performance::ReportGuestRun();
                 if (Eden::Fastmem::Window64Base() != 0) {
                     char window64[1024];

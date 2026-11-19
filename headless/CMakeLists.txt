@@ -579,7 +579,10 @@ endif()
                 _setjmp _longjmp openlog closelog dladdr if_nametoindex pipe2 recvmmsg sendmmsg
                 popen pclose isatty mkstemp gmtime_r ZSTD_trace_compress_begin
                 ZSTD_trace_compress_end ZSTD_trace_decompress_begin ZSTD_trace_decompress_end)
-            set(update_rename --redefine-sym fcntl=__wrap_fcntl --redefine-sym __real_fcntl=fcntl)
+            # fcntl is wrapped for the whole program below (--wrap=fcntl), which already sends
+            # every call to __wrap_fcntl and its fallback to __real_fcntl: renaming them here as
+            # well would point the fallback back at the wrapper.
+            set(update_rename)
             foreach(name IN LISTS update_own)
                 list(APPEND update_rename --redefine-sym "${name}=console_curl_${name}")
             endforeach()
@@ -595,6 +598,12 @@ endif()
                 COMMAND_EXPAND_LISTS VERBATIM)
             set_source_files_properties("${update_object}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
             target_sources(eden-headless PRIVATE "${EDEN_PORT_DIR}/update_notice.cpp" "${update_object}")
+            # A title's fcntl on a socket is refused (EACCES on FW 13.40, EINVAL on older ones), so
+            # non-blocking mode is unreachable: Boost.Asio aborts accept()/connect() with that error
+            # before making the call, and the guest kernel's SetNonBlock fails the same way. The
+            # wrappers in console_curl.c (fcntl, and ioctl for Asio) map those to setsockopt(SO_NBIO)
+            # for the whole program.
+            target_link_options(eden-headless PRIVATE -Wl,--wrap=fcntl -Wl,--wrap=ioctl)
             target_link_libraries(eden-headless PRIVATE
                 "${OPENSSL_SSL_LIBRARY}" "${OPENSSL_CRYPTO_LIBRARY}" "${ZLIB_LIBRARY}")
             # The launcher calls OpenGL by name (the SDK's headers), not through glad.

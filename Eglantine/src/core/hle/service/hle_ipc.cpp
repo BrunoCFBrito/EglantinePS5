@@ -302,10 +302,15 @@ Result HLERequestContext::WriteToOutgoingCommandBuffer() {
     auto& owner_process = *thread->GetOwnerProcess();
     auto& handle_table = owner_process.GetHandleTable();
 
+    // A null object is written to the guest as handle 0, which no wait can ever satisfy; the
+    // framework logs the service once it has the reply (service.cpp, InvokeRequest).
+    const auto note_null = [this] { wrote_null_handle = true; };
     for (auto& object : outgoing_copy_objects) {
         Handle handle{};
         if (object) {
             R_TRY(handle_table.Add(kernel, &handle, object));
+        } else {
+            note_null();
         }
         cmd_buf[current_offset++] = handle;
     }

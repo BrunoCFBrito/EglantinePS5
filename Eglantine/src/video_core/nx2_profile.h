@@ -83,6 +83,13 @@ enum class Zone : u32 {
     DeltaTake,            ///< Whether the previous draw is still reusable (TakeReusableDraw)
     DeltaCheck,           ///< Engine, repack layout and delta-held checks before a delta draw
     OcarinaTrack,         ///< Per-draw OoT camera/actor tracking
+    UniformsBegin,        ///< BeginGraphicsUniforms: the per-draw uniform write vectors
+    RecordGap,            ///< Configure to record: traces, frame dump checks, OoT hash checks
+    ResolveNote,          ///< NoteResolvedDraw after the draw is recorded
+    SplitExecute,         ///< The split's back running one ring entry
+    SplitCall,            ///< A deferred call entry on the split's back
+    FlushSubmit,          ///< FlushWork: the submission policy's flush
+    FlushCache,           ///< FlushCaching: deferred guest writes and the invalidation accumulator
     Count,
 };
 
@@ -100,6 +107,8 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "present wait", "queue submit", "yield to guests", "cache lock", "tick work",
     "draw queries", "draw tail", "astc policy",
     "delta take", "delta check", "ocarina track",
+    "uniforms begin", "record gap", "resolve note",
+    "split execute", "split call", "flush submit", "flush cache",
 };
 
 static_assert(static_cast<size_t>(Zone::Count) <= StutterTrace::ZoneSlots);
@@ -427,6 +436,9 @@ inline void Report(const char* thread_name = "GPU thread", bool report_all_conte
     } else {
         line += fmt::format(" | host_cpu_busy_ms_per_s=unavailable window_wall_ms={:.3f}",
                             static_cast<double>(window) / 1e6);
+    }
+    if (const auto core = Common::CurrentThreadCpuCore(); core) {
+        line += fmt::format(" cpu={}", *core);
     }
     LOG_INFO(HW_GPU, "{} per second:{}", thread_name, line);
     if (const std::string methods = TopMethods(t_method_count, &t_method_same, window); !methods.empty()) {

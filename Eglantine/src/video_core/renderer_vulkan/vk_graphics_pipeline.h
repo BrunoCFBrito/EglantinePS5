@@ -120,6 +120,7 @@ public:
     static std::chrono::nanoseconds TakeHoldTime() noexcept;
 
     bool HasDynamicVertexInput() const noexcept { return key.state.dynamic_vertex_input; }
+    u64 DynamicAttributeTypes() const noexcept { return key.state.attribute_types; }
     const std::array<u64, 6>& ShaderHashes() const noexcept {
         return key.unique_hashes;
     }

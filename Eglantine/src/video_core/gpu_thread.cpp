@@ -4,6 +4,7 @@
 namespace VideoCore { class RendererBase; }
 namespace Eden { bool LoadingTick(VideoCore::RendererBase&, bool idle); }
 #else // PS5
+#include "headless/performance.h"
 namespace VideoCore { class RendererBase; }
 namespace Eden { bool LoadingTick(VideoCore::RendererBase&, bool idle); }
 #endif // PS5
@@ -101,6 +102,7 @@ void ThreadManager::RunWorker(VideoCore::RendererBase& renderer, Core::Frontend:
         auto& split = VideoCommon::GpuSplit::Get();
         while (!stop_token.stop_requested()) {
             Profile::Report();
+            Eden::Performance::PublishRoleCpu(Eden::Performance::CpuRole::GpuCommand);
             split.MaybeStart(system);
             if (VideoCommon::g_acquire_counting) {
                 split.ReportAcquire();

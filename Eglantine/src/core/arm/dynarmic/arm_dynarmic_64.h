@@ -118,6 +118,10 @@ private:
     std::optional<DynarmicCallbacks64> m_cb{};
     std::size_t m_core_index{};
 
+public:
+    /// The guest core this instance runs (CNTPCT/SVC statistics are kept per core).
+    [[nodiscard]] std::size_t CoreIndex() const { return m_core_index; }
+
     std::optional<Dynarmic::A64::Jit> m_jit{};
 
     // SVC callback

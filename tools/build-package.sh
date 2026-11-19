@@ -40,7 +40,14 @@ bash tools/build-headless-native.sh --graphics
 python3 -B tools/check-radv-native.py
 echo "== Package $EDEN_PACKAGE_DIR"
 rm -rf "$EDEN_PACKAGE_DIR"
-bash tools/package-headless-native.sh --integration
+if [[ -n ${EDEN_FAST_PACKAGE:-} ]]; then
+    # Iteration build: the integration suite re-checks behaviour that a diagnostics-only change
+    # cannot alter. Release builds and anything touching the loader/package run it.
+    echo "== Fast package (EDEN_FAST_PACKAGE): skipping the integration suite"
+    bash tools/package-headless-native.sh
+else
+    bash tools/package-headless-native.sh --integration
+fi
 if [[ $mode == release ]]; then
     python3 -B headless/check_package.py --check
 elif [[ -f CANDIDATE.json ]]; then

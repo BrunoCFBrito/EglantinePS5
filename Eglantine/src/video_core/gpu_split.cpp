@@ -25,6 +25,7 @@
 #include "core/core.h"
 #include "video_core/engines/engine_interface.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "headless/performance.h"
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
@@ -430,6 +431,7 @@ void GpuSplit::DeferFunction(std::function<void()>&& func) {
 }
 
 size_t GpuSplit::Execute(const u64* entry, size_t words) {
+    Nx2Profile::Scope execute_scope{Nx2Profile::Zone::SplitExecute};
     const u64 head = entry[0];
     switch (static_cast<Kind>(head & 0xf)) {
     case Kind::Wrap:
@@ -526,6 +528,7 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
         return data + (amount + 1) / 2;
     }
     case Kind::Call: {
+        Nx2Profile::Scope call_scope{Nx2Profile::Zone::SplitCall};
         if ((head & FastDrawNeutral) == 0) {
             Nx2FastDraw::Break(Nx2FastDraw::Reason::Call);
         }
@@ -555,6 +558,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     u64 read_position = 0;
     while (!stop_token.stop_requested()) {
         Nx2Profile::Report("GPU back thread", true);
+        Eden::Performance::PublishRoleCpu(Eden::Performance::CpuRole::GpuBack);
         u64 available = published.load(std::memory_order_acquire);
         if (available == read_position) {
             Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};

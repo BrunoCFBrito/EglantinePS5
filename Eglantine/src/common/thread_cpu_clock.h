@@ -11,6 +11,8 @@
 namespace Common {
 
 std::optional<u64> CurrentThreadCpuTimeNs();
+/// The CPU this thread is pinned to, when the platform can report it without running the thread.
+std::optional<unsigned> CurrentThreadCpuCore();
 
 class ThreadCpuClock {
 public:

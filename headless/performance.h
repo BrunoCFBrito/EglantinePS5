@@ -54,6 +54,29 @@ inline std::atomic<bool> firmware_applets{false};
 enum class CpuPhase : unsigned { Kernel, Guest, Idle };
 struct alignas(64) CpuState { std::atomic<CpuPhase> phase{}; };
 inline std::array<CpuState, 6> cpu_state{};
+/// EDEN_CPU_ROLES: the CPU time each host role spent and the CPU/lane it ran on, so a saturated
+/// lane in the console's per-core monitor can be named. Published by the role itself.
+enum class CpuRole : unsigned {
+    GpuCommand,
+    GpuBack,
+    VulkanWorker,
+    GuestCore0, GuestCore1, GuestCore2, GuestCore3, GuestCore4, GuestCore5,
+    Count,
+};
+/// EDEN_NX2_CNTPCT_STATS: per guest core, the host time spent answering CNTPCT reads (the
+/// guest's polling loop) and in SVC dispatch, counted by the calling core itself.
+struct alignas(64) CntpctStats {
+    std::atomic<unsigned long long> reads{}, spin_reads{}, cntpct_ns{};
+    std::atomic<unsigned long long> svcs{}, svc_ns{};
+};
+inline std::array<CntpctStats, 6> cntpct_stats{};
+/// SVC number -> calls, per guest core (EDEN_NX2_CNTPCT_STATS: which syscall a wait loop uses).
+inline std::array<std::array<std::atomic<unsigned>, 512>, 6> svc_numbers{};
+void ReportCntpctStats();
+void PublishRoleCpu(CpuRole role);
+/// One stderr line per call (5 s): each role's CPU ms/s and its lane range. Not stdout: the
+/// console does not capture stdout.
+void ReportRoleCpu(unsigned frames);
 void SampleCpu(unsigned core, unsigned long long thread, unsigned long long pc, unsigned svc, unsigned fpcr);
 // The overlay's CPU field (hud.h, HudMachine::cpu): how busy the busiest emulated core was since
 // the previous call, as a percentage of one CPU; ~0u until two readings of a core are known, or

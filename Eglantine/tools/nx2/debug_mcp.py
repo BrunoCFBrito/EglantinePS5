@@ -6,6 +6,9 @@ Run Lichii with EDEN_NX2_DEBUG_SERVER=127.0.0.1:6545, then register this script 
 server for the agent:  python3 -I tools/nx2/debug_mcp.py [--server 127.0.0.1:6545]
 or run one request from a shell:
   python3 -I tools/nx2/debug_mcp.py --call '{"method":"screenshot","params":{}}' --out shot.png
+A console refuses TCP in both directions, so there the game is started with
+EDEN_NX2_DEBUG_FILE=<dir> and asked through that directory over FTP:
+  python3 -I tools/nx2/debug_mcp.py --ftp 192.168.3.44:2121 --file /data/eglantineps5/user/log/debug-file --call '{"method":"status","params":{}}'
 
 Standard library only. Each tool call is forwarded as one JSON line to the emulator, which may
 be restarted between calls: the adapter reconnects on demand.
@@ -13,12 +16,15 @@ be restarted between calls: the adapter reconnects on demand.
 
 import argparse
 import base64
+import ftplib
+import io
 import json
 import math
 import os
 import socket
 import subprocess
 import sys
+import time
 
 PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 DEFAULT_SERVER = "127.0.0.1:6545"
@@ -262,15 +268,24 @@ class EmulatorError(Exception):
 
 
 class Emulator:
-    """One JSON line per request to the debug server, reconnecting when the game restarted."""
+    """One JSON line per request to the debug server, reconnecting when the game restarted.
 
-    def __init__(self, address):
+    With `listen` the roles are inverted: this side waits for the game to dial in
+    (EDEN_NX2_DEBUG_CONNECT on the console, where accept() is refused)."""
+
+    def __init__(self, address, listen=False):
         host, _, port = address.rpartition(":")
         self.host = host.strip("[]") or "127.0.0.1"
         self.port = int(port)
         self.sock = None
         self.buffer = b""
         self.next_id = 1
+        self.listener = None
+        if listen:
+            self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.listener.bind((self.host, self.port))
+            self.listener.listen(4)
 
     def close(self):
         if self.sock is not None:
@@ -278,11 +293,19 @@ class Emulator:
         self.sock = None
         self.buffer = b""
 
+    def connect(self, timeout):
+        if self.listener is None:
+            return socket.create_connection((self.host, self.port), timeout=5)
+        self.listener.settimeout(timeout)
+        connection, _ = self.listener.accept()
+        connection.settimeout(timeout)
+        return connection
+
     def call(self, method, params, timeout):
         for attempt in (0, 1):
             try:
                 if self.sock is None:
-                    self.sock = socket.create_connection((self.host, self.port), timeout=5)
+                    self.sock = self.connect(timeout)
                 self.sock.settimeout(timeout)
                 request_id = self.next_id
                 self.next_id += 1
@@ -299,6 +322,11 @@ class Emulator:
             except (ConnectionRefusedError, socket.timeout) as error:
                 self.close()
                 if isinstance(error, socket.timeout):
+                    if self.listener is not None:
+                        raise EmulatorError(
+                            f"nothing dialled in to {self.host}:{self.port} within {timeout} s: "
+                            f"start the game with EDEN_NX2_DEBUG_CONNECT={self.host}:{self.port}"
+                        ) from error
                     raise EmulatorError(f"no answer within {timeout} s") from error
                 raise EmulatorError(
                     f"nothing listens on {self.host}:{self.port}: start Lichii with "
@@ -308,6 +336,58 @@ class Emulator:
                 self.close()
                 if attempt == 1:
                     raise EmulatorError(str(error)) from error
+        if "error" in response:
+            raise EmulatorError(response["error"])
+        return response.get("result")
+
+
+class FileEmulator:
+    """One request per poll through request.json/response.json in a console directory over FTP.
+
+    A PS5 title is refused TCP both ways, so on a console this is the transport
+    (EDEN_NX2_DEBUG_FILE=<dir>). Both files carry the request's id as "seq"."""
+
+    def __init__(self, address, directory):
+        host, _, port = address.rpartition(":")
+        self.ftp = ftplib.FTP()
+        self.ftp.connect(host or "127.0.0.1", int(port or 21), timeout=10)
+        self.ftp.login()
+        self.directory = directory.rstrip("/")
+        self.next_id = 1
+
+    def close(self):
+        try:
+            self.ftp.close()
+        except OSError:
+            pass
+
+    def call(self, method, params, timeout):
+        request_id = self.next_id
+        self.next_id += 1
+        request = json.dumps({"id": request_id, "seq": request_id, "method": method,
+                              "params": params})
+        try:
+            self.ftp.storbinary("STOR " + self.directory + "/request.json",
+                                io.BytesIO(request.encode() + b"\n"))
+        except ftplib.error_perm as error:
+            raise EmulatorError(
+                f"cannot write {self.directory}/request.json: {error}; start the game with "
+                f"EDEN_NX2_DEBUG_FILE={self.directory}") from error
+        deadline = time.time() + timeout
+        response = None
+        while time.time() < deadline:
+            buffer = io.BytesIO()
+            try:
+                self.ftp.retrbinary("RETR " + self.directory + "/response.json", buffer.write)
+                response = json.loads(buffer.getvalue())
+            except (ftplib.error_perm, ValueError):
+                response = None
+            if isinstance(response, dict) and response.get("id") == request_id:
+                break
+            response = None
+            time.sleep(0.1)
+        if response is None:
+            raise EmulatorError(f"no answer within {timeout} s from {self.directory}")
         if "error" in response:
             raise EmulatorError(response["error"])
         return response.get("result")
@@ -451,11 +531,23 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--server", default=os.environ.get("LICHII_DEBUG_SERVER", DEFAULT_SERVER),
                         help=f"host:port of EDEN_NX2_DEBUG_SERVER (default {DEFAULT_SERVER})")
+    parser.add_argument("--listen", action="store_true",
+                        help="wait for the game to dial in to --server (EDEN_NX2_DEBUG_CONNECT)")
+    parser.add_argument("--file", metavar="DIR",
+                        help="ask through request.json/response.json in this console directory over "
+                             "FTP (EDEN_NX2_DEBUG_FILE; the only transport a console allows)")
+    parser.add_argument("--ftp", metavar="HOST:PORT", default=os.environ.get("LICHII_DEBUG_FTP",
+                                                                             "127.0.0.1:21"),
+                        help="with --file: the console's FTP server (default 127.0.0.1:21)")
     parser.add_argument("--call", metavar="JSON",
                         help='run one request and exit, e.g. \'{"method":"screenshot","params":{}}\'')
     parser.add_argument("--out", metavar="PNG", help="with --call: where to save the PNG")
     args = parser.parse_args()
-    adapter = Adapter(Emulator(args.server))
+    if args.file:
+        emulator = FileEmulator(args.ftp, args.file)
+    else:
+        emulator = Emulator(args.server, listen=args.listen)
+    adapter = Adapter(emulator)
     if args.call is not None:
         sys.exit(call_once(adapter, args.call, args.out, sys.stdout))
     serve(adapter, sys.stdin, sys.stdout)

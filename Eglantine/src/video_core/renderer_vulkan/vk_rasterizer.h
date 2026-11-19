@@ -432,6 +432,7 @@ private:
         Submitted,
         RenderPass,
         DeltaPipeline,
+        VertexInput,
         HandleBind,
         HandleData,
         SampledImages,
@@ -460,6 +461,12 @@ private:
         /// PrepareDraw time and draws per path.
         std::array<u64, static_cast<size_t>(DrawPath::Count)> prepare_ns{};
         std::array<u64, static_cast<size_t>(DrawPath::Count)> prepare_draws{};
+        /// PrepareDraw time per path: 4 us buckets to 256 us, and the largest seen.
+        static constexpr size_t PrepareBucketUs = 4;
+        static constexpr size_t PrepareBuckets = 64;
+        std::array<std::array<u32, PrepareBuckets>, static_cast<size_t>(DrawPath::Count)>
+            prepare_hist{};
+        std::array<u64, static_cast<size_t>(DrawPath::Count)> prepare_max_ns{};
         /// EDEN_NX2_FAST_DRAW_VERIFY
         u64 verified{};
         u64 pipeline_mismatches{};

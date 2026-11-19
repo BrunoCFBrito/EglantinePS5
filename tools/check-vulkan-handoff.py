@@ -39,6 +39,11 @@ using namespace std::chrono_literals;
 inline bool handoff_enabled = true;
 extern "C" bool eden_vulkan_handoff_enabled() { return handoff_enabled; }
 struct MkwWorkerTimer {};
+namespace Eden::Performance {
+enum class CpuRole { GpuCommand, GpuBack, VulkanWorker };
+inline void PublishRoleCpu(CpuRole) {}
+}
+
 namespace VideoCommon {
 namespace LoadingProbe { struct Probe { void Mark(const char*) {} }; inline Probe gpu; }
 namespace GpuSplit { inline bool check_owner{}; inline void CheckOwner(const char*) {} }

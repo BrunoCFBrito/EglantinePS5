@@ -67,8 +67,12 @@ Maxwell3D::Maxwell3D(MemoryManager& memory_manager_)
     execution_mask.reset();
     for (size_t i = 0; i < execution_mask.size(); i++)
         execution_mask[i] = IsMethodExecutable(u32(i));
-    fast_maxwell3d = !record_write_history &&
-                     !trace_first_method_writes && !VideoCommon::Nx2Profile::Enabled();
+    // EDEN_NX2_PROFILE_KEEP_FAST=1 keeps the fast method path while the profile runs: the zones
+    // then measure a program whose per-draw cost is the one players get, at the price of the
+    // per-method counts the profile alone would give.
+    static const bool keep_fast_while_profiling = std::getenv("EDEN_NX2_PROFILE_KEEP_FAST") != nullptr;
+    fast_maxwell3d = !record_write_history && !trace_first_method_writes &&
+                     (!VideoCommon::Nx2Profile::Enabled() || keep_fast_while_profiling);
 }
 
 Maxwell3D::~Maxwell3D() = default;
@@ -370,7 +374,8 @@ bool Maxwell3D::IsFastDrawParameter(u32 method) {
         return true;
     default:
         return DrawManager::IsInstanceLoopMethod(method) || IsFastDrawDeltaMethod(method) ||
-               IsFastDrawVertexBuffer(method) || IsFastDrawQueryMethod(method);
+               IsFastDrawVertexBuffer(method) || IsFastDrawVertexFormat(method) ||
+               IsFastDrawPipelineConfig(method) || IsFastDrawQueryMethod(method);
     }
 }
 
@@ -380,6 +385,25 @@ bool Maxwell3D::IsFastDrawQueryMethod(u32 method) {
     // CounterEnable), and a resolve that leaves the render pass ends the delta chain there.
     return method == MAXWELL3D_REG_INDEX(clear_report_value) ||
            method == MAXWELL3D_REG_INDEX(render_enable.mode);
+}
+
+bool Maxwell3D::IsFastDrawPipelineConfig(u32 method) {
+    // register_count is written per draw and read by nothing: a pipeline is chosen by its
+    // program offset and the shader hashes, which end reuse through the shader set.
+    constexpr u32 pipelines = MAXWELL3D_REG_INDEX(pipelines);
+    constexpr u32 words = sizeof(Regs::Pipeline) / sizeof(u32);
+    if (method < pipelines || method >= pipelines + Regs::MaxShaderProgram * words) {
+        return false;
+    }
+    return (method - pipelines) % words == 3; // register_count
+}
+
+bool Maxwell3D::IsFastDrawVertexFormat(u32 method) {
+    // With dynamic vertex input only each attribute's type class is in the pipeline key, which
+    // the reusable draw compares (TakeReusableDraw); the rest is recorded for every draw.
+    constexpr u32 formats = MAXWELL3D_REG_INDEX(vertex_attrib_format);
+    return VideoCommon::Nx2FastDraw::g_dynamic_vertex_input.load(std::memory_order_relaxed) &&
+           method >= formats && method < formats + Regs::NumVertexAttributes;
 }
 
 bool Maxwell3D::IsFastDrawVertexBuffer(u32 method) {

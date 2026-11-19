@@ -261,6 +261,10 @@ struct FixedPipelineState {
     u32 line_stipple_factor;
     u32 line_stipple_pattern;
 
+    /// The type class of each attribute (2 bits each), the part of a vertex attribute format that
+    /// stays in the pipeline key with dynamic vertex input.
+    [[nodiscard]] static u64 DynamicAttributeTypes(const Tegra::Engines::Maxwell3D::Regs& regs) noexcept;
+
     void Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFeatures& features);
 
     size_t Hash() const noexcept;

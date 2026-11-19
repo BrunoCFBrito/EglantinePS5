@@ -26,15 +26,27 @@ class Memory;
 
 namespace Core::Nx2Debug {
 
+class Client;
+class FileSession;
 class Server;
 struct Endpoint;
 struct ToolState;
+
+/// Where the service gets its requests: a listening socket, a connection it dials, or two files in
+/// `directory` (a console refuses TCP in both directions, so there the files are what is left).
+struct ServiceTarget {
+    enum class Kind { Listen, Dial, File };
+    Kind kind{Kind::Listen};
+    std::string host;
+    u16 port{};
+    std::string directory;
+};
 
 /// The debug server of one boot (docs/nx2/debug-mcp.md): started when a game has loaded, stopped
 /// first when it shuts down, so the tools never see a half-built or half-destroyed system.
 class Service {
 public:
-    explicit Service(System& system, std::string title, u64 program_id, const Endpoint& endpoint,
+    explicit Service(System& system, std::string title, u64 program_id, const ServiceTarget& target,
                      std::string dump_directory);
     ~Service();
 
@@ -44,6 +56,8 @@ public:
 private:
     std::shared_ptr<ToolState> state;
     std::unique_ptr<Server> server;
+    std::unique_ptr<Client> client;
+    std::unique_ptr<FileSession> files;
 };
 
 /// A reject_shaders hash: exactly 16 hex digits, optionally after 0x. Throws std::runtime_error.

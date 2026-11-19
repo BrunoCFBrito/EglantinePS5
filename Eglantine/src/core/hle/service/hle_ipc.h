@@ -416,11 +416,17 @@ public:
         is_deferred = is_deferred_;
     }
 
+    /// Whether the reply just written hands the guest handle 0 for an object that was null.
+    [[nodiscard]] bool WroteNullHandle() const {
+        return wrote_null_handle;
+    }
+
 private:
     friend struct IPC::ResponseBuilder;
 
     void ParseCommandBuffer(u32_le* src_cmdbuf, bool incoming);
 
+    bool wrote_null_handle{};
     std::array<u32, IPC::COMMAND_BUFFER_LENGTH> cmd_buf;
     Kernel::KServerSession* server_session{};
     Kernel::KHandleTable* client_handle_table{};

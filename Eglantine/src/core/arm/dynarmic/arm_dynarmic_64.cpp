@@ -293,6 +293,8 @@ u64 DynarmicCallbacks64::GetTicksRemaining() {
 }
 
 u64 DynarmicCallbacks64::GetCNTPCT() {
+    static const bool stats = std::getenv("EDEN_NX2_CNTPCT_STATS") != nullptr;
+    const long long stats_begin = stats ? Common::g_wall_clock.GetTimeNS().count() : 0;
     const u64 ticks = m_parent.m_system.CoreTiming().GetClockTicks();
     // Guest code that waits by polling the counter (title 1's main thread reads it ~17 million
     // times a second while waiting for the GPU) keeps a host core busy at full speed, and the
@@ -303,7 +305,8 @@ u64 DynarmicCallbacks64::GetCNTPCT() {
         const char* value = std::getenv("EDEN_NX2_CNTPCT_PAUSE");
         return value == nullptr || value[0] != '0';
     }();
-    if (pause_spins && ticks - m_last_cntpct < m_spin_ticks) {
+    const bool spinning = ticks - m_last_cntpct < m_spin_ticks;
+    if (pause_spins && spinning) {
 #if defined(_M_X64) || defined(__x86_64__)
         _mm_pause();
         _mm_pause();
@@ -312,6 +315,19 @@ u64 DynarmicCallbacks64::GetCNTPCT() {
 #endif
     }
     m_last_cntpct = ticks;
+    if (stats) {
+        const size_t core = m_parent.CoreIndex();
+        if (core < Eden::Performance::cntpct_stats.size()) {
+            auto& entry = Eden::Performance::cntpct_stats[core];
+            entry.reads.fetch_add(1, std::memory_order_relaxed);
+            if (spinning) {
+                entry.spin_reads.fetch_add(1, std::memory_order_relaxed);
+            }
+            entry.cntpct_ns.fetch_add(
+                static_cast<u64>(Common::g_wall_clock.GetTimeNS().count() - stats_begin),
+                std::memory_order_relaxed);
+        }
+    }
     return ticks;
 }
 

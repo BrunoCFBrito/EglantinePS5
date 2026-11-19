@@ -925,21 +925,44 @@ std::optional<HID::InjectedInput> InputAt(std::span<const InputStep> steps, u64 
     return std::nullopt;
 }
 
-Service::Service(System& system, std::string title, u64 program_id, const Endpoint& endpoint,
+Service::Service(System& system, std::string title, u64 program_id, const ServiceTarget& target,
                  std::string dump_directory)
     : state{std::make_shared<ToolState>(system, std::move(title), program_id,
                                         std::move(dump_directory))} {
     VideoCore::Nx2Debug::BeginSession();
     Common::Log::SetRingCapacity(RING_LINES);
+    const Endpoint endpoint{target.host, target.port};
     try {
-        server = std::make_unique<Server>(endpoint, MakeHandlers(state));
+        switch (target.kind) {
+        case ServiceTarget::Kind::Dial:
+            client = std::make_unique<Client>(endpoint, MakeHandlers(state));
+            break;
+        case ServiceTarget::Kind::File:
+            files = std::make_unique<FileSession>(target.directory, MakeHandlers(state));
+            break;
+        case ServiceTarget::Kind::Listen:
+            server = std::make_unique<Server>(endpoint, MakeHandlers(state));
+            break;
+        }
     } catch (...) {
         VideoCore::Nx2Debug::EndSession();
         throw;
     }
     g_nx2_present_time_services.fetch_add(1, std::memory_order_relaxed);
-    LOG_INFO(Debug, "Debug server listening on {}:{}, dump dir {}", endpoint.host, server->Port(),
-             state->dump_directory.generic_string());
+    switch (target.kind) {
+    case ServiceTarget::Kind::Dial:
+        LOG_INFO(Debug, "Debug client dialling {}:{}, dump dir {}", target.host, target.port,
+                 state->dump_directory.generic_string());
+        break;
+    case ServiceTarget::Kind::File:
+        LOG_INFO(Debug, "Debug files in {}, dump dir {}", target.directory,
+                 state->dump_directory.generic_string());
+        break;
+    case ServiceTarget::Kind::Listen:
+        LOG_INFO(Debug, "Debug server listening on {}:{}, dump dir {}", target.host,
+                 server->Port(), state->dump_directory.generic_string());
+        break;
+    }
 }
 
 Service::~Service() {
@@ -947,17 +970,41 @@ Service::~Service() {
     g_nx2_present_time_services.fetch_sub(1, std::memory_order_relaxed);
     VideoCore::Nx2Debug::EndSession();
     server.reset();
+    client.reset();
+    files.reset();
 }
 
 std::unique_ptr<Service> MaybeStartService(System& system, std::string title, u64 program_id) {
-    const char* const text = std::getenv("EDEN_NX2_DEBUG_SERVER");
-    if (text == nullptr || *text == '\0') {
-        return nullptr;
-    }
+    // EDEN_NX2_DEBUG_SERVER listens, EDEN_NX2_DEBUG_CONNECT dials out, EDEN_NX2_DEBUG_FILE names
+    // the directory two files go in. A console refuses libc TCP both ways (a title's accept() and
+    // connect() return EACCES, verified 2026-11-19); the server there is built on the platform's
+    // own network API instead, and the files remain for a build where even that is refused.
+    const char* const file = std::getenv("EDEN_NX2_DEBUG_FILE");
+    const char* const connect = std::getenv("EDEN_NX2_DEBUG_CONNECT");
+    const char* const listen = std::getenv("EDEN_NX2_DEBUG_SERVER");
+    ServiceTarget target;
     std::string error;
-    const auto endpoint = ParseEndpoint(text, error);
-    if (!endpoint) {
-        LOG_ERROR(Debug, "EDEN_NX2_DEBUG_SERVER={}: {}; the debug server is off", text, error);
+    if (file != nullptr && *file != '\0') {
+        target.kind = ServiceTarget::Kind::File;
+        target.directory = file;
+    } else if (connect != nullptr && *connect != '\0') {
+        target.kind = ServiceTarget::Kind::Dial;
+        const auto endpoint = ParseEndpoint(connect, error, true);
+        if (!endpoint) {
+            LOG_ERROR(Debug, "EDEN_NX2_DEBUG_CONNECT={}: {}; the debug client is off", connect, error);
+            return nullptr;
+        }
+        target.host = endpoint->host;
+        target.port = endpoint->port;
+    } else if (listen != nullptr && *listen != '\0') {
+        const auto endpoint = ParseEndpoint(listen, error);
+        if (!endpoint) {
+            LOG_ERROR(Debug, "EDEN_NX2_DEBUG_SERVER={}: {}; the debug server is off", listen, error);
+            return nullptr;
+        }
+        target.host = endpoint->host;
+        target.port = endpoint->port;
+    } else {
         return nullptr;
     }
     const char* const directory = std::getenv("EDEN_NX2_DEBUG_DIR");
@@ -965,11 +1012,10 @@ std::unique_ptr<Service> MaybeStartService(System& system, std::string title, u6
         ? std::string{directory}
         : (Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir) / "debug-server").generic_string();
     try {
-        return std::make_unique<Service>(system, std::move(title), program_id, *endpoint,
+        return std::make_unique<Service>(system, std::move(title), program_id, target,
                                          std::move(dump_directory));
     } catch (const std::exception& failure) {
-        LOG_ERROR(Debug, "Debug server cannot listen on {}:{}: {}", endpoint->host, endpoint->port,
-                  failure.what());
+        LOG_ERROR(Debug, "The debug service cannot start: {}", failure.what());
         return nullptr;
     }
 }

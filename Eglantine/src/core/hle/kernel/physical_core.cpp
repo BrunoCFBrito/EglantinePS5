@@ -160,8 +160,30 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
 
         // Handle system calls.
         if (supervisor_call) {
-            // Perform call.
-            Svc::Call(system, interface->GetSvcNumber());
+            // Perform call. EDEN_NX2_CNTPCT_STATS times it per core, so guest CPU splits into
+            // kernel/HLE work, the CNTPCT callback and guest code.
+            static const bool svc_stats = std::getenv("EDEN_NX2_CNTPCT_STATS") != nullptr;
+            // A blocking SVC can yield to another guest thread on this same host thread, which may
+            // enter an SVC of its own: only the outermost call's wall time is this core's.
+            static thread_local unsigned svc_depth = 0;
+            const bool outermost = svc_depth++ == 0;
+            const u32 svc_number = interface->GetSvcNumber();
+            const long long svc_begin = svc_stats && outermost ? Eden::Performance::DurationNs() : 0;
+            Svc::Call(system, svc_number);
+            if (svc_stats && m_core_index < Eden::Performance::cntpct_stats.size()) {
+                auto& stats = Eden::Performance::cntpct_stats[m_core_index];
+                stats.svcs.fetch_add(1, std::memory_order_relaxed);
+                if (svc_number < 512) {
+                    Eden::Performance::svc_numbers[m_core_index][svc_number].fetch_add(
+                        1, std::memory_order_relaxed);
+                }
+                if (outermost) {
+                    stats.svc_ns.fetch_add(
+                        static_cast<unsigned long long>(Eden::Performance::DurationNs() - svc_begin),
+                        std::memory_order_relaxed);
+                }
+            }
+            --svc_depth;
             return;
         }
 

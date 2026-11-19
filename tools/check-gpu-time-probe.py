@@ -62,6 +62,9 @@ struct Device {
  const Physical& GetPhysical()const{return physical;}
  unsigned GetGraphicsFamily()const{return 0;}
 };
+// The probe section logs its periodic line; the stub keeps the probe's logic under test.
+enum { HW_GPU = 0 };
+template <typename... Args> void LOG_INFO(int, const char*, Args&&...) {}
 '''+f'\n#include "{root}/headless/hud_gpu_time.h"\n#include "{root}/headless/submission_origin.h"\n'+probe_section()+r'''
 int main(){Device d;vk::CommandBuffer cmd;
  Eden::DevVulkan::gpu_time=true;

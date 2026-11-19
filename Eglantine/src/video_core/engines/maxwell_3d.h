@@ -3280,6 +3280,10 @@ public:
     static bool IsFastDrawDeltaMethod(u32 method);
     /// A vertex stream's address, size or limit (not its stride or enable).
     static bool IsFastDrawVertexBuffer(u32 method);
+    /// A vertex attribute format word, where dynamic vertex input keeps its type class in the key.
+    static bool IsFastDrawVertexFormat(u32 method);
+    /// A pipeline's register_count: written per draw and read by nothing.
+    static bool IsFastDrawPipelineConfig(u32 method);
     /// Counter resets and the render enable mode: query state every draw applies itself.
     static bool IsFastDrawQueryMethod(u32 method);
     void NoteFastDrawConstantData(GPUVAddr begin, GPUVAddr end);

@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -132,6 +133,28 @@ static int console_curl_socket_flags(int socket, int command, int value)
     }
 }
 
+/* Boost.Asio sets non-blocking with ioctl(FIONBIO) on this platform (set_user_non_blocking
+ * calls ioctl, not fcntl), and that is refused the same way. Linked with --wrap=ioctl. */
+
+extern int __real_ioctl(int descriptor, unsigned long request, ...);
+
+int __wrap_ioctl(int descriptor, unsigned long request, ...)
+{
+    va_list arguments;
+    va_start(arguments, request);
+    void *argument = va_arg(arguments, void *);
+    va_end(arguments);
+    const int result = __real_ioctl(descriptor, request, argument);
+    if (result >= 0 || (errno != EINVAL && errno != EACCES))
+        return result;
+    if (request == FIONBIO)
+        return console_curl_socket_flags(descriptor, F_SETFL,
+                                         argument != NULL && *(const int *)argument != 0
+                                             ? O_NONBLOCK
+                                             : 0);
+    return result;
+}
+
 int __wrap_fcntl(int descriptor, int command, ...)
 {
     va_list arguments;
@@ -140,7 +163,9 @@ int __wrap_fcntl(int descriptor, int command, ...)
     const intptr_t argument = va_arg(arguments, intptr_t);
     va_end(arguments);
     const int result = __real_fcntl(descriptor, command, argument);
-    if (result >= 0 || errno != EINVAL)
+    /* FW 13.40 answers EACCES here, an older one EINVAL; both mean the console refused the call
+     * on a socket, and SO_NBIO is what it accepts instead. */
+    if (result >= 0 || (errno != EINVAL && errno != EACCES))
         return result;
     if (command == F_GETFD || command == F_SETFD || command == F_SETFL || command == F_GETFL)
         return console_curl_socket_flags(descriptor, command, (int)argument);

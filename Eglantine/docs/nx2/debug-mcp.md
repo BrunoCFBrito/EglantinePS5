@@ -40,6 +40,18 @@ with Boost.Asio, as the GDB stub does (`src/core/debugger/debugger.cpp:147`), an
 `{"id":1,"result":{...}}` or `{"id":1,"error":"..."}`. The transport knows nothing about the
 emulator: it maps method names to handlers. That keeps it unit-testable without a `System`.
 
+**Consoles: the socket is fine, `fcntl` is not.** On a PS5 title the console refuses
+`fcntl(F_SETFL, O_NONBLOCK)` on a socket (`EACCES` on FW 13.40, `EINVAL` on older firmware;
+measured 2026-11-19, and the same wall RetroArch PS5 documented). Boost.Asio sets non-blocking
+before every accept/connect and aborts the operation with that error, so the refusal looked like
+"accept() returned EACCES" and nothing ever answered. `headless/update_check/console_curl.c`
+already mapped `F_SETFL`/`FIONDIO`-style calls to `setsockopt(SOL_SOCKET, SO_NBIO)`; it now
+triggers on `EACCES` too and is linked program-wide (`-Wl,--wrap=fcntl`), which also repairs the
+guest kernel's own `SetNonBlock`. With that in place `EDEN_NX2_DEBUG_SERVER` listens as on a PC.
+`EDEN_NX2_DEBUG_CONNECT` (dial out, `debug_mcp.py --listen`) and `EDEN_NX2_DEBUG_FILE` (a
+request/response directory reached over FTP, `debug_mcp.py --file`) remain as fallbacks; the
+protocol is identical in all three.
+
 `src/core/debugger/nx2_debug_tools.cpp` holds the tools. `Core::System::Impl::Load` starts the
 service once a game has loaded (`src/core/core.cpp:476`), and `ShutdownMainProcess` stops it
 before anything else (`src/core/core.cpp:481`). The member is declared last

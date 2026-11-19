@@ -672,6 +672,14 @@ GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_in
         ++fast_draw_stats.delta_blockers[static_cast<size_t>(draw.pipeline->DeltaDrawBlocker())];
         return full(FullDraw::DeltaPipeline);
     }
+    // Vertex attribute formats are draw parameters with dynamic vertex input (UpdateVertexInput
+    // records them for every draw); only the type class of each attribute is in the pipeline key.
+    if (maxwell3d->dirty.flags[Dirty::VertexInput] &&
+        (!draw.pipeline->HasDynamicVertexInput() ||
+         FixedPipelineState::DynamicAttributeTypes(maxwell3d->regs) !=
+             draw.pipeline->DynamicAttributeTypes())) {
+        return full(FullDraw::VertexInput);
+    }
     const auto& handles = draw.pipeline->HandleConstantBuffers();
     for (size_t stage = 0; stage < handles.size() && !delta.Empty(); ++stage) {
         if ((delta.binds[stage] & handles[stage]) != 0) {
@@ -778,13 +786,15 @@ void RasterizerVulkan::ReportFastDraws() {
     LOG_INFO(Render_Vulkan,
              "Fast draw per second: {:.0f} delta | full: {:.0f} after an ineligible draw, {:.0f} "
              "different kind, {:.0f} state changed, {:.0f} after a submit, {:.0f} render pass or "
-             "pipeline changed, {:.0f} pipeline takes no delta draws, {:.0f} handle buffer bound, "
-             "{:.0f} handle data written, {:.0f} sampled image to prepare",
+             "pipeline changed, {:.0f} pipeline takes no delta draws, {:.0f} vertex input changed, "
+             "{:.0f} handle buffer bound, {:.0f} handle data written, "
+             "{:.0f} sampled image to prepare",
              static_cast<double>(stats.delta) / seconds, per_second(FullDraw::NoCandidate),
              per_second(FullDraw::Kind), per_second(FullDraw::StateChanged),
              per_second(FullDraw::Submitted), per_second(FullDraw::RenderPass),
-             per_second(FullDraw::DeltaPipeline), per_second(FullDraw::HandleBind),
-             per_second(FullDraw::HandleData), per_second(FullDraw::SampledImages));
+             per_second(FullDraw::DeltaPipeline), per_second(FullDraw::VertexInput),
+             per_second(FullDraw::HandleBind), per_second(FullDraw::HandleData),
+             per_second(FullDraw::SampledImages));
     static constexpr std::array<const char*, static_cast<size_t>(Ineligible::Count)>
         ineligible_names{"indirect",       "mesh",          "not built",     "writes images",
                          "transform feedback", "inline index", "quads",       "repacked vertices",
@@ -805,6 +815,33 @@ void RasterizerVulkan::ReportFastDraws() {
     };
     const u64 all_draws = stats.prepare_draws[0] + stats.prepare_draws[1];
     const u64 all_ns = stats.prepare_ns[0] + stats.prepare_ns[1];
+    // PrepareDraw percentiles per path, from the 4 us buckets.
+    const auto percentile_us = [&](DrawPath path, double fraction) {
+        const size_t index = static_cast<size_t>(path);
+        const u64 total = stats.prepare_draws[index];
+        if (total == 0) {
+            return 0.0;
+        }
+        const u64 target = static_cast<u64>(fraction * static_cast<double>(total));
+        u64 seen = 0;
+        for (size_t bucket = 0; bucket < FastDrawStats::PrepareBuckets; ++bucket) {
+            seen += stats.prepare_hist[index][bucket];
+            if (seen > target) {
+                return static_cast<double>(bucket + 1) * FastDrawStats::PrepareBucketUs;
+            }
+        }
+        return static_cast<double>(FastDrawStats::PrepareBuckets) * FastDrawStats::PrepareBucketUs;
+    };
+    const auto max_us = [&](DrawPath path) {
+        return static_cast<double>(stats.prepare_max_ns[static_cast<size_t>(path)]) / 1e3;
+    };
+    LOG_INFO(Render_Vulkan,
+             "Fast draw prepare percentiles: full p50={:.0f} p90={:.0f} p99={:.0f} max={:.0f} us | "
+             "delta p50={:.0f} p90={:.0f} p99={:.0f} max={:.0f} us",
+             percentile_us(DrawPath::Full, 0.50), percentile_us(DrawPath::Full, 0.90),
+             percentile_us(DrawPath::Full, 0.99), max_us(DrawPath::Full),
+             percentile_us(DrawPath::Delta, 0.50), percentile_us(DrawPath::Delta, 0.90),
+             percentile_us(DrawPath::Delta, 0.99), max_us(DrawPath::Delta));
     static constexpr std::array<const char*,
                                 static_cast<size_t>(GraphicsPipeline::DeltaBlocker::Count)>
         blocker_names{"none", "writes images", "mesh", "computed handles", "not configured"};
@@ -1091,9 +1128,12 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     const ::Eden::Performance::Timer rasterizer_draw_timer(::Eden::Performance::rasterizer_draw);
     auto phase = ::Eden::Performance::MarkStart();
     {
-        Profile::Scope scope{Profile::Zone::FlushWork};
+        Profile::Scope scope{Profile::Zone::FlushSubmit};
         FlushWork();
         SlowDraw::At("flush work");
+    }
+    {
+        Profile::Scope scope{Profile::Zone::FlushCache};
         gpu_memory->FlushCaching();
         SlowDraw::At("flush caching");
     }
@@ -1470,7 +1510,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     }
     const DrawPath path = delta_holds && !verify_pipeline ? DrawPath::Delta : DrawPath::Full;
     SlowDraw::At("engine setup");
-    buffer_cache.BeginGraphicsUniforms(path == DrawPath::Delta ? &taken_delta : nullptr);
+    {
+        Profile::Scope scope{Profile::Zone::UniformsBegin};
+        buffer_cache.BeginGraphicsUniforms(path == DrawPath::Delta ? &taken_delta : nullptr);
+    }
     if (path == DrawPath::Delta) {
         if (Profile::Scope scope{Profile::Zone::Configure};
             !ConfigureIgnoringOom([&] { return pipeline->ConfigureDelta(is_indexed); })) {
@@ -1502,6 +1545,8 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     }
 
     SlowDraw::At("pipeline configure");
+    {
+    Profile::Scope record_gap{Profile::Zone::RecordGap};
     {
         Profile::Scope scope{Profile::Zone::OcarinaTrack};
         TrackOcarinaCamera();
@@ -1554,6 +1599,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         UpdateDynamicStates(pipeline);
     }
 
+    }
     SlowDraw::At("dynamic state");
     {
         Profile::Scope scope{Profile::Zone::DrawQueries};
@@ -1609,10 +1655,20 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         }
     }
     if (fast_draw_on) {
-        NoteResolvedDraw(pipeline, is_indexed, is_indirect, draw_serial, draw_map_serial);
+        {
+            Profile::Scope scope{Profile::Zone::ResolveNote};
+            NoteResolvedDraw(pipeline, is_indexed, is_indirect, draw_serial, draw_map_serial);
+        }
         const size_t index = static_cast<size_t>(path);
-        fast_draw_stats.prepare_ns[index] += Profile::Now() - fast_draw_start;
+        const u64 prepare_ns = Profile::Now() - fast_draw_start;
+        fast_draw_stats.prepare_ns[index] += prepare_ns;
         ++fast_draw_stats.prepare_draws[index];
+        constexpr size_t bucket_us = FastDrawStats::PrepareBucketUs;
+        const size_t bucket = std::min<size_t>(prepare_ns / (bucket_us * 1000),
+                                               FastDrawStats::PrepareBuckets - 1);
+        ++fast_draw_stats.prepare_hist[index][bucket];
+        fast_draw_stats.prepare_max_ns[index] =
+            std::max(fast_draw_stats.prepare_max_ns[index], prepare_ns);
     }
     static u32 native_capture_count{};
     if (maxwell3d->GetNativeMacroEngine().native_turing &&
