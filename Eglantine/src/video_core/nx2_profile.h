@@ -90,6 +90,10 @@ enum class Zone : u32 {
     SplitCall,            ///< A deferred call entry on the split's back
     FlushSubmit,          ///< FlushWork: the submission policy's flush
     FlushCache,           ///< FlushCaching: deferred guest writes and the invalidation accumulator
+    BindUniforms,         ///< Of bind stage buffers: the uniform buffers of one stage
+    BindOtherBuffers,     ///< Of bind stage buffers: the storage and texture buffers of one stage
+    UpdateVertexInput,    ///< Of update buffers: index, vertex and transform-feedback bindings
+    UpdateStageBuffers,   ///< Of update buffers: each stage's uniform, storage and texture buffers
     Count,
 };
 
@@ -109,6 +113,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "delta take", "delta check", "ocarina track",
     "uniforms begin", "record gap", "resolve note",
     "split execute", "split call", "flush submit", "flush cache",
+    "bind uniforms", "bind storage/texture", "update vertex input", "update stage buffers",
 };
 
 static_assert(static_cast<size_t>(Zone::Count) <= StutterTrace::ZoneSlots);
@@ -186,7 +191,7 @@ inline u64 Ticks() {
 struct ThreadData {
     std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ns{};
     std::array<u64, static_cast<size_t>(Zone::Count)> count{};
-    std::array<u64, 8> counters{}; ///< See Counter
+    std::array<u64, 16> counters{}; ///< See Counter
     std::array<u64, static_cast<size_t>(DrainSite::Count)> drain_ns{};
     std::array<u64, static_cast<size_t>(DrainSite::Count)> drain_count{};
     /// GPU waits by the zone they happened in (Other: outside every zone)
@@ -267,6 +272,10 @@ enum class Counter : u32 {
     SameValueWrites, ///< Of MethodWrites: the register already held the value
     AcquireChecks,  ///< Semaphore acquires evaluated
     AcquireWaits,   ///< Of AcquireChecks: not met yet (the channel waits)
+    SplitMethodEntries, ///< Split entries of kind Method (one register write each)
+    SplitMultiEntries,  ///< Split entries of kind Multi (a run of one register's writes)
+    SplitCallEntries,   ///< Split entries of kind Call (a thunk and its payload)
+    SplitOtherEntries,  ///< Split entries of kind Engine, Wrap or a bad head
 };
 
 /// Method calls on this thread by method (3D registers on the back, macros on the front), and
@@ -384,6 +393,11 @@ inline void Report(const char* thread_name = "GPU thread", bool report_all_conte
     line += fmt::format(" | 3D register writes {:.0f} ({:.0f} same value)",
                         static_cast<double>(data.counters[4]) * 1e9 / window,
                         static_cast<double>(data.counters[5]) * 1e9 / window);
+    line += fmt::format(" | split entries method {:.0f} multi {:.0f} call {:.0f} other {:.0f}",
+                        static_cast<double>(data.counters[static_cast<size_t>(Counter::SplitMethodEntries)]) * 1e9 / window,
+                        static_cast<double>(data.counters[static_cast<size_t>(Counter::SplitMultiEntries)]) * 1e9 / window,
+                        static_cast<double>(data.counters[static_cast<size_t>(Counter::SplitCallEntries)]) * 1e9 / window,
+                        static_cast<double>(data.counters[static_cast<size_t>(Counter::SplitOtherEntries)]) * 1e9 / window);
     line += fmt::format(" | acquires {:.0f} ({:.0f} waited)",
                         static_cast<double>(data.counters[6]) * 1e9 / window,
                         static_cast<double>(data.counters[7]) * 1e9 / window);

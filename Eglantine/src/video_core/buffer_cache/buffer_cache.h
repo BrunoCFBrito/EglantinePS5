@@ -1777,12 +1777,19 @@ void BufferCache<P>::BindHostGeometryBuffers(bool is_indexed) {
 
 template <class P>
 void BufferCache<P>::BindHostStageBuffers(size_t stage) {
-    BindHostGraphicsUniformBuffers(stage);
-    if (channel_state->enabled_storage_buffers[stage] != 0) {
-        BindHostGraphicsStorageBuffers(stage);
+    {
+        VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::BindUniforms};
+        BindHostGraphicsUniformBuffers(stage);
     }
-    if (channel_state->enabled_texture_buffers[stage] != 0) {
-        BindHostGraphicsTextureBuffers(stage);
+    if (channel_state->enabled_storage_buffers[stage] != 0 ||
+        channel_state->enabled_texture_buffers[stage] != 0) {
+        VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::BindOtherBuffers};
+        if (channel_state->enabled_storage_buffers[stage] != 0) {
+            BindHostGraphicsStorageBuffers(stage);
+        }
+        if (channel_state->enabled_texture_buffers[stage] != 0) {
+            BindHostGraphicsTextureBuffers(stage);
+        }
     }
 }
 
@@ -3198,16 +3205,22 @@ void BufferCache<P>::DoUpdateGraphicsBuffers(bool is_indexed) {
     long long since_upd = ::Eden::Performance::MarkStart();
     graphics_segments.clear();
     BufferOperations([&]() {
-        if (is_indexed) {
-            UpdateIndexBuffer();
+        {
+            VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::UpdateVertexInput};
+            if (is_indexed) {
+                UpdateIndexBuffer();
+            }
+            UpdateVertexBuffers();
+            UpdateTransformFeedbackBuffers();
         }
-        UpdateVertexBuffers();
-        UpdateTransformFeedbackBuffers();
         ::Eden::Performance::Mark(::Eden::Performance::upd_state, since_upd);
-        for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
-            UpdateUniformBuffers(stage);
-            UpdateStorageBuffers(stage);
-            UpdateTextureBuffers(stage);
+        {
+            VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::UpdateStageBuffers};
+            for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+                UpdateUniformBuffers(stage);
+                UpdateStorageBuffers(stage);
+                UpdateTextureBuffers(stage);
+            }
         }
         ::Eden::Performance::Mark(::Eden::Performance::upd_stage, since_upd);
         if (current_draw_indirect) {
