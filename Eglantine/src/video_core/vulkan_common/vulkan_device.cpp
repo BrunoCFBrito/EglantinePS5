@@ -563,6 +563,9 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
                                  properties.subgroup_size_control.maxSubgroupSize > GuestWarpSize;
 
     is_integrated = properties.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+    LOG_INFO(Render_Vulkan, "Device type {} ({}), integrated={}",
+             static_cast<int>(properties.properties.deviceType),
+             properties.properties.deviceName, is_integrated);
     is_virtual = properties.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU;
     is_non_gpu = properties.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_OTHER ||
                  properties.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
