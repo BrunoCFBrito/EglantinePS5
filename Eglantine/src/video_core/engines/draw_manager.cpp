@@ -11,6 +11,7 @@
 #include "common/settings.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/nx2_draw_audit.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/render_trace.h"
 
@@ -361,6 +362,21 @@ void Maxwell3D::DrawManager::ProcessDraw(Maxwell3D& maxwell3d, bool draw_indexed
         }
     }
     UpdateTopology(maxwell3d);
+    if (VideoCommon::Nx2DrawAudit::g_enabled) [[unlikely]] {
+        const auto& regs = maxwell3d.regs;
+        const u64 vs =
+            (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
+        const u64 ps =
+            (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1];
+        VideoCommon::Nx2DrawAudit::Count(
+            draw_indexed, draw_state.draw_element_count, instance_count,
+            static_cast<u32>(draw_state.index_buffer.format),
+            !maxwell3d.ShouldExecute(), vs, ps,
+            draw_indexed ? draw_state.index_buffer.first : draw_state.vertex_buffer.first,
+            static_cast<u64>(draw_state.topology),
+            (u64{draw_state.index_buffer.start_addr_high} << 32) |
+                draw_state.index_buffer.start_addr_low);
+    }
     if (maxwell3d.ShouldExecute()) {
         maxwell3d.rasterizer->Draw(draw_indexed, instance_count);
     } else {
@@ -372,6 +388,9 @@ void Maxwell3D::DrawManager::ProcessDrawIndirect(Maxwell3D& maxwell3d) {
     draw_state.draw_element_count = 0;
     LOG_TRACE(HW_GPU, "called, topology={}, is_indexed={}, includes_count={}, buffer_size={}, max_draw_count={}", draw_state.topology, indirect_state.is_indexed, indirect_state.include_count, indirect_state.buffer_size, indirect_state.max_draw_counts);
     UpdateTopology(maxwell3d);
+    if (VideoCommon::Nx2DrawAudit::g_enabled) [[unlikely]] {
+        ++VideoCommon::Nx2DrawAudit::g_counters.indirect;
+    }
     if (maxwell3d.ShouldExecute()) {
         maxwell3d.rasterizer->DrawIndirect();
     } else {

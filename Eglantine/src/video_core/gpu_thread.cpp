@@ -36,6 +36,7 @@ namespace Eden { bool LoadingTick(VideoCore::RendererBase&, bool idle); }
 #include "video_core/gpu_thread.h"
 #include "video_core/gpu_split.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_call_sites.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/host1x/host1x.h"
@@ -205,11 +206,13 @@ void ThreadManager::RunWorker(VideoCore::RendererBase& renderer, Core::Frontend:
                 } else if (const auto* flush = std::get_if<FlushRegionCommand>(&next.data)) {
                     split.Defer([rasterizer_ptr, addr = flush->addr, size = flush->size] {
                         rasterizer_ptr->FlushRegion(addr, size);
-                    });
+                    }, 0, VideoCommon::GpuSplit::Writes::Anywhere,
+                                VideoCommon::Nx2CallSite::GpuThreadFlushRegion);
                 } else if (const auto* invalidate = std::get_if<InvalidateRegionCommand>(&next.data)) {
                     split.Defer([rasterizer_ptr, addr = invalidate->addr, size = invalidate->size] {
                         rasterizer_ptr->OnCacheInvalidation(addr, size);
-                    });
+                    }, 0, VideoCommon::GpuSplit::Writes::Anywhere,
+                                VideoCommon::Nx2CallSite::GpuThreadInvalidateRegion);
                 } else {
                     ASSERT(false);
                 }

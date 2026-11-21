@@ -48,6 +48,35 @@ TEST_CASE("A vertex attribute format write keeps the chain only with dynamic ver
     VideoCommon::Nx2FastDraw::g_dynamic_vertex_input.store(previous);
 }
 
+TEST_CASE("Query, condition address and unused register writes keep the fast draw chain",
+          "[video_core][fast_draw]") {
+    // OoT writes the report semaphore (query, address, payload), render_enable.address_low and
+    // reads-nothing registers thousands of times a second; none is in what a delta draw keeps.
+    // Measured on the console: state-changed full draws fell 22,953 -> 18,513/s at the spawn.
+    using Regs = Tegra::Engines::Maxwell3D::Regs;
+    const auto check = [](u32 method) {
+        return Tegra::Engines::Maxwell3D::IsFastDrawParameter(method);
+    };
+    REQUIRE(check(MAXWELL3D_REG_INDEX(report_semaphore.query)));
+    REQUIRE(check(MAXWELL3D_REG_INDEX(report_semaphore.address_low)));
+    REQUIRE(check(MAXWELL3D_REG_INDEX(report_semaphore.payload)));
+    REQUIRE(check(MAXWELL3D_REG_INDEX(render_enable.address_high)));
+    REQUIRE(check(MAXWELL3D_REG_INDEX(render_enable.address_low)));
+    REQUIRE(check(MAXWELL3D_REG_INDEX(const_color_rendering)));
+    // Pipeline words 7.. (reserved[2..3] and the padding); word 6 is the program address low.
+    const u32 pipelines = MAXWELL3D_REG_INDEX(pipelines);
+    const u32 words = sizeof(Regs::Pipeline) / sizeof(u32);
+    REQUIRE(check(pipelines + 7));
+    REQUIRE(check(pipelines + words + words - 1));
+    REQUIRE_FALSE(check(pipelines + 6));
+    // The transform feedback gap: buffers end, controls begin 0x300 bytes later.
+    const u32 tf = MAXWELL3D_REG_INDEX(transform_feedback);
+    const u32 tf_buffers = sizeof(Regs::TransformFeedback::Buffer) / sizeof(u32);
+    REQUIRE(check(tf + tf_buffers * Regs::NumTransformFeedbackBuffers));
+    REQUIRE(check(tf + tf_buffers * Regs::NumTransformFeedbackBuffers + 0x100 / sizeof(u32) - 1));
+    REQUIRE_FALSE(check(tf)); // buffer enable: read (Address/IsEnabled)
+}
+
 TEST_CASE("A pipeline register_count write keeps the fast draw chain", "[video_core][fast_draw]") {
     // Written per draw, read by nothing (OoT: ~5,000/s of breaks on the console).
     const u32 pipelines = MAXWELL3D_REG_INDEX(pipelines);

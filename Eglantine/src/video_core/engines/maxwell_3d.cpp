@@ -35,6 +35,8 @@
 #include "video_core/nx2.h"
 #include "video_core/nx2_async_readback.h"
 #include "video_core/nx2_cmdpage_diag.h"
+#include "video_core/nx2_call_sites.h"
+#include "video_core/nx2_draw_audit.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
@@ -63,6 +65,7 @@ Maxwell3D::Maxwell3D(MemoryManager& memory_manager_)
 {
     dirty.flags.flip();
     InitializeRegisterDefaults();
+    VideoCommon::Nx2DrawAudit::SetEnabledFromEnv();
     reports_fast_draw_breaks = true;
     execution_mask.reset();
     for (size_t i = 0; i < execution_mask.size(); i++)
@@ -372,10 +375,17 @@ bool Maxwell3D::IsFastDrawParameter(u32 method) {
     // alter what a resolve produces. OoT 0400486024DEC000 rewrites it on about half its draws.
     case MAXWELL3D_REG_INDEX(vertex_id_base):
         return true;
+    // The conditional-render address is read only when render_enable.mode is written
+    // (ProcessQueryCondition), which does not end reuse either: ShouldExecute answers from the
+    // latched mode whatever the address is by then. OoT rewrites it on about a sixth of its draws.
+    case MAXWELL3D_REG_INDEX(render_enable.address_high):
+    case MAXWELL3D_REG_INDEX(render_enable.address_low):
+        return true;
     default:
         return DrawManager::IsInstanceLoopMethod(method) || IsFastDrawDeltaMethod(method) ||
                IsFastDrawVertexBuffer(method) || IsFastDrawVertexFormat(method) ||
-               IsFastDrawPipelineConfig(method) || IsFastDrawQueryMethod(method);
+               IsFastDrawPipelineConfig(method) || IsFastDrawQueryMethod(method) ||
+               IsUnusedRegister(method);
     }
 }
 
@@ -383,8 +393,17 @@ bool Maxwell3D::IsFastDrawQueryMethod(u32 method) {
     // Neither is in what a delta draw keeps: the draw manager asks ShouldExecute for every draw,
     // every draw resumes the counters and host conditional rendering (NotifySegment,
     // CounterEnable), and a resolve that leaves the render pass ends the delta chain there.
-    return method == MAXWELL3D_REG_INDEX(clear_report_value) ||
-           method == MAXWELL3D_REG_INDEX(render_enable.mode);
+    if (method == MAXWELL3D_REG_INDEX(clear_report_value) ||
+        method == MAXWELL3D_REG_INDEX(render_enable.mode)) {
+        return true;
+    }
+    // The report's address and payload are read when the query runs (ProcessQueryGet) and Query
+    // only notes the sync, which the buffer cache already consumes (g_sync_serial); no draw reads
+    // them. OoT rewrites the address on about a third of its draws, right before the query.
+    return method == MAXWELL3D_REG_INDEX(report_semaphore.query) ||
+           method == MAXWELL3D_REG_INDEX(report_semaphore.address_high) ||
+           method == MAXWELL3D_REG_INDEX(report_semaphore.address_low) ||
+           method == MAXWELL3D_REG_INDEX(report_semaphore.payload);
 }
 
 bool Maxwell3D::IsFastDrawPipelineConfig(u32 method) {
@@ -395,7 +414,25 @@ bool Maxwell3D::IsFastDrawPipelineConfig(u32 method) {
     if (method < pipelines || method >= pipelines + Regs::MaxShaderProgram * words) {
         return false;
     }
-    return (method - pipelines) % words == 3; // register_count
+    // register_count, then reserved[2..3] and the padding: written per draw, read by nothing. A
+    // pipeline resolves through its program address (reserved[0..1]), offset and binding group.
+    const u32 word = (method - pipelines) % words;
+    return word == 3 || word >= 7;
+}
+
+bool Maxwell3D::IsUnusedRegister(u32 method) {
+    // Registers the engine stores and never reads. OoT rewrites the transform feedback gap
+    // (0x400..0x6ff: hardware stream-out space the engine does not model) and
+    // const_color_rendering thousands of times a second; neither can change what a resolve
+    // produces.
+    constexpr u32 tf = MAXWELL3D_REG_INDEX(transform_feedback);
+    constexpr u32 tf_buffers = sizeof(Regs::TransformFeedback::Buffer) / sizeof(u32);
+    constexpr u32 tf_controls =
+        (sizeof(Regs::TransformFeedback::Buffer) * Regs::NumTransformFeedbackBuffers + 0x300) /
+        sizeof(u32);
+    const bool tf_gap = method >= tf + tf_buffers * Regs::NumTransformFeedbackBuffers &&
+                        method < tf + tf_controls;
+    return tf_gap || method == MAXWELL3D_REG_INDEX(const_color_rendering);
 }
 
 bool Maxwell3D::IsFastDrawVertexFormat(u32 method) {
@@ -2269,14 +2306,16 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                 [memory = &memory_manager, source, read_bytes] {
                     memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
                 },
-                VideoCommon::DrainSite::MacroDmaFlush);
+                VideoCommon::DrainSite::MacroDmaFlush,
+                VideoCommon::Nx2CallSite::MacroDmaFlush);
         }
         split.Run(
             [this, source, read_bytes] {
                 VideoCommon::QueryDma::FlushPending(memory_manager, *rasterizer, source,
                                                     read_bytes);
             },
-            VideoCommon::DrainSite::MacroDmaFlush);
+            VideoCommon::DrainSite::MacroDmaFlush,
+            VideoCommon::Nx2CallSite::MacroDmaFlush);
     };
     namespace AsyncReadback = VideoCore::AsyncReadback;
     const u64 wait_start = AsyncReadback::Now();

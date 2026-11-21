@@ -495,6 +495,9 @@ private:
         /// StateChanged draws by the reason of the last break, and by its 3D method.
         std::array<u64, static_cast<size_t>(VideoCommon::Nx2FastDraw::Reason::Count)> breaks{};
         std::array<u32, Maxwell::NUM_REGS> break_methods{};
+        /// StateChanged draws whose last break wrote a render-target register, by RT slot and
+        /// field: whether the delta dies on a target the draw actually uses.
+        std::array<std::array<u32, 16>, 8> rt_breaks{};
         u64 window_start{};
     };
     /// The pipeline the draw can take the delta path with, or null for a full resolve. Clears

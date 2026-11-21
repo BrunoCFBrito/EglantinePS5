@@ -236,12 +236,16 @@ public:
 
     /// Runs `func` on the back after everything sent before it. Must be trivially copyable.
     /// `flags`: FastDrawNeutral when `func` can't change what a draw resolves to.
+    /// `site`: diagnostic label (nx2_call_sites.h), stored in bits 32-39; Call entries leave
+    /// them free.
     template <typename Func>
-    void Defer(const Func& func, u64 flags = 0, Writes writes = Writes::Anywhere) {
+    void Defer(const Func& func, u64 flags = 0, Writes writes = Writes::Anywhere,
+               u32 site = 0) {
         static_assert(std::is_trivially_copyable_v<Func> && alignof(Func) <= alignof(u64));
         constexpr size_t payload = (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
         u64* const entry = Reserve(2 + payload);
-        entry[0] = static_cast<u64>(Kind::Call) | flags | (u64{payload} << 8);
+        entry[0] = static_cast<u64>(Kind::Call) | flags | (u64{payload} << 8) |
+                   (u64{(site & 0xff)} << 32);
         entry[1] = reinterpret_cast<u64>(&CallThunk<Func>);
         std::memcpy(entry + 2, &func, sizeof(Func));
         Commit(2 + payload);
@@ -275,7 +279,7 @@ public:
     /// cache download that records into the Vulkan scheduler. A drained back still submits from
     /// its idle hook, so the front never touches that state itself.
     template <typename Func>
-    void Run(const Func& func, DrainSite site = DrainSite::Other) {
+    void Run(const Func& func, DrainSite site = DrainSite::Other, u32 call_site = 0) {
         if (on_back_thread || !active) {
             if (!on_back_thread) {
                 Nx2FastDraw::BreakUnsplit(Nx2FastDraw::Reason::Call);
@@ -283,7 +287,7 @@ public:
             func();
             return;
         }
-        Defer(func);
+        Defer(func, 0, Writes::Anywhere, call_site);
         Drain(site);
     }
 
@@ -377,7 +381,8 @@ private:
         Engine, ///< The engine the next methods go to: word 1
         Method, ///< Bits 8-23 method, 32-63 argument; flags IsLast, HasSegment (word 1)
         Multi,  ///< Bits 8-23 method, 32-63 amount; word 1 methods pending, [segment], words
-        Call,   ///< Bits 8-31 payload size in words; word 1 thunk, then the payload
+        Call,   ///< Bits 8-31 payload size in words, 32-39 diagnostic site; word 1 thunk, then
+                ///< the payload
         State,  ///< Bits 8-23 last method that breaks, 32-63 count; flag HasBreak; words 1-4
                 ///< dirty flags; then (method | value << 32) per write (StateWrite)
     };

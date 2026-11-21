@@ -85,6 +85,7 @@
 #include "video_core/nx2.h"
 #include "video_core/nx2_backx.h"
 #include "video_core/nx2_debug_control.h"
+#include "video_core/nx2_call_sites.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
 
@@ -657,6 +658,10 @@ GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_in
         ++fast_draw_stats.breaks[last_break & 0xff];
         if (const u32 method = last_break >> 8; method < Maxwell::NUM_REGS) {
             ++fast_draw_stats.break_methods[method];
+            constexpr u32 rt_base = offsetof(Maxwell, rt) / sizeof(u32);
+            if (method >= rt_base && method < rt_base + 8 * 16) {
+                ++fast_draw_stats.rt_breaks[(method - rt_base) / 16][(method - rt_base) % 16];
+            }
         }
         return full(FullDraw::StateChanged);
     }
@@ -907,6 +912,37 @@ void RasterizerVulkan::ReportFastDraws() {
     }
     LOG_INFO(Render_Vulkan, "Fast draw state changes per second by last break:{} | by method:{}",
              breaks, top);
+    // Which render-target register the delta died on, per second: slot/field, largest first.
+    std::vector<std::pair<u32, u32>> rt;
+    for (u32 slot = 0; slot < stats.rt_breaks.size(); ++slot) {
+        for (u32 field = 0; field < stats.rt_breaks[slot].size(); ++field) {
+            if (stats.rt_breaks[slot][field] != 0) {
+                rt.emplace_back(stats.rt_breaks[slot][field], slot * 16 + field);
+            }
+        }
+    }
+    std::partial_sort(rt.begin(), rt.begin() + std::min<size_t>(rt.size(), 8), rt.end(),
+                      std::greater{});
+    std::string rt_top;
+    for (size_t i = 0; i < std::min<size_t>(rt.size(), 8); ++i) {
+        rt_top += fmt::format(" rt{}[{}]:{:.0f}", rt[i].second / 16, rt[i].second % 16,
+                              static_cast<double>(rt[i].first) / seconds);
+    }
+    if (!rt_top.empty()) {
+        LOG_INFO(Render_Vulkan, "Fast draw render-target breaks per second:{}", rt_top);
+    }
+    // Which deferred call ended the chain (nx2_call_sites.h): the site rides in the break's
+    // method field, so this is the same sample as the lines above.
+    std::string calls;
+    for (size_t site = 0; site < VideoCommon::Nx2CallSite::NumSites; ++site) {
+        if (stats.break_methods[site] != 0) {
+            calls += fmt::format(" {} {:.0f}", VideoCommon::Nx2CallSite::names[site],
+                                 static_cast<double>(stats.break_methods[site]) / seconds);
+        }
+    }
+    if (!calls.empty()) {
+        LOG_INFO(Render_Vulkan, "Fast draw deferred-call breaks per second:{}", calls);
+    }
     stats = FastDrawStats{.window_start = now};
 }
 

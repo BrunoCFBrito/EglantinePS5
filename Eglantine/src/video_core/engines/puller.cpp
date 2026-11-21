@@ -28,6 +28,7 @@
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_call_sites.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/rasterizer_interface.h"
 
@@ -48,7 +49,8 @@ u32 ReadSemaphoreWord(DmaPusher& dma_pusher, GPUVAddr address) {
             [rasterizer = dma_pusher.rasterizer, device = *device] {
                 rasterizer->FlushRegion(device, sizeof(u32), VideoCommon::CacheType::BufferCache);
             },
-            VideoCommon::DrainSite::SemaphoreFlush);
+            VideoCommon::DrainSite::SemaphoreFlush,
+            VideoCommon::Nx2CallSite::PullerReadFlush);
     }
     const u32 guest = dma_pusher.memory_manager.Read<u32>(address);
     if (!device) {
@@ -60,9 +62,9 @@ u32 ReadSemaphoreWord(DmaPusher& dma_pusher, GPUVAddr address) {
 // With the GPU thread split (gpu_split.h) the rasterizer belongs to the back thread: work that
 // only feeds it runs there in order; reads of what it wrote first wait for it (DrainBack).
 template <typename Func>
-void OnBack(const Func& func) {
+void OnBack(const Func& func, VideoCommon::Nx2CallSite::Site site) {
     if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
-        split.Defer(func);
+        split.Defer(func, 0, VideoCommon::GpuSplit::Writes::Anywhere, site);
     } else {
         VideoCommon::Nx2FastDraw::BreakUnsplit(VideoCommon::Nx2FastDraw::Reason::Call);
         func();
@@ -78,7 +80,8 @@ void DrainBack() {
 void ReleaseFences(DmaPusher& dma_pusher) {
     VideoCommon::GpuSplit::Get().Run(
         [rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); },
-        VideoCommon::DrainSite::FenceRelease);
+        VideoCommon::DrainSite::FenceRelease,
+        VideoCommon::Nx2CallSite::PullerFenceRelease);
 }
 
 // A release was just sent to the back: tell the front what it writes (CheckWithoutDrain).
@@ -400,14 +403,15 @@ void Puller::ProcessFenceActionMethod(DmaPusher& dma_pusher) {
     case Puller::FenceOperation::Acquire:
         // UNIMPLEMENTED_MSG("Channel Scheduling pending.");
         // WaitFence(regs.fence_action.syncpoint_id, regs.fence_value);
-        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); });
+        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); },
+          VideoCommon::Nx2CallSite::PullerFenceRelease);
         VideoCommon::GpuSplit::Get().NoteSync();
         VideoCommon::Nx2FastDraw::NoteSync();
         break;
     case Puller::FenceOperation::Increment:
         OnBack([rasterizer = dma_pusher.rasterizer, id = static_cast<u32>(regs.fence_action.syncpoint_id.Value())] {
             rasterizer->SignalSyncPoint(id);
-        });
+        }, VideoCommon::Nx2CallSite::PullerSyncpoint);
         break;
     default:
         UNIMPLEMENTED_MSG("Unimplemented operation {}", regs.fence_action.op.Value());
@@ -449,7 +453,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                 rasterizer->Query(mirror, VideoCommon::QueryType::Payload,
                                   properties | VideoCommon::QueryPropertiesFlags::Nx2Mirror, payload, 0);
             }
-        });
+        }, VideoCommon::Nx2CallSite::PullerReport);
         NoteRelease(dma_pusher, sequence_address, payload,
                     properties == VideoCommon::QueryPropertiesFlags::HasTimeout);
     } else if (g_nx2_ampere) {
@@ -554,7 +558,7 @@ void Puller::ProcessSemaphoreRelease(DmaPusher& dma_pusher) {
     OnBack([rasterizer = dma_pusher.rasterizer, sequence_address, payload] {
         rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload,
                           VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
-    });
+    }, VideoCommon::Nx2CallSite::PullerSemaphoreRelease);
     NoteRelease(dma_pusher, sequence_address, payload, false);
 }
 
@@ -590,7 +594,7 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
         OnBack([rasterizer = dma_pusher.rasterizer, address, payload] {
             rasterizer->Query(address, VideoCommon::QueryType::Payload,
                               VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
-        });
+        }, VideoCommon::Nx2CallSite::PullerSemaphoreRelease);
         NoteRelease(dma_pusher, address, payload, false);
         return;
     }
@@ -640,13 +644,15 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
     case BufferMethods::WrcacheFlush:
         break;
     case BufferMethods::RefCnt:
-        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->SignalReference(); });
+        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->SignalReference(); },
+               VideoCommon::Nx2CallSite::PullerReference);
         break;
     case BufferMethods::SyncpointOperation:
         ProcessFenceActionMethod(dma_pusher);
         break;
     case BufferMethods::WaitForIdle:
-        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->WaitForIdle(); });
+        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->WaitForIdle(); },
+               VideoCommon::Nx2CallSite::PullerIdle);
         VideoCommon::GpuSplit::Get().NoteSync();
         break;
     case BufferMethods::SemaphoreOperation: {
@@ -663,7 +669,8 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
     }
     case BufferMethods::MemOpB: {
         // Implement this better.
-        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->InvalidateGPUCache(); });
+        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->InvalidateGPUCache(); },
+               VideoCommon::Nx2CallSite::PullerInvalidateCache);
         break;
     }
     case BufferMethods::MemOpC:

@@ -32,6 +32,7 @@
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
+#include "video_core/nx2_call_sites.h"
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
@@ -78,7 +79,9 @@ void DmaPusher::DispatchCalls() {
 #else // PS5
     if (::Eden::Performance::gpu_dirty_pending.load(std::memory_order_relaxed)) {
         if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
-            split.Defer([memory = &memory_manager] { memory->FlushCaching(); });
+            split.Defer([memory = &memory_manager] { memory->FlushCaching(); }, 0,
+                        VideoCommon::GpuSplit::Writes::Anywhere,
+                        VideoCommon::Nx2CallSite::DmaPusherFlushCaching);
         } else {
             memory_manager.FlushCaching();
         }
@@ -92,10 +95,13 @@ void DmaPusher::DispatchCalls() {
         }
     }
     if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
-        split.Defer([gpu = &system.GPU()] {
-            gpu->FlushCommands();
-            gpu->OnCommandListEnd();
-        });
+        split.Defer(
+            [gpu = &system.GPU()] {
+                gpu->FlushCommands();
+                gpu->OnCommandListEnd();
+            },
+            0, VideoCommon::GpuSplit::Writes::Anywhere,
+            VideoCommon::Nx2CallSite::DmaPusherListEnd);
         split.Publish();
         return;
     }
@@ -421,7 +427,8 @@ bool DmaPusher::Step() {
                 synced = true;
                 sync_cv.notify_all();
             });
-        }, VideoCommon::DrainSite::GpSyncFence);
+        }, VideoCommon::DrainSite::GpSyncFence,
+           VideoCommon::Nx2CallSite::DmaPusherGpSyncFence);
     }
 
     return true;
@@ -919,13 +926,15 @@ bool DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
             [rasterizer = rasterizer, pages = std::span<const DAddr>{pages}] {
                 rasterizer->FlushGpuWrittenCommandListPages(pages);
             },
-            VideoCommon::DrainSite::ListFlush);
+            VideoCommon::DrainSite::ListFlush,
+            VideoCommon::Nx2CallSite::DmaPusherListFlushPages);
     } else if (dirty) {
         VideoCommon::GpuSplit::Get().Run(
             [memory = &memory_manager, first_page, size = end_page - first_page] {
                 memory->FlushRegion(first_page, size, VideoCommon::CacheType::BufferCache);
             },
-            VideoCommon::DrainSite::ListFlush);
+            VideoCommon::DrainSite::ListFlush,
+            VideoCommon::Nx2CallSite::DmaPusherListFlush);
     }
     if (diag) {
         auto kind = Nx2CmdPageDiag::Kind::NoWrite;

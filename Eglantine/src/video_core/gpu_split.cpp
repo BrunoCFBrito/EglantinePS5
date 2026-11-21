@@ -30,6 +30,7 @@
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_call_sites.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
 
@@ -453,10 +454,12 @@ void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, 
 
 void GpuSplit::DeferFunction(std::function<void()>&& func) {
     auto* const heap = new std::function<void()>(std::move(func));
-    Defer([heap] {
-        (*heap)();
-        delete heap;
-    });
+    Defer(
+        [heap] {
+            (*heap)();
+            delete heap;
+        },
+        0, Writes::Anywhere, Nx2CallSite::DeferredFunction);
 }
 
 size_t GpuSplit::Execute(const u64* entry, size_t words) {
@@ -581,7 +584,9 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
     case Kind::Call: {
         Nx2Profile::Scope call_scope{Nx2Profile::Zone::SplitCall};
         if ((head & FastDrawNeutral) == 0) {
-            Nx2FastDraw::Break(Nx2FastDraw::Reason::Call);
+            // The site (nx2_call_sites.h) rides in the break's method field: the report shows
+            // which deferred call ended the chain, with the draws it cost.
+            Nx2FastDraw::Break(Nx2FastDraw::Reason::Call, static_cast<u32>(head >> 32));
         }
         const size_t payload = static_cast<size_t>((head >> 8) & 0xffffff);
         reinterpret_cast<void (*)(const u64*)>(entry[1])(entry + 2);
