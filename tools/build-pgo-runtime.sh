@@ -38,6 +38,8 @@ done
 # stock catch-all layer never sees the compiler's section-based counters).
 clang-18 "${cflags[@]}" -c "$root/tools/pgo-platform-ps5.c" -o "$work/pgo-platform-ps5.o"
 clang++-18 "${cxxflags[@]}" -c "$profile/InstrProfilingRuntime.cpp" -o "$work/InstrProfilingRuntime.o"
+# rcs keeps members of an existing archive; start from an empty one.
+rm -f "$output"
 llvm-ar-18 rcs "$output" "$work"/*.o
 echo "== Built $output"
 # __start_/__stop___llvm_prf_* are synthesised by the linker from the instrumented objects.
