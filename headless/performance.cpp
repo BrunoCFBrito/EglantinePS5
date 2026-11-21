@@ -35,6 +35,7 @@
 #include <sys/param.h>
 #include "common/fs/file.h"
 #include "core/hle/kernel/svc/svc_memory_stats.h"
+#include "nx2_emutls_stats.h"
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -1034,6 +1035,7 @@ void RegisterWorker(const char* name) {
 #endif
 #ifdef PS5_NATIVE
     MkwNativeSample::Register(name);
+    Eden::Nx2EmutlsStats::NoteCurrentThread(name);  // EDEN_NX2_EMUTLS_STATS=1
 #endif
     Eden::Crash::NameThread(name);  // a crash report names the thread
 #if defined(EDEN_DEV_PROFILE) && defined(PS5_NATIVE)
