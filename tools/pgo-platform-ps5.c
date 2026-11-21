@@ -18,7 +18,6 @@
 PS5_PROF_SECTION(data);
 PS5_PROF_SECTION(cnts);
 PS5_PROF_SECTION(names);
-PS5_PROF_SECTION(bits);
 PS5_PROF_SECTION(vnds);
 
 COMPILER_RT_VISIBILITY const __llvm_profile_data *__llvm_profile_begin_data(void) {
@@ -39,11 +38,13 @@ COMPILER_RT_VISIBILITY char *__llvm_profile_begin_counters(void) {
 COMPILER_RT_VISIBILITY char *__llvm_profile_end_counters(void) {
     return __stop___llvm_prf_cnts;
 }
+// IR PGO emits no bitmap section. Not referencing __start_/__stop___llvm_prf_bits matters: the
+// packager rejects any undefined symbol that the SDK does not export, weak or not.
 COMPILER_RT_VISIBILITY char *__llvm_profile_begin_bitmap(void) {
-    return __start___llvm_prf_bits;
+    return NULL;
 }
 COMPILER_RT_VISIBILITY char *__llvm_profile_end_bitmap(void) {
-    return __stop___llvm_prf_bits;
+    return NULL;
 }
 COMPILER_RT_VISIBILITY uint32_t *__llvm_profile_begin_orderfile(void) {
     return NULL;
