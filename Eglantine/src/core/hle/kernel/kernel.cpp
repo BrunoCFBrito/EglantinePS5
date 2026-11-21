@@ -72,6 +72,24 @@ static constexpr void (*eden_guest_swap_pool)(std::uint64_t, std::uint64_t) noex
 
 namespace Kernel {
 
+namespace {
+
+// Plain copies of the hot fields of ThreadLocalData (the fast TLS of zortos293/Lichii#641).
+// ThreadLocalData holds an optional KThread, so its thread_local has a dynamic initializer and a
+// non-trivial destructor: under the PS5 build's -femulated-tls every read is a call to __tls_init
+// (its guard read is another emulated-TLS access) plus a call to __emutls_get_address, and SVCs,
+// scheduler locks and memory traps read the current thread and the host thread ID millions of
+// times per second. These copies are constinit and trivially destructible, so a read costs one
+// __emutls_get_address, and they are written wherever the originals are written.
+// They are per host thread, like the originals. Guest threads are fibers that can resume on
+// another host thread, and every read below reads whichever host thread is running, so no value
+// is ever carried across a fiber switch.
+constinit thread_local KThread* t_nx2_current_thread = nullptr;
+constinit thread_local u8 t_nx2_host_thread_id = UINT8_MAX;
+constinit thread_local bool t_nx2_phantom_mode = false;
+
+} // Anonymous namespace
+
 // Can only be used by a single implementation PER THREAD
 struct ThreadLocalData {
     std::optional<KThread> raw_thread;
@@ -534,12 +552,13 @@ struct KernelCore::Impl {
         // The first four slots are reserved for CPU core threads
         ASSERT(core_id < Core::Hardware::NUM_CPU_CORES);
         tls_data.host_thread_id = u8(core_id);
+        t_nx2_host_thread_id = u8(core_id);
         return tls_data.host_thread_id;
     }
 
     /// Gets the host thread ID for the caller
     u32 GetHostThreadId() const {
-        return tls_data.host_thread_id;
+        return t_nx2_host_thread_id;
     }
 
     // Gets the dummy KThread for the caller, allocating a new one if this is the first time
@@ -578,11 +597,12 @@ struct KernelCore::Impl {
 
     // Forces singlecore
     bool IsPhantomModeForSingleCore() const {
-        return tls_data.is_phantom_mode_for_singlecore;
+        return t_nx2_phantom_mode;
     }
     void SetIsPhantomModeForSingleCore(bool value) {
         ASSERT(!is_multicore);
         tls_data.is_phantom_mode_for_singlecore = value;
+        t_nx2_phantom_mode = value;
     }
 
     bool IsShuttingDown() const {
@@ -593,8 +613,20 @@ struct KernelCore::Impl {
         return t.current_thread ? t.current_thread : (t.current_thread = GetHostDummyThread(t, nullptr));
     }
 
+    /// The current thread without reading ThreadLocalData once it is known. Mirrors
+    /// tls_data.current_thread exactly: every write of that field writes this one.
+    KThread* GetCurrentEmuThreadFast() {
+        if (KThread* const cached = t_nx2_current_thread; cached != nullptr) [[likely]] {
+            return cached;
+        }
+        KThread* const thread = GetCurrentEmuThread(tls_data);
+        t_nx2_current_thread = thread;
+        return thread;
+    }
+
     void SetCurrentEmuThread(KThread* thread) {
         tls_data.current_thread = thread;
+        t_nx2_current_thread = thread;
     }
 
     void DeriveInitialMemoryLayout() {
@@ -1322,7 +1354,7 @@ u32 KernelCore::GetCurrentHostThreadID() const {
 }
 
 KThread* KernelCore::GetCurrentEmuThread() const {
-    return impl->GetCurrentEmuThread(Impl::tls_data);
+    return impl->GetCurrentEmuThreadFast();
 }
 
 void KernelCore::SetCurrentEmuThread(KThread* thread) {
