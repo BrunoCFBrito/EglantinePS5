@@ -700,6 +700,9 @@ if(NOT EDEN_PGO STREQUAL "OFF")
         target_compile_definitions(eden-headless PRIVATE EDEN_PGO=1)
         target_link_libraries(eden-headless PRIVATE "${EDEN_PGO_RUNTIME}")
         # InstrProfilingRuntime.cpp has no symbol anything references; keep its constructor.
-        target_link_options(eden-headless PRIVATE "-Wl,--undefined=__llvm_profile_runtime")
+        target_link_options(eden-headless PRIVATE "-Wl,--undefined=__llvm_profile_runtime"
+            # The host-named .deplibs entry Clang 18 writes into each object (libclang_rt.profile-
+            # x86_64_nosubmission.a) is the host runtime, not this target's; the archive is linked above.
+            "-Wl,--no-dependent-libraries")
     endif()
 endif()
