@@ -3,12 +3,16 @@
 
 // EDEN_NX2_EMUTLS_STATS: the PS5 build links compiler-rt's emulated TLS (every unit is built with
 // -femulated-tls), so one thread_local read is one __emutls_get_address call. This file wraps that
-// call (tools/link-headless-native.sh adds --wrap=__emutls_get_address) and, when the switch is
-// set, counts the calls per thread and per return address and prints an EDEN_EMUTLS line set to
-// stderr every 10 s. Thread names come from Performance::RegisterWorker. With the switch off the
-// wrapper is one relaxed load and a branch, then the real call. No thread_local is used here on
-// purpose: any thread_local read in the wrapper would call the wrapper.
+// call (--wrap=__emutls_get_address) and, when the switch is set, counts the calls per thread and
+// per return address and prints an EDEN_EMUTLS line set to stderr every 10 s. Thread names come
+// from Performance::RegisterWorker. Both the wrapper and this file are build-time opt-in
+// (EDEN_EMUTLS_STATS_BUILD=1, headless/CMakeLists.txt): with the switch off the wrapper is one
+// relaxed load and a branch, then the real call, which is still too much for every thread_local
+// read in a default build. No thread_local is used here on purpose: any thread_local read in the
+// wrapper would call the wrapper.
 #include "nx2_emutls_stats.h"
+
+#if defined(EDEN_EMUTLS_STATS)
 
 #include <pthread.h>
 
@@ -262,3 +266,5 @@ extern "C" void* __wrap___emutls_get_address(void* object) {
     slot->busy.store(0, std::memory_order_relaxed);
     return result;
 }
+
+#endif // defined(EDEN_EMUTLS_STATS)

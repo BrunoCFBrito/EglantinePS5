@@ -39,6 +39,8 @@ fi
 # entrypoint-table reference that resolves to 0 either way.
 # The SDK's dlfcn wrappers explicitly return unavailable when these optional
 # weak hooks are null. This static frontend supplies no dynamic-loader hooks.
+# --wrap=__emutls_get_address is absent on purpose: the emulated-TLS call counter is a build-time
+# opt-in (EDEN_EMUTLS_STATS, headless/CMakeLists.txt) and passes the wrap only in that build.
 "$template/.deps/native/ps5-payload-sdk/bin/prospero-lld" \
     "${tls_flags[@]}" "${radv_link_flags[@]}" -L "$sdk/target/lib" \
     --defsym=__dlopen=0 --defsym=__dlsym=0 --defsym=__dladdr=0 \
@@ -53,7 +55,6 @@ fi
     --wrap=feof --wrap=ferror --wrap=fileno --wrap=fgetc --wrap=getc --wrap=fgets --wrap=setvbuf \
     --wrap=flockfile --wrap=funlockfile --wrap=open --wrap=close --wrap=read --wrap=pread --wrap=lseek \
     --wrap=fstat --wrap=stat --wrap=lstat \
-    --wrap=__emutls_get_address \
     --wrap=sceKernelAllocateDirectMemory --wrap=sceKernelReleaseDirectMemory \
     -o "$output" --start-group "${libraries[@]}" "${radv_link_inputs[@]}" \
     "$sdk/target/lib/libc++.a" "$sdk/target/lib/libc++abi.a" "$sdk/target/lib/libunwind.a" \

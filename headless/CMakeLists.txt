@@ -1,5 +1,8 @@
 option(EDEN_MKW_DIAGNOSTICS "Enable Mario Kart development controls and capture instrumentation" OFF)
 option(EDEN_SCRIPTED_INPUT "Enable file-driven input for console qualification" OFF)
+# Off by default: the wrapper puts every emulated thread_local read (10-13 M/s in OoT) through
+# __wrap___emutls_get_address, whether or not EDEN_NX2_EMUTLS_STATS is set at run time.
+option(EDEN_EMUTLS_STATS "Link the emulated-TLS call counter (EDEN_NX2_EMUTLS_STATS)" OFF)
 option(EDEN_PS5_VULKAN "Build the native Vulkan renderer alongside OpenGL" OFF)
 set(EDEN_VULKAN_DRIVER "CUSTOM" CACHE STRING "Native Vulkan driver: CUSTOM or RADV")
 set_property(CACHE EDEN_VULKAN_DRIVER PROPERTY STRINGS CUSTOM RADV)
@@ -263,7 +266,6 @@ if(PS5_NATIVE)
     add_executable(eden-headless "${EDEN_PORT_DIR}/main.cpp" "${PORT_ROOT}/src/aligned_alloc.c"
         "${EDEN_PORT_DIR}/heap_pages.cpp" "${EDEN_PORT_DIR}/performance.cpp"
         "${EDEN_PORT_DIR}/crash_report.cpp" "${EDEN_PORT_DIR}/stop_limit.cpp"
-        "${EDEN_PORT_DIR}/nx2_emutls_stats.cpp"
         "${EDEN_PORT_DIR}/elevation/elevation.cpp"
         "${eden_app_crt}" "${PORT_ROOT}/src/lifecycle.c" "${PORT_ROOT}/src/direct_memory.c"
         "${PORT_BUILD_DIR}/app_heap.c")
@@ -279,6 +281,14 @@ if(PS5_NATIVE)
             "${PORT_ROOT}/../mihawk-vulkan-review/tools/radv-link.sh")
     endif()
     target_compile_definitions(common PRIVATE PS5_NATIVE=1)
+    # Opt-in (EDEN_EMUTLS_STATS_BUILD=1, tools/build-headless-native.sh): wrap every emulated-TLS
+    # read and count it per thread and site (nx2_emutls_stats.cpp). A default build links neither
+    # the wrapper nor the stats source, so NoteCurrentThread compiles to nothing (its header).
+    if(EDEN_EMUTLS_STATS)
+        target_sources(eden-headless PRIVATE "${EDEN_PORT_DIR}/nx2_emutls_stats.cpp")
+        target_compile_definitions(eden-headless PRIVATE EDEN_EMUTLS_STATS=1)
+        target_link_options(eden-headless PRIVATE -Wl,--wrap=__emutls_get_address)
+    endif()
 else()
     add_executable(eden-headless "${EDEN_PORT_DIR}/main.cpp" "${PORT_ROOT}/src/aligned_alloc.c"
         "${EDEN_PORT_DIR}/stop_limit.cpp")
