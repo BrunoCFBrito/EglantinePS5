@@ -3,10 +3,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -21,6 +23,9 @@ bool CommitCodeRange(const void* executable, std::size_t bytes) noexcept;
 void DecommitCodeRange(const void* executable, std::size_t keep_bytes) noexcept;
 bool FreeCodeRange(void* executable) noexcept;
 }
+// The guest memory service's reclaim path (src/guest_memory_service.inc): trims the driver's
+// unbound granules and packs cold guest memory to give the pool room. Null outside the app.
+extern "C" [[gnu::weak]] std::size_t eden_memory_recover(std::size_t bytes) noexcept;
 // Separate RW/NX and RX views avoid changing page permissions per compiled block.
 // Unsupported native JIT allocation falls back to the qualified owned W^X path.
 inline Xbyak::Allocator* EdenJitAllocator() {
@@ -111,6 +116,27 @@ inline Xbyak::Allocator* EdenJitAllocator() {
         // Memory behind the first `bytes` of a cache: asked before the JIT writes that far.
         void commit(std::uint8_t* pointer, std::size_t bytes) override {
             if (Common::CommitCodeRange(pointer, bytes)) return;
+            // CommitCodeRange tried its own three recoveries and found no step. The load that took
+            // the pool's last contiguous pieces releases them over the next moments, and the
+            // swapper needs a tick to pack cold guest memory, so wait a bounded while and ask
+            // again before the cache cannot go on. One line per episode.
+            constexpr auto wait_limit = std::chrono::seconds(3);
+            constexpr auto pause = std::chrono::milliseconds(40);
+            const auto begin = std::chrono::steady_clock::now();
+            int tries = 0;
+            bool ok = false;
+            while (&eden_memory_recover != nullptr && !ok &&
+                   std::chrono::steady_clock::now() - begin < wait_limit) {
+                std::this_thread::sleep_for(pause);
+                ++tries;
+                (void)eden_memory_recover(std::size_t{32} << 20);
+                ok = Common::CommitCodeRange(pointer, bytes);
+            }
+            const auto waited =
+                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin);
+            std::fprintf(stderr, "EDEN_JIT_COMMIT_WAIT tries=%d waited_ms=%lld ok=%d\n", tries,
+                         static_cast<long long>(waited.count()), ok ? 1 : 0);
+            if (ok) return;
             std::fputs("JIT code cache: the console has no memory for its next part\n", stderr);
             std::abort();
         }
