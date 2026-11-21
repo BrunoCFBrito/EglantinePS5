@@ -666,6 +666,11 @@ endif()
 # out: the back thread's frame is spent in common, core and video_core.
 if(PS5_NATIVE)
     target_sources(eden-headless PRIVATE "${EDEN_PORT_DIR}/pgo_profile.cpp")
+    # The hooks file is not part of the profiled code: compiled with EDEN_PGO=use its control flow
+    # no longer matches the generate build's profile ("function control flow change detected", an
+    # error under -Werror). Per-file only; the profile flags stay on for every other source.
+    set_source_files_properties("${EDEN_PORT_DIR}/pgo_profile.cpp" PROPERTIES
+        COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:AppleClang,Clang>:-fno-profile-instr-use;-fno-profile-use;-fno-profile-generate>")
 endif()
 set(EDEN_PGO "OFF" CACHE STRING "Profile-guided optimisation: OFF, generate or use")
 set_property(CACHE EDEN_PGO PROPERTY STRINGS OFF generate use)
