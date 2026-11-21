@@ -168,10 +168,12 @@ add_library(
 # The ZBIC decoder runs once per module at load, so a profile buys it nothing, and the aarch64
 # PGO build returns errors for NSOs the plain build decodes (#95). Both spellings are disabled:
 # -fno-profile-instr-use for frontend instrumentation and -fno-profile-use for the IR pair
-# (-fprofile-generate/-fprofile-use) the PS5 build uses.
+# (-fprofile-generate/-fprofile-use) the PS5 build uses. -fno-profile-generate does the same for a
+# training build: instrumented, the decoder reports "Data corruption detected" for Ocarina of Time's
+# main NSO and the game does not load (#1204).
 set_source_files_properties(zbic_compression.cpp PROPERTIES
     INCLUDE_DIRECTORIES "${ZBIC_INCLUDE_DIR}"
-    COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:AppleClang,Clang,GNU>:-Wno-unused-function;-Wno-missing-declarations;-Wno-shadow>;$<$<CXX_COMPILER_ID:MSVC>:/wd4505;/wd5245>;$<$<CXX_COMPILER_ID:AppleClang,Clang>:-fno-profile-instr-use;-fno-profile-use>")
+    COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:AppleClang,Clang,GNU>:-Wno-unused-function;-Wno-missing-declarations;-Wno-shadow>;$<$<CXX_COMPILER_ID:MSVC>:/wd4505;/wd5245>;$<$<CXX_COMPILER_ID:AppleClang,Clang>:-fno-profile-instr-use;-fno-profile-use;-fno-profile-generate>")
 
 if(WIN32)
     target_sources(common PRIVATE windows/timer_resolution.cpp
