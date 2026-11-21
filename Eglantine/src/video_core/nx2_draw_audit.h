@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdlib>
@@ -49,6 +50,108 @@ struct Counters {
 
 inline Counters g_counters;
 
+// Draws grouped by the render pass target they open: colour target 0 (address and format), the
+// depth target (address and format), the colour target count, whether the pass is depth-only or
+// has no target at all, and the target size. A pass family's share of the draw stream sizes what
+// a per-pass lever could win: depth-only passes are the sun shadow map, small targets the water
+// ripple, reflections and effects.
+struct PassKey {
+    u64 color; ///< rt[0] address, its low bits moved out by |format; 0 with no colour target
+    u64 depth; ///< zeta address, its low bits moved out by |format; 0 with depth off
+    u32 rt_count;
+    u32 width;
+    u32 height;
+    u32 flags; ///< bit 0 depth-only, bit 1 no target
+
+    bool operator==(const PassKey&) const = default;
+};
+
+struct PassGroup {
+    PassKey key{};
+    u64 draws{};
+};
+
+inline constexpr size_t PassTableSize = 256;
+inline constexpr size_t PassProbes = 8;
+inline std::array<PassGroup, PassTableSize> g_passes{};
+inline u64 g_pass_total{};
+inline u64 g_pass_depth_only{};
+inline u64 g_pass_shadow{};
+inline u64 g_pass_small{};
+inline u64 g_pass_overflow{};
+
+[[nodiscard]] inline u64 HashPass(const PassKey& key) {
+    u64 hash = key.color ^ (key.depth * 0x9e3779b97f4a7c15ULL);
+    hash ^= (u64{key.rt_count} << 32) ^ (u64{key.width} << 11) ^ u64{key.height};
+    hash ^= u64{key.flags} * 0xc2b2ae3d27d4eb4fULL;
+    return hash ^ (hash >> 29);
+}
+
+/// Counts one draw in its pass group. Cheap: one hash, then a probe over groups already seen.
+inline void CountPass(const PassKey& key) {
+    if (!g_enabled) {
+        return;
+    }
+    ++g_pass_total;
+    if (key.flags & 1) {
+        ++g_pass_depth_only;
+        g_pass_shadow += (key.width >= 4096 || key.height >= 4096) ? 1 : 0;
+    }
+    g_pass_small += (key.width <= 512 && key.height <= 512) ? 1 : 0;
+    size_t index = HashPass(key) & (PassTableSize - 1);
+    for (size_t probe = 0; probe < PassProbes; ++probe) {
+        PassGroup& group = g_passes[index];
+        if (group.draws == 0) {
+            group.key = key;
+            group.draws = 1;
+            return;
+        }
+        if (group.key == key) {
+            ++group.draws;
+            return;
+        }
+        index = (index + 1) & (PassTableSize - 1);
+    }
+    ++g_pass_overflow;
+}
+
+inline void LogPasses(double seconds) {
+    const auto rate = [seconds](u64 value) { return static_cast<double>(value) / seconds; };
+    const auto share = [](u64 part, u64 total) {
+        return total == 0 ? 0.0 : 100.0 * static_cast<double>(part) / static_cast<double>(total);
+    };
+    std::array<PassGroup, PassTableSize> groups{};
+    size_t count = 0;
+    for (const PassGroup& group : g_passes) {
+        if (group.draws != 0) {
+            groups[count++] = group;
+        }
+    }
+    std::partial_sort(groups.begin(), groups.begin() + std::min<size_t>(count, 16), groups.begin() + count,
+                      [](const PassGroup& a, const PassGroup& b) { return a.draws > b.draws; });
+    LOG_INFO(HW_GPU,
+             "Draw pass audit per second: {:.0f} draws in {} groups, depth-only {:.0f} "
+             "({:.1f}%), shadow {:.0f} ({:.1f}%), small {:.0f} ({:.1f}%), ungrouped {:.0f}",
+             rate(g_pass_total), count, rate(g_pass_depth_only), share(g_pass_depth_only, g_pass_total),
+             rate(g_pass_shadow), share(g_pass_shadow, g_pass_total), rate(g_pass_small),
+             share(g_pass_small, g_pass_total), rate(g_pass_overflow));
+    for (size_t i = 0; i < std::min<size_t>(count, 15); ++i) {
+        const PassGroup& group = groups[i];
+        LOG_INFO(HW_GPU,
+                 "Draw pass {}: {:.0f}/s ({:.1f}%) color0={:#x}/{:#x} depth={:#x}/{:#x} rt={} {}x{}{}",
+                 i + 1, rate(group.draws), share(group.draws, g_pass_total),
+                 group.key.color >> 8, group.key.color & 0xff, group.key.depth >> 8,
+                 group.key.depth & 0xff, group.key.rt_count, group.key.width, group.key.height,
+                 (group.key.flags & 1) ? " depth-only" : (group.key.flags & 2) ? " no-target" : "");
+    }
+    g_passes = {};
+    g_pass_total = 0;
+    g_pass_depth_only = 0;
+    g_pass_shadow = 0;
+    g_pass_small = 0;
+    g_pass_overflow = 0;
+}
+
 inline void Count(bool indexed, u32 element_count, u32 instance_count, u32 index_format,
                   bool suppressed, u64 vs, u64 ps, u64 first, u64 topology, u64 index_address) {
     if (!g_enabled) {
@@ -87,6 +190,7 @@ inline void Count(bool indexed, u32 element_count, u32 instance_count, u32 index
         return;
     }
     const auto rate = [seconds](u64 value) { return static_cast<double>(value) / seconds; };
+    LogPasses(seconds);
     LOG_INFO(HW_GPU,
              "Draw audit per second: {:.0f} draws, {:.0f} empty, {:.0f} suppressed, {:.0f} "
              "repeat the draw before, {:.0f} open a new program run, {:.0f} instanced, {:.0f} "

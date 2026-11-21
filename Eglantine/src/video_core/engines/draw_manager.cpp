@@ -39,6 +39,32 @@ void TraceSuppressedDraw(const Maxwell3D& maxwell3d, bool indirect) {
 
 } // namespace
 
+namespace {
+
+/// The render pass the next draw opens, as the draw audit groups it (EDEN_NX2_DRAW_AUDIT).
+void NotePass(const Maxwell3D::Regs& regs) {
+    const auto& rt0 = regs.rt[0];
+    const u32 rt_count = regs.rt_control.count.Value();
+    const bool has_depth = regs.zeta_enable != 0;
+    VideoCommon::Nx2DrawAudit::PassKey pass{};
+    pass.rt_count = rt_count;
+    if (rt_count != 0) {
+        pass.color = (rt0.Address() << 8) | static_cast<u64>(rt0.format);
+        pass.width = rt0.width;
+        pass.height = rt0.height;
+    } else if (has_depth) {
+        pass.width = regs.zeta_size.width;
+        pass.height = regs.zeta_size.height;
+    }
+    if (has_depth) {
+        pass.depth = (regs.zeta.Address() << 8) | static_cast<u64>(regs.zeta.format);
+    }
+    pass.flags = (rt_count == 0 && has_depth) ? 1u : (rt_count == 0) ? 2u : 0u;
+    VideoCommon::Nx2DrawAudit::CountPass(pass);
+}
+
+} // namespace
+
 void Maxwell3D::DrawManager::ProcessMethodCall(Maxwell3D& maxwell3d, u32 method, u32 argument) {
     switch (method) {
     case MAXWELL3D_REG_INDEX(clear_surface):
@@ -376,6 +402,7 @@ void Maxwell3D::DrawManager::ProcessDraw(Maxwell3D& maxwell3d, bool draw_indexed
             static_cast<u64>(draw_state.topology),
             (u64{draw_state.index_buffer.start_addr_high} << 32) |
                 draw_state.index_buffer.start_addr_low);
+        NotePass(regs);
     }
     if (maxwell3d.ShouldExecute()) {
         maxwell3d.rasterizer->Draw(draw_indexed, instance_count);
@@ -390,6 +417,7 @@ void Maxwell3D::DrawManager::ProcessDrawIndirect(Maxwell3D& maxwell3d) {
     UpdateTopology(maxwell3d);
     if (VideoCommon::Nx2DrawAudit::g_enabled) [[unlikely]] {
         ++VideoCommon::Nx2DrawAudit::g_counters.indirect;
+        NotePass(maxwell3d.regs);
     }
     if (maxwell3d.ShouldExecute()) {
         maxwell3d.rasterizer->DrawIndirect();
