@@ -29,11 +29,14 @@ cflags=(-target x86_64-sie-ps5 -O2 -g0 -isysroot "$sdk"
 cxxflags=("${cflags[@]}" -isystem "$sdk/target/include/c++/v1" -fno-rtti -fexceptions)
 sources=(InstrProfiling.c InstrProfilingBuffer.c InstrProfilingFile.c InstrProfilingInternal.c
          InstrProfilingMerge.c InstrProfilingMergeFile.c InstrProfilingNameVar.c
-         InstrProfilingPlatformOther.c InstrProfilingUtil.c InstrProfilingValue.c
-         InstrProfilingVersionVar.c InstrProfilingWriter.c)
+         InstrProfilingUtil.c InstrProfilingValue.c InstrProfilingVersionVar.c
+         InstrProfilingWriter.c)
 for name in "${sources[@]}"; do
     clang-18 "${cflags[@]}" -c "$profile/$name" -o "$work/${name%.c}.o"
 done
+# The PS5 platform layer (section boundaries; the stock Linux layer needs dl_iterate_phdr and the
+# stock catch-all layer never sees the compiler's section-based counters).
+clang-18 "${cflags[@]}" -c "$root/tools/pgo-platform-ps5.c" -o "$work/pgo-platform-ps5.o"
 clang++-18 "${cxxflags[@]}" -c "$profile/InstrProfilingRuntime.cpp" -o "$work/InstrProfilingRuntime.o"
 llvm-ar-18 rcs "$output" "$work"/*.o
 echo "== Built $output"
