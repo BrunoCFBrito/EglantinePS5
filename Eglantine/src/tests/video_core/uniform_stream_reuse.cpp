@@ -19,9 +19,21 @@ void Check(bool condition, const char* message) {
 
 struct Memory {
     std::array<u8, 8192> bytes{};
+    u32 gathered{}; ///< Reads through ReadBlockUnsafe
+    u32 in_place{}; ///< Ranges GetSpan handed out
     void ReadBlockUnsafe(u64 address, void* destination, u32 size) {
         Check(address + size <= bytes.size(), "read outside guest memory");
         std::memcpy(destination, bytes.data() + address, size);
+        ++gathered;
+    }
+    /// As the device memory manager: a range in one piece of host memory, here one that doesn't
+    /// cross a 4 KiB page (as if the pages after it were mapped elsewhere).
+    u8* GetSpan(u64 address, size_t size) {
+        if (address / 4096 != (address + size - 1) / 4096) {
+            return nullptr;
+        }
+        ++in_place;
+        return bytes.data() + address;
     }
 };
 
@@ -113,12 +125,51 @@ TEST_CASE("Uniform stream reuse preserves data through mutation and session rese
         bind(stage, slot, address, size);
         bind(stage, slot, address, size);
     }
+    Check(memory.gathered > 1000 && memory.in_place > 1000,
+          "the reads did not take both the gathered and the in-place path");
+}
+
+TEST_CASE("Uniform stream history reuses binds that alternate every draw", "[video_core]") {
+    using VideoCommon::BindSmallUniformReusing;
+    if (!VideoCommon::UniformStreamHistoryEnabled()) {
+        return;
+    }
+    Memory memory;
+    Runtime runtime;
+    VideoCommon::ResetUniformStreamReuse<Runtime>();
+    constexpr u64 base = 512;
+    constexpr u32 size = 256;
+    constexpr u32 ranges = 3;
+    for (u32 range = 0; range < ranges; ++range) {
+        memory.bytes[base + range * 1024] = static_cast<u8>(range + 1);
+    }
+    const auto bind = [&](u32 range) {
+        Check(BindSmallUniformReusing(runtime, memory, 1, 4, 4, base + range * 1024, size),
+              "valid small uniform rejected");
+    };
+    // Three actors' buffers, bound in the same order every draw: the first round allocates,
+    // the next ones hit their history entry instead of copying again.
+    for (u32 round = 0; round < 4; ++round) {
+        for (u32 range = 0; range < ranges; ++range) {
+            bind(range);
+        }
+    }
+    Check(runtime.allocations.size() == ranges,
+          "an alternating bind was copied again after its first stream");
+    // A changed buffer updates its entry and allocates once.
+    memory.bytes[base] ^= u8{0x5a};
+    bind(0);
+    bind(0);
+    Check(runtime.allocations.size() == ranges + 1, "changed bytes reused a stale history entry");
 }
 
 TEST_CASE("Uniform stream reuse: a slot whose bytes change every bind skips the compare",
           "[video_core]") {
     using VideoCommon::BindSmallUniformReusing;
     using Reuse = VideoCommon::UniformStreamReuse<Runtime::StreamUniformRef>;
+    if (!VideoCommon::UniformStreamHistoryEnabled()) {
+        return;
+    }
     Memory memory;
     Runtime runtime;
     VideoCommon::ResetUniformStreamReuse<Runtime>();

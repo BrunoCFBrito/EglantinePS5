@@ -243,8 +243,9 @@ struct GPU::Impl {
         // into its caller's frame: return at once (WaitForSyncOperation does not wait either).
         if (sync_requests_dropped) return CurrentSyncRequestFence();
 #endif // PS5
-        const u64 fence = ++last_sync_fence;
+        const u64 fence = last_sync_fence.load(std::memory_order_relaxed) + 1;
         sync_requests.emplace_back(std::forward<Func>(action));
+        last_sync_fence.store(fence, std::memory_order_release);
         return fence;
     }
 
@@ -270,6 +271,12 @@ struct GPU::Impl {
 
     /// Tick pending requests within the GPU.
     void TickWork() {
+        // Most ticks follow a draw with no requests pending. A request queued meanwhile is
+        // served by a later draw or by the tick its caller queues after publishing the fence.
+        if (current_sync_fence.load(std::memory_order_acquire) ==
+            last_sync_fence.load(std::memory_order_acquire)) {
+            return;
+        }
         std::unique_lock lck{sync_request_mutex};
         while (!sync_requests.empty()) {
             auto request = std::move(sync_requests.front());
@@ -532,7 +539,7 @@ struct GPU::Impl {
     std::list<std::function<void()>> sync_requests;
     std::atomic<u64> current_sync_fence{};
     std::atomic<AmpereAnchor> ampere_anchor{};
-    u64 last_sync_fence{};
+    std::atomic<u64> last_sync_fence{}; ///< Last request published, written under the mutex
 
     VideoCommon::PendingMaps pending_maps;
     std::mutex sync_request_mutex;
