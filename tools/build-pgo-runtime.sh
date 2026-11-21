@@ -23,7 +23,9 @@ mkdir -p "$work" "$(dirname "$output")"
 cflags=(-target x86_64-sie-ps5 -O2 -g0 -isysroot "$sdk"
         -isystem "$sdk/target/include" -fno-stack-protector -fno-plt
         -ffunction-sections -fdata-sections -fno-profile-generate -fno-profile-instr-generate
-        -DCOMPILER_RT_HAS_ATOMICS=1 -I "$profile" -I "$source_dir/include/profile")
+        -DCOMPILER_RT_HAS_ATOMICS=1 -DNDEBUG -U__FreeBSD__ -I "$profile" -I "$source_dir/include/profile")
+# -U__FreeBSD__: the PS5 target predefines __FreeBSD__ (9), which would select procctl(2) and
+# __assert paths the SDK does not export. Without it the runtime takes its portable branches.
 cxxflags=("${cflags[@]}" -isystem "$sdk/target/include/c++/v1" -fno-rtti -fexceptions)
 sources=(InstrProfiling.c InstrProfilingBuffer.c InstrProfilingFile.c InstrProfilingInternal.c
          InstrProfilingMerge.c InstrProfilingMergeFile.c InstrProfilingNameVar.c
