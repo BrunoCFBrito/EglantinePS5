@@ -660,3 +660,46 @@ if(PS5_NATIVE)
         TARGET_DIRECTORY video_core APPEND PROPERTY COMPILE_OPTIONS
             -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer)
 endif()
+
+# Profile-guided optimisation (patches/pgo-plan-2026-11-21.md). generate counts the branches this
+# port's own code takes; use compiles with the merged profile. The third-party targets are left
+# out: the back thread's frame is spent in common, core and video_core.
+if(PS5_NATIVE)
+    target_sources(eden-headless PRIVATE "${EDEN_PORT_DIR}/pgo_profile.cpp")
+endif()
+set(EDEN_PGO "OFF" CACHE STRING "Profile-guided optimisation: OFF, generate or use")
+set_property(CACHE EDEN_PGO PROPERTY STRINGS OFF generate use)
+set(EDEN_PGO_PROFILE "" CACHE FILEPATH "llvm-profdata output for EDEN_PGO=use")
+set(EDEN_PGO_RUNTIME "" CACHE FILEPATH "profile runtime archive for EDEN_PGO=generate")
+if(NOT EDEN_PGO STREQUAL "OFF")
+    if(NOT PS5_NATIVE)
+        message(FATAL_ERROR "EDEN_PGO is a PS5 native build option")
+    endif()
+    if(EDEN_PGO STREQUAL "generate")
+        if(NOT EXISTS "${EDEN_PGO_RUNTIME}")
+            message(FATAL_ERROR "EDEN_PGO=generate needs EDEN_PGO_RUNTIME (tools/build-pgo-runtime.sh)")
+        endif()
+        # Atomic counters: the guest cores and the GPU threads run this code at the same time.
+        set(eden_pgo_flags -fprofile-generate -fprofile-update=atomic)
+    elseif(EDEN_PGO STREQUAL "use")
+        if(NOT EXISTS "${EDEN_PGO_PROFILE}")
+            message(FATAL_ERROR "EDEN_PGO=use needs EDEN_PGO_PROFILE (llvm-profdata merge output)")
+        endif()
+        set(eden_pgo_flags "-fprofile-use=${EDEN_PGO_PROFILE}")
+    else()
+        message(FATAL_ERROR "EDEN_PGO must be OFF, generate or use, not '${EDEN_PGO}'")
+    endif()
+    foreach(eden_pgo_target common core video_core eden-headless)
+        if(TARGET ${eden_pgo_target})
+            target_compile_options(${eden_pgo_target} PRIVATE ${eden_pgo_flags}
+                -Wno-error=profile-instr-out-of-date -Wno-error=profile-instr-unprofiled
+                -Wno-error=profile-instr-missing)
+        endif()
+    endforeach()
+    if(EDEN_PGO STREQUAL "generate")
+        target_compile_definitions(eden-headless PRIVATE EDEN_PGO=1)
+        target_link_libraries(eden-headless PRIVATE "${EDEN_PGO_RUNTIME}")
+        # InstrProfilingRuntime.cpp has no symbol anything references; keep its constructor.
+        target_link_options(eden-headless PRIVATE "-Wl,--undefined=__llvm_profile_runtime")
+    endif()
+endif()

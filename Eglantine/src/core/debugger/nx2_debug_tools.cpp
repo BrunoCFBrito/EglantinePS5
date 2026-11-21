@@ -35,6 +35,10 @@
 #include "video_core/nx2_debug_control.h"
 #include "video_core/renderer_base.h"
 
+#if defined(__PROSPERO__)
+#include "pgo_profile.h"
+#endif
+
 namespace Core::Nx2Debug {
 
 using nlohmann::json;
@@ -682,6 +686,21 @@ json InputSequence(ToolState& state, const json& params, const ClientGone& clien
     return RunInput(state, steps, params, client_gone);
 }
 
+#if defined(__PROSPERO__)
+json WriteProfile(ToolState& state, const json& params) {
+    (void)state;
+    (void)params;
+    const std::string file = ::Eden::Pgo::Write();
+    u64 bytes = 0;
+    if (!file.empty()) {
+        std::error_code error;
+        const auto size = std::filesystem::file_size(file, error);
+        bytes = error ? 0 : static_cast<u64>(size);
+    }
+    return {{"file", file}, {"bytes", bytes}};
+}
+#endif
+
 Handlers MakeHandlers(const std::shared_ptr<ToolState>& state) {
     const auto handler = [&state](json (*tool)(ToolState&, const json&)) -> Handler {
         return [state, tool](const json& params, const ClientGone&) { return tool(*state, params); };
@@ -707,6 +726,9 @@ Handlers MakeHandlers(const std::shared_ptr<ToolState>& state) {
         {"read_gpu_memory", handler(ReadGpuMemory)},
         {"input", waiting(Input)},
         {"input_sequence", waiting(InputSequence)},
+#if defined(__PROSPERO__)
+        {"write_profile", handler(WriteProfile)},
+#endif
     };
 }
 
@@ -949,6 +971,10 @@ Service::Service(System& system, std::string title, u64 program_id, const Servic
         throw;
     }
     g_nx2_present_time_services.fetch_add(1, std::memory_order_relaxed);
+#if defined(__PROSPERO__)
+    // EDEN_PGO_FLUSH_SECONDS: a training run's counters reach disk even if the app is killed.
+    ::Eden::Pgo::StartPeriodicWrites();
+#endif
     switch (target.kind) {
     case ServiceTarget::Kind::Dial:
         LOG_INFO(Debug, "Debug client dialling {}:{}, dump dir {}", target.host, target.port,
