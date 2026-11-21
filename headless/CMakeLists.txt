@@ -700,7 +700,9 @@ if(NOT EDEN_PGO STREQUAL "OFF")
         if(NOT EXISTS "${EDEN_PGO_PROFILE}")
             message(FATAL_ERROR "EDEN_PGO=use needs EDEN_PGO_PROFILE (llvm-profdata merge output)")
         endif()
-        set(eden_pgo_flags "-fprofile-use=${EDEN_PGO_PROFILE}")
+        # Release profiles come from EDEN_DEV_PROFILE-off code: some functions in the profile no longer
+        # match (backend-plugin hash mismatch). Downgrade only those, for profile-use builds.
+        set(eden_pgo_flags "-fprofile-use=${EDEN_PGO_PROFILE}" "-Wno-error=backend-plugin")
     else()
         message(FATAL_ERROR "EDEN_PGO must be OFF, generate or use, not '${EDEN_PGO}'")
     endif()
